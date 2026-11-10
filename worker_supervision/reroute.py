@@ -133,7 +133,7 @@ def _handle_worker_exhaustion_or_stall(
     def fail_worker(fail_msg: str) -> Dict[str, Any]:
         _s._ping_launcher(launcher, fail_msg, from_id=worker_id)
         _s.notify_desktop_event(
-            f"worker_stall_or_exhausted|{worker_id}", "Subway Context",
+            f"worker_stall_or_exhausted|{worker_id}", "Subway",
             fail_msg[:500], route="workers",
         )
         return {"status": "failed", "exit_code": 1, "reason": fail_msg, "stall_alerted": True}

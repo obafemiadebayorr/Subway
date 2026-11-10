@@ -358,7 +358,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/healthz":
             if self._gate(api=False):
-                self.send_json({"service": "subway-context", "version": _s.VERSION, "pid": os.getpid()})
+                self.send_json({"service": "subway", "version": _s.VERSION, "pid": os.getpid()})
             return
         if path == "/api/reload":
             if not self._gate(api=True):
@@ -1692,7 +1692,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             with _s._state_lock("config"):
                 cfg = _s._load_json("config.json")
             dispatch_res = dispatch_notification(
-                "Subway Context",
+                "Subway",
                 "Test alert: Notifications are working in your IDE and desktop!",
                 config=cfg
             )

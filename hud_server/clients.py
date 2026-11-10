@@ -93,7 +93,7 @@ def _config_has_subway(path: str, *keys: str) -> bool:
         return False
     for k in keys:
         node = node.get(k) if isinstance(node, dict) else None
-    return isinstance(node, dict) and "subway-context" in node
+    return isinstance(node, dict) and ("subway" in node or "subway-context" in node)
 
 def _subway_sessions() -> Dict[str, int]:
     """Subway MCP servers running right now, by the client that launched them."""
@@ -112,7 +112,7 @@ def _subway_sessions() -> Dict[str, int]:
         except Exception:
             return counts
         for _pid, (ppid, args) in procs.items():
-            if "subway-context/server.py" not in args.replace("\\", "/") or re.search(r"server\.py\s+(hud|__supervise)", args):
+            if not re.search(r"(?i)subway(?:-context)?/server\.py", args.replace("\\", "/")) or re.search(r"server\.py\s+(hud|__supervise)", args):
                 continue
             parent = procs.get(ppid, (0, ""))[1].strip().split(" ")[0].replace('"', '')
             name = os.path.basename(parent).lower()
@@ -134,7 +134,7 @@ def _subway_sessions() -> Dict[str, int]:
             with contextlib.suppress(ValueError):
                 procs[int(parts[0])] = (int(parts[1]), parts[2])
     for _pid, (ppid, args) in procs.items():
-        if "subway-context/server.py" not in args or re.search(r"server\.py\s+(hud|__supervise)", args):
+        if not re.search(r"(?i)subway(?:-context)?/server\.py", args) or re.search(r"server\.py\s+(hud|__supervise)", args):
             continue
         parent = procs.get(ppid, (0, ""))[1].split(" ")[0]
         name = os.path.basename(parent).lower()

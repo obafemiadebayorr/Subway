@@ -1,15 +1,15 @@
-# Subway Context
+# Subway
 
 > **On-demand, token-efficient context transit system connecting independent AI coding agents across multiple windows (Antigravity, Claude Code, OpenCode terminal).**
 
-![Subway Context Tri-Agent Multi-Window Architecture](assets/subway-tri-pane-hero.jpg)
-_Live multi-window workspace: Claude Code IDE tab (center), OpenCode terminal (bottom dock), and Antigravity Gemini (right pane) connected concurrently via Subway Context._
+![Subway Tri-Agent Multi-Window Architecture](assets/subway-tri-pane-hero.jpg)
+_Live multi-window workspace: Claude Code IDE tab (center), OpenCode terminal (bottom dock), and Antigravity Gemini (right pane) connected concurrently via Subway._
 
-Stop copy-pasting 50,000-line markdown summaries between AI tools or blowing through your context window. **Subway Context** acts as an on-demand transit system between your coding agents: board any chat, search by quote, sync only the delta turns since your last visit, and extract high-density decision logs.
+Stop copy-pasting 50,000-line markdown summaries between AI tools or blowing through your context window. **Subway** acts as an on-demand transit system between your coding agents: board any chat, search by quote, sync only the delta turns since your last visit, and extract high-density decision logs.
 
 ---
 
-## Why Subway Context?
+## Why Subway?
 
 When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude Code in tab 2, OpenCode terminal running in background):
 
@@ -17,7 +17,7 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 2. **Serial Number Hell**: Nobody remembers 36-character UUIDs (`78879399-3626-4504...`).
 3. **Token Bankruptcy**: Copying full conversation dumps eats up 20,000–50,000 tokens before you even type your prompt.
 
-**Subway Context solves this:**
+**Subway solves this:**
 
 - **Zero Dependencies**: Uses standard Python (`/usr/bin/python3`), runs on your own machine.
 - **Search by Quote**: Search any phrase you or the agent said; jump directly to that turn.
@@ -30,7 +30,7 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 
 ## Supported Transit Lines
 
-![Subway Context Transit Pipeline](assets/subway-transit-pipeline.svg)
+![Subway Transit Pipeline](assets/subway-transit-pipeline.svg)
 _Universal on-demand multi-agent transit connecting Claude Code, Antigravity, and OpenCode via local stdio MCP._
 
 | Line | Storage Format | Supported Capabilities |
@@ -48,16 +48,16 @@ _Universal on-demand multi-agent transit connecting Claude Code, Antigravity, an
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/ObaIsSoft/Subway.git ~/Documents/dev/subway-context
-cd ~/Documents/dev/subway-context
+git clone https://github.com/obafemiadebayorr/Subway.git
+cd Subway
 ```
 
 ### 2. Universal 1-Click Auto-Connect
 
-Install subway-context directly via npm (v1.2.0):
+Install from npm:
 
 ```bash
-npx -y subway-context install
+npx -y @obafemi_adebayorr/subway install
 ```
 
 
@@ -68,14 +68,14 @@ Or run the universal installer script locally:
 python3 install.py
 ```
 
-_(Or simply tell Gemini / Claude: **"Connect Subway Context to my coding agents"**)_
+_(Or simply tell Gemini / Claude: **"Connect Subway to my coding agents"**)_
 
 Output:
 
 ```text
-Subway Context Universal Connector
+Subway Universal Connector
 
-Server binary: /Users/.../Documents/dev/subway-context/server.py
+Server binary: /path/to/Subway/server.py
 Python runner: /usr/bin/python3
 
   [+] Claude Code           : Connected in ~/.claude.json
@@ -114,7 +114,7 @@ python3 install.py --remove opencode
 #### Claude Code CLI
 
 ```bash
-claude mcp add --scope user subway-context -- /usr/bin/python3 ~/Documents/dev/subway-context/server.py
+claude mcp add --scope user subway -- /usr/bin/python3 /path/to/Subway/server.py
 ```
 
 #### Antigravity IDE
@@ -124,9 +124,9 @@ Add to `~/.gemini/config/mcp_config.json`:
 ```json
 {
   "mcpServers": {
-    "subway-context": {
+    "subway": {
       "command": "python3",
-      "args": ["/path/to/subway-context/server.py"]
+      "args": ["/path/to/Subway/server.py"]
     }
   }
 }
@@ -140,9 +140,9 @@ Add to `~/.config/opencode/opencode.json`:
 {
   "mcp": {
     "servers": {
-      "subway-context": {
+      "subway": {
         "type": "local",
-        "command": ["python3", "/path/to/subway-context/server.py"]
+        "command": ["python3", "/path/to/Subway/server.py"]
       }
     }
   }
@@ -156,7 +156,7 @@ Add to `~/.config/opencode/opencode.json`:
 ## 4-Tier Station Aliasing System
 
 ![Subway 4-Tier Aliasing Hierarchy](assets/aliasing-hierarchy.svg)
-_Subway Context routes station requests through a 4-tier hierarchy: Explicit Pins -> Floating Heads -> Workspace Terminals -> Topic Slugs._
+_Subway routes station requests through a 4-tier hierarchy: Explicit Pins -> Floating Heads -> Workspace Terminals -> Topic Slugs._
 
 ### The Multi-Chat Challenge
 
@@ -170,20 +170,20 @@ Terminal tools like Claude Code CLI and OpenCode run on a **process lifecycle** 
 
 ### The 4-Tier Solution
 
-Subway Context eliminates raw UUIDs and context jacking with a layered 4-tier naming hierarchy:
+Subway eliminates raw UUIDs and context jacking with a layered 4-tier naming hierarchy:
 
 | Tier | Format | Examples | Behavior |
 | :--- | :--- | :--- | :--- |
 | **1. Explicit Pins** | `@<alias>` | `@claude-main`, `@agy-live`, `@opencode-terminal` | **Immutable & sticky** via `tag_chat`. Never drifts when switching tabs or opening side tasks. |
 | **2. Floating Latest** | `@<agent>-latest`, `@latest` | `@agy-latest`, `@claude-latest`, `@latest` | Dynamically resolves to the most recently touched session globally or per-platform. |
-| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio`, `@copilot-subway-context` | Dynamically resolves to the **latest active chat in that workspace folder**. |
+| **3. Workspace Heads** | `@<agent>-<project>` | `@agy-my-project`, `@claude-portfolio`, `@copilot-subway` | Dynamically resolves to the **latest active chat in that workspace folder**. |
 | **4. Topic Slugs** | `@<agent>-<topic>` | `@agy-subway`, `@agy-gitignore`, `@copilot-parser` | Automatically extracted from conversation titles. Reference chats by **topic** rather than ID. |
 
 ---
 
 ## Core Tool Reference
 
-Subway Context exposes MCP tools divided across functional roles:
+Subway exposes MCP tools divided across functional roles:
 
 ### 1. Navigation & Transit
 - **`subway(tool, args)`**: Stable dispatcher to call any Subway tool by name (including newly reloaded tools), or pass `tool="list"` to inspect registered tools.
@@ -266,7 +266,7 @@ spin_worker(
 
 When multiple autonomous agents (e.g. Claude Code in tab 1, OpenCode in terminal dock, and Antigravity in sidecar) run concurrently in the same repository, they risk **file collision**—clobbering and overwriting each other's edits.
 
-Subway Context provides a central **Workspace Guard** (`~/.subway-context/locks.json`):
+Subway provides a central **Workspace Guard** (`~/.subway/locks.json`):
 
 1. **`claim_file(filepath, ...)`**: Acquires a time-limited lease (default: 300s).
    ```text
@@ -283,18 +283,18 @@ Subway Context provides a central **Workspace Guard** (`~/.subway-context/locks.
 
 ## Live Station Board HUD
 
-Subway Context includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a cyber-transit dark-mode web dashboard.
+Subway includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a cyber-transit dark-mode web dashboard.
 
 ### Architecture & Security
 
 - **Native ES Modules**: The HUD lives in the `hud/` folder as native ES modules with **zero build step** (`hud/index.html`, `app.js`, `views.js`, `usage.js`, `lib.js`, `styles.css`).
 - **Loopback Only (`127.0.0.1`)**: The HUD server binds strictly to `127.0.0.1` (or `SUBWAY_HUD_PORT`, default 7890). There is deliberately no option to bind to `0.0.0.0` or external network interfaces.
-- **Per-User Authentication Token**: Protected by a random HMAC token stored in `~/.subway-context/hud_token`. The token is injected into served HTML and validated via the `X-Subway-Token` header on all API calls. Requests missing or mismatched tokens are rejected with `403 Forbidden`.
+- **Per-User Authentication Token**: Protected by a random HMAC token stored in `~/.subway/hud_token`. The token is injected into served HTML and validated via the `X-Subway-Token` header on all API calls. Requests missing or mismatched tokens are rejected with `403 Forbidden`.
 - **Live Updates**: HUD updates are pushed the moment a worker or permission changes (`GET /api/events`), about 1 ms locally. Chats still depend on the model taking its turn.
 - **HUD Features**: Displays budget rows with real usage, a reset card that cycles through providers, a spend chart coloured per provider, and worker history pages with Load more.
 - **No Automatic Launch**: To conserve resources, the HUD **no longer starts automatically** when MCP connects. You start it whenever you want via:
   1. The `start_hud` MCP tool
-  2. CLI: `subway-context hud` (or `python3 server.py hud [--open] [port]`)
+  2. CLI: `subway hud` (or `python3 server.py hud [--open] [port]`)
   3. Setting `SUBWAY_HUD_AUTOSTART=1` in your environment
 
 ### Opening the HUD in an IDE Browser
@@ -317,10 +317,10 @@ export SUBWAY_HUD_ORIGINS="vscode-webview://*,http://127.0.0.1:3000"
 
 ## Terminals
 
-Subway Context can capture commands from terminals you explicitly share with it, so agents and the HUD can see what failed and hand it to a worker — nothing is captured from anywhere you haven't opted in. There are two ways to opt in, and both need the 1.3.4 build of the VS Code extension (rebuild and reinstall it from the `vscode` folder):
+Subway can capture commands from terminals you explicitly share with it, so agents and the HUD can see what failed and hand it to a worker — nothing is captured from anywhere you haven't opted in. There are two ways to opt in, and both need the 1.3.4 build of the VS Code extension (rebuild and reinstall it from the `vscode` folder):
 
-- **VS Code / Antigravity / Cursor / Windsurf extension**: install the Subway Context VS Code extension, then enable the `subway.terminalSharing.enabled` setting and run **Subway: Share Terminal** on the terminal you want captured (no shell integration → nothing is captured, shown in the HUD as "no shell integration"). **Subway: Allow Terminal Commands** additionally lets `run_terminal` execute commands there. **Subway: Stop Sharing Terminal** opts back out.
-- **Standalone zsh/bash shells**: `subway-context terminal hook install [zsh|bash]` adds a marked block to your `.zshrc`/`.bashrc` (backing up the original first) that reports each finished command's text, exit code and working directory in the background — never its output. `subway-context terminal hook status` and `subway-context terminal hook uninstall [zsh|bash]` check or cleanly remove it.
+- **VS Code / Antigravity / Cursor / Windsurf extension**: install the Subway VS Code extension, then enable the `subway.terminalSharing.enabled` setting and run **Subway: Share Terminal** on the terminal you want captured (no shell integration → nothing is captured, shown in the HUD as "no shell integration"). **Subway: Allow Terminal Commands** additionally lets `run_terminal` execute commands there. **Subway: Stop Sharing Terminal** opts back out.
+- **Standalone zsh/bash shells**: `subway terminal hook install [zsh|bash]` adds a marked block to your `.zshrc`/`.bashrc` (backing up the original first) that reports each finished command's text, exit code and working directory in the background — never its output. `subway terminal hook status` and `subway terminal hook uninstall [zsh|bash]` check or cleanly remove it.
 - Captured commands are redacted (tokens, keys, passwords, `Authorization` headers) before they reach the store, and are visible via `read_terminal`, `search_terminal`, and the HUD's **Terminals** page, where a failed command can be handed straight to a worker.
 - **Terminal Switches**: `terminal_sharing` (`true`/`false`) controls master capture state. `terminal_mode` (`ask`, `auto_safe`, `auto_approve`, default `ask`) controls whether terminal commands require interactive user approval.
 
@@ -328,7 +328,7 @@ Subway Context can capture commands from terminals you explicitly share with it,
 
 ## Quota & Rate Limit Tracking
 
-Subway Context tracks live rate limits, token usage, and session windows across detected AI clients:
+Subway tracks live rate limits, token usage, and session windows across detected AI clients:
 
 - **Data Sources**:
   - **Antigravity**: Read live from the local Antigravity language server metrics.
@@ -344,14 +344,14 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 
 ### Budgets & Capacity
 
-- **Budgets**: `subway-context budget` shows them; `subway-context budget <chat|provider> <tokens>` sets them; typing that command as your own chat message in Claude Code works, including 3.5M and even when blocked. The HUD sets them too. Agents can't: the guard is best effort for shell commands.
-- **Per-chat vs universal chat budgets**: typing `subway-context budget chat <tokens>` as a message inside a chat sets that chat's own budget (and `chat 0` clears it) — it never touches other chats. Running the same command from a plain terminal (no chat context) sets the universal default that applies only to chats with no budget of their own; add `--chat <id>` to set one specific chat from the terminal. A chat is never blocked by a budget set in a different chat.
+- **Budgets**: `subway budget` shows them; `subway budget <chat|provider> <tokens>` sets them; typing that command as your own chat message in Claude Code works, including 3.5M and even when blocked. The HUD sets them too. Agents can't: the guard is best effort for shell commands.
+- **Per-chat vs universal chat budgets**: typing `subway budget chat <tokens>` as a message inside a chat sets that chat's own budget (and `chat 0` clears it) — it never touches other chats. Running the same command from a plain terminal (no chat context) sets the universal default that applies only to chats with no budget of their own; add `--chat <id>` to set one specific chat from the terminal. A chat is never blocked by a budget set in a different chat.
 - **Enforcement**: Warnings at 80%, block at 100%. Claude Code blocks the prompt and tools through hooks. Antigravity and OpenCode have no such hook, so there the block lands on the next Subway tool call.
 - **Worker Token Caps**: Workers are told to wrap up at two thirds, and no call is started that would pass the cap. A call already running can still overrun. Counts thinking and Claude cache creation. Set Claude caps above about 100K: one call can cost 35K. Custom providers report no tokens, so they use max_seconds.
-- **Context Compaction**: `subway-context compaction` shows the mode; `subway-context compaction <suggest|auto|never> [tokens]` sets it, e.g. `subway-context compaction auto 300k`. The compaction point defaults to 300,000 tokens and accepts 100K to 1M; the HUD's "Compact at (tokens)" field sets it too. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's `autoCompactWindow`, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only.
+- **Context Compaction**: `subway compaction` shows the mode; `subway compaction <suggest|auto|never> [tokens]` sets it, e.g. `subway compaction auto 300k`. The compaction point defaults to 300,000 tokens and accepts 100K to 1M; the HUD's "Compact at (tokens)" field sets it too. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's `autoCompactWindow`, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only.
 - **Capacity**: 4 running workers per chat. Per machine: 2 up to 8 GB, 6 up to 16 GB, 10 above, or set `max_workers` in `config.json`. A worker over the limit stays queued.
 - **Worker safeguards**: `worker_rules: false` omits the standard rules from edit-worker prompts. Antigravity and OpenCode deny identifiable whole-file reads over 1,500 lines inside the worker folder; set `large_file_read_lines` to change the limit or `large_file_reads: "allow"` to disable the guard.
-- **Configuration Switches (`~/.subway-context/config.json`)**:
+- **Configuration Switches (`~/.subway/config.json`)**:
   - `worker_limits`: `false` disables machine concurrency limits (workers remain queued only if system memory is critically low).
   - `local_memory_guard`: `false` (or env `SUBWAY_LOCAL_MEMORY_GUARD="0"`) disables local model RAM safety checks.
   - `copilot_inline_floor_pct`: Optional allowance floor percentage (default `0`, off unless set) below which inline completions are denied.
@@ -363,7 +363,7 @@ Subway Context tracks live rate limits, token usage, and session windows across 
 
 ## Autonomous Worker Swarms & Approval Workflow
 
-Subway Context allows agents to queue background tasks across different engines (`claude`, `opencode`, or `antigravity`).
+Subway allows agents to queue background tasks across different engines (`claude`, `opencode`, or `antigravity`).
 
 ### Mandatory User Approval
 
@@ -371,9 +371,9 @@ Workers **always require user approval** before any execution begins:
 1. When an agent calls `spin_worker(...)`, the worker is placed in `pending_approval` state.
 2. The user can approve the worker in three ways:
    - **In the Live HUD**: Clicking "Approve" (authenticated via HUD token).
-   - **Via CLI**: Running `subway-context approve <worker_id>` in their terminal.
+   - **Via CLI**: Running `subway approve <worker_id>` in their terminal.
    - **Via Approval Code**: Giving the 6-character approval code shown in the HUD or CLI to their agent to call `approve_worker(worker_id="...", approval_code="...")`.
-3. **No Agent Self-Approval**: Agents **cannot self-approve** workers through MCP—they do not have access to the approval code unless the user explicitly pastes it. However, any process with shell access running as your user can still execute the CLI command `subway-context approve <id>`.
+3. **No Agent Self-Approval**: Agents **cannot self-approve** workers through MCP—they do not have access to the approval code unless the user explicitly pastes it. However, any process with shell access running as your user can still execute the CLI command `subway approve <id>`.
 
 ### Provider Dispatch & Antigravity CLI Note
 
@@ -406,18 +406,18 @@ Workers use permission modes to govern actions:
 When a worker needs permission:
 - **Relay Reach**: Requests reach the launching chat automatically **on its next Subway tool call** (appended to the tool output), or through the `watch_workers` tool.
 - **Terminal Oversight Commands**:
-  - `subway-context permissions`: List all pending permission requests.
-  - `subway-context allow <request_id>`: Allow the action once.
-  - `subway-context always <request_id>`: Allow this and future identical requests.
-  - `subway-context deny <request_id>`: Deny the requested action.
-  - `subway-context watch [seconds]`: Wait and stream worker permission requests or status changes.
+  - `subway permissions`: List all pending permission requests.
+  - `subway allow <request_id>`: Allow the action once.
+  - `subway always <request_id>`: Allow this and future identical requests.
+  - `subway deny <request_id>`: Deny the requested action.
+  - `subway watch [seconds]`: Wait and stream worker permission requests or status changes.
 - **Supported Engines**: The permission relay currently supports **Antigravity** and **Claude** workers (not yet OpenCode).
 
 ---
 
 ## Shared Decision Tracks
 
-Rather than copying whole conversation histories, Subway Context maintains lightweight **Shared Decision Tracks** (`~/.subway-context/tracks/<track>.jsonl`).
+Rather than copying whole conversation histories, Subway maintains lightweight **Shared Decision Tracks** (`~/.subway/tracks/<track>.jsonl`).
 
 - **`join_track(track="main")`**: Subscribes an agent to a shared context track and fetches current state.
 - **`broadcast_track(message, track="main", files=[...], decisions=[...])`**: Publishes milestones, architectural decisions, or touched files to all collaborating agents.
@@ -443,33 +443,33 @@ When agents spin up parallel subagents (e.g. Claude Code background `Agent` work
 
 ## CLI Command Reference
 
-The `subway-context` command (or `python3 server.py`) provides direct terminal access:
+The `subway` command (or `python3 server.py`) provides direct terminal access:
 
 ```bash
-subway-context                                    # Run as MCP server over stdio
-subway-context hud [port] [--open]                # Start Live HUD on 127.0.0.1
-subway-context workers                            # List workers with approval codes
-subway-context approve <worker_id>                # Launch a pending worker
-subway-context reject <worker_id> [reason]        # Reject or stop a worker
-subway-context stop <worker_id>                   # Terminate running worker process
-subway-context permissions                        # List worker permission requests
-subway-context mode [ask|auto_safe|auto_approve]  # Show or set permission mode
-subway-context allow|always|deny <request_id>     # Answer worker permission request
-subway-context watch [seconds]                    # Wait for requests or completions
-subway-context tail <worker_id>                   # Inspect worker status and log
-subway-context locks                              # View active workspace leases
-subway-context track [name]                       # View shared context track
-subway-context quota [source]                     # View quota and token metrics
-subway-context terminal hook install|uninstall|status [zsh|bash]  # Manage the shell capture hook
-subway-context install | status | uninstall       # Manage agent registrations
-subway-context <tool> '<json args>'               # Call any MCP tool directly
+subway                                    # Run as MCP server over stdio
+subway hud [port] [--open]                # Start Live HUD on 127.0.0.1
+subway workers                            # List workers with approval codes
+subway approve <worker_id>                # Launch a pending worker
+subway reject <worker_id> [reason]        # Reject or stop a worker
+subway stop <worker_id>                   # Terminate running worker process
+subway permissions                        # List worker permission requests
+subway mode [ask|auto_safe|auto_approve]  # Show or set permission mode
+subway allow|always|deny <request_id>     # Answer worker permission request
+subway watch [seconds]                    # Wait for requests or completions
+subway tail <worker_id>                   # Inspect worker status and log
+subway locks                              # View active workspace leases
+subway track [name]                       # View shared context track
+subway quota [source]                     # View quota and token metrics
+subway terminal hook install|uninstall|status [zsh|bash]  # Manage the shell capture hook
+subway install | status | uninstall       # Manage agent registrations
+subway <tool> '<json args>'               # Call any MCP tool directly
 ```
 
 ---
 
 ## Native OpenCode `@` Autocomplete Integration
 
-In OpenCode, typing `@` in the prompt searches workspace files and registered agent definitions. Subway Context automatically syncs all 4 alias tiers directly into OpenCode's agent registry (`~/.config/opencode/agents/*.md`):
+In OpenCode, typing `@` in the prompt searches workspace files and registered agent definitions. Subway automatically syncs all 4 alias tiers directly into OpenCode's agent registry (`~/.config/opencode/agents/*.md`):
 
 - **Hyphen-Prefixed Filtering**: Typing `@claude-` filters out repository files and displays agent transit targets (`@claude-main`, `@claude-latest`, `@claude-my-project`, etc.).
 - **Antigravity Stations**: Typing `@agy-` displays active Antigravity stations (`@agy-live`, `@agy-latest`, `@agy-my-project`, `@agy-subway`, etc.).
@@ -479,7 +479,7 @@ In OpenCode, typing `@` in the prompt searches workspace files and registered ag
 
 ## Claude Code: IDE Extension vs CLI
 
-Subway Context supports both the **Claude Code CLI** (terminal) and the **official Claude Code IDE extension** (VS Code / Antigravity editor tab).
+Subway supports both the **Claude Code CLI** (terminal) and the **official Claude Code IDE extension** (VS Code / Antigravity editor tab).
 
 ```text
 ┌─────────────────────────────────┬─────────────────────────────────┐
@@ -494,7 +494,7 @@ Subway Context supports both the **Claude Code CLI** (terminal) and the **offici
 
 Both Claude environments share the exact same underlying architecture:
 
-1. **Unified Configuration**: Both read `~/.claude.json`. Subway Context is registered under `mcpServers["subway-context"]`, enabling all tools across both CLI and IDE chat tabs.
+1. **Unified Configuration**: Both read `~/.claude.json`. Subway is registered under `mcpServers["subway"]`, enabling all tools across both CLI and IDE chat tabs.
 2. **Unified Session Tracking**: Active IDE editor tabs are recorded in `~/.claude/sessions/<pid>.json` with `"entrypoint": "claude-vscode"`. Subway automatically detects live tab names and maps them for transit.
 3. **PreToolUse Hook Guard**: Both CLI and IDE trigger the `hook-guard` command on file edits, enforcing active leases against conflicting modifications.
 
@@ -516,7 +516,7 @@ Local workers run through ACP, so they ask permission and can be denied; auto_sa
 - **Runs Locally**: Subway itself runs on your machine, over stdio and loopback (`127.0.0.1`), with no Subway account or server. The agents it connects still use their own services, `/usage` asks Claude Code to contact Anthropic, and the HUD loads its fonts from Google Fonts.
 - **Read-Only on Chat Stores**: Never modifies conversation histories of host tools.
 - **Fail-Open Hook Design**: Hook guard failures fail open to prevent blocking developer edits.
-- **Sandboxed Metadata**: State, aliases, checkpoints, and mailboxes live strictly in `~/.subway-context/`.
+- **Sandboxed Metadata**: State, aliases, checkpoints, and mailboxes live strictly in `~/.subway/`.
 
 ---
 

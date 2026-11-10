@@ -73,11 +73,11 @@ def _sync_opencode_agent_stubs(force: bool = False) -> None:
 
     for alias in _s.load_aliases():
         clean = alias.strip().lower().lstrip("@")
-        desired_stubs[clean] = f"Subway Context pinned transit connector to @{clean}."
+        desired_stubs[clean] = f"Subway pinned transit connector to @{clean}."
 
     for a in ("claude-latest", "agy-latest", "opencode-latest"):
         src_name = "Claude Code" if "claude" in a else ("Antigravity" if "agy" in a else "OpenCode")
-        desired_stubs[a] = f"Subway Context transit connector to latest {src_name} session."
+        desired_stubs[a] = f"Subway transit connector to latest {src_name} session."
 
     prefix_for = {"claude": ("claude", "Claude Code"), "antigravity": ("agy", "Antigravity"),
                   "opencode": ("opencode", "OpenCode"), "pi": ("deep", "DeepAI Code")}
@@ -86,7 +86,7 @@ def _sync_opencode_agent_stubs(force: bool = False) -> None:
         if not prefix:
             continue
         for p in _s._project_names(c.get("project")):
-            desired_stubs[f"{prefix}-{p}"] = f"Subway Context transit connector to latest {label} chat in {p}."
+            desired_stubs[f"{prefix}-{p}"] = f"Subway transit connector to latest {label} chat in {p}."
 
     agy_chats = [c for c in chats if c.get("source") == "antigravity"]
     agy_chats.sort(key=lambda c: _s.sort_key_ts(c.get("updated")), reverse=True)
@@ -94,7 +94,7 @@ def _sync_opencode_agent_stubs(force: bool = False) -> None:
         title = c.get("title") or ""
         slug = _s.slugify_topic(title)
         if slug and slug != "chat":
-            desired_stubs[f"agy-{slug}"] = f"Subway Context transit to @agy-{slug} ({_s.one_line(title, 60)})."
+            desired_stubs[f"agy-{slug}"] = f"Subway transit to @agy-{slug} ({_s.one_line(title, 60)})."
 
     # Every name becomes a filename, so anything unsafe is dropped rather than written.
     desired_stubs = {k: v for k, v in desired_stubs.items() if _s.ALIAS_RE.match(k)}
@@ -106,7 +106,7 @@ def _sync_opencode_agent_stubs(force: bool = False) -> None:
             f"mode: subagent\n"
             f"---\n"
             f"{_s._STUB_MARKER}\n"
-            f"You are the Subway Context transit connector for @{stub_name}.\n"
+            f"You are the Subway transit connector for @{stub_name}.\n"
             f"When invoked, call MCP tool `read_chat(chat_id=\"@{stub_name}\", mode=\"decisions\", since=\"last\")` "
             f"to pull the latest context, decisions, and files touched into this session.\n"
         )

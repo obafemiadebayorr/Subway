@@ -299,13 +299,13 @@ def _sync_pi_autocompact(mode: str, at: int) -> str:
 def _enqueue_pi_compact_wake(text: str = "/compact") -> bool:
     """Fallback: enqueue a wake event whose text is /compact for the subway-wake extension.
 
-    subway-wake.js drains ~/.subway-context/wake_spools/<station>.jsonl and injects events
+    subway-wake.js drains ~/.subway/wake_spools/<station>.jsonl and injects events
     as user messages via pi.sendUserMessage (agent_end / /subway-wake). Used only when pi
     exposes no supported auto-compaction config key (it does; see _sync_pi_autocompact)."""
     station = os.environ.get("SUBWAY_STATION_ID", "").strip()
     if not station:
         try:
-            spath = os.path.join(getattr(_s, "SUBWAY_DIR", os.path.join(getattr(_s, "HOME", os.path.expanduser("~")), ".subway-context")),
+            spath = os.path.join(getattr(_s, "SUBWAY_DIR", os.path.join(getattr(_s, "HOME", os.path.expanduser("~")), ".subway")),
                                  "station_id.txt")
             if os.path.isfile(spath):
                 with open(spath, "r", encoding="utf-8") as f:
@@ -744,7 +744,7 @@ def compact_opencode_workers() -> bool:
 def _compact_requests_file(session_id: Optional[str] = None) -> str:
     sid = session_id or _s._self_id() or "unknown-chat"
     safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(sid))
-    base = getattr(_s, "SUBWAY_DIR", os.path.join(os.path.expanduser("~"), ".subway-context"))
+    base = getattr(_s, "SUBWAY_DIR", os.path.join(os.path.expanduser("~"), ".subway"))
     return os.path.join(base, "compact_requests", safe + ".jsonl")
 
 
@@ -869,7 +869,7 @@ def compaction_notice(session_id: Optional[str] = None, prompt: str = "") -> Opt
     x_pct = int(round(pct))
     msg = (f"This chat holds {usage // 1000:,}K tokens of context ({x_pct}% of its window), re-read on every turn. "
            f"Compact now: /compact {focus}")
-    _s.notify_desktop_event(key, "Subway Context", msg)
+    _s.notify_desktop_event(key, "Subway", msg)
 
     if mode == "auto":
         at = _s.compact_at_tokens()

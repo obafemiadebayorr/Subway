@@ -1,4 +1,4 @@
-/* Help and newcomer reference for Subway Context. */
+/* Help and newcomer reference for Subway. */
 import { h } from "./lib.js";
 
 let query = "";
@@ -51,7 +51,7 @@ export function helpPage() {
         { term: "token cap and wrap-up", desc: "Workers are told to wrap up at two thirds of their cap, and no tool call is started that would pass the cap." },
         { term: "verifier", desc: "Automated check returning PASS, FLAG, or FAIL; proves changes are mechanically sound, not proof of correctness." },
         { term: "compaction and segments", desc: "Context trimming modes (Suggest, Auto, Never); keeps active context compact while full history stays readable." },
-        { term: "compaction point", desc: "`subway-context compaction auto 300k` sets Auto at 300,000 tokens. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's autoCompactWindow, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only. Default 300,000; range 100,000 to 1,000,000." },
+        { term: "compaction point", desc: "`subway compaction auto 300k` sets Auto at 300,000 tokens. In Auto, Claude Code compacts itself near that point (Subway sets Claude Code's autoCompactWindow, leaving a value the user set alone), OpenCode workers are compacted, and Antigravity is warned only. Default 300,000; range 100,000 to 1,000,000." },
         { term: "track record routing", desc: "Assigning worker tasks to models based on task type and historical success." },
         { term: "out of quota", desc: "Occurs when a provider or model runs out of tokens or hits rate limits, pausing work or falling back." },
         { term: "desktop alerts", desc: "System notifications sent when workers need approval, finish tasks, or approach budget limits." },
@@ -105,22 +105,22 @@ export function helpPage() {
     },
     {
       title: "Terminal Commands",
-      subtitle: "CLI controls via the subway-context binary",
+      subtitle: "CLI controls via the subway binary",
       items: [
-        { term: "subway-context", desc: "Run as an MCP server over stdio." },
-        { term: "subway-context hud [port] [--open]", desc: "Start the Live HUD on 127.0.0.1." },
-        { term: "subway-context workers", desc: "List workers, with approval codes for pending ones." },
-        { term: "subway-context approve <worker_id>", desc: "Launch a pending worker." },
-        { term: "subway-context reject <worker_id> [reason]", desc: "Reject a worker with an optional reason." },
-        { term: "subway-context stop <worker_id>", desc: "Stop a running worker." },
-        { term: "subway-context permissions", desc: "List worker permission requests." },
-        { term: "subway-context watch [--stream]", desc: "Wait for, or stream, permission requests and finished workers." },
-        { term: "subway-context mode [ask|auto_safe|auto_approve]", desc: "Show or set how workers get permissions." },
-        { term: "subway-context allow|always|deny <request_id>", desc: "Allow, always allow, or deny a worker permission request." },
-        { term: "subway-context tail <worker_id>", desc: "Show a worker's status and log." },
-        { term: "subway-context locks | track [name] | quota [source]", desc: "Show active file leases, view a shared context track, or inspect token quota." },
-        { term: "subway-context install | status | uninstall", desc: "Install, check connection status, or uninstall agent registrations." },
-        { term: "subway-context <tool> '<json args>'", desc: "Call any MCP tool directly." },
+        { term: "subway", desc: "Run as an MCP server over stdio." },
+        { term: "subway hud [port] [--open]", desc: "Start the Live HUD on 127.0.0.1." },
+        { term: "subway workers", desc: "List workers, with approval codes for pending ones." },
+        { term: "subway approve <worker_id>", desc: "Launch a pending worker." },
+        { term: "subway reject <worker_id> [reason]", desc: "Reject a worker with an optional reason." },
+        { term: "subway stop <worker_id>", desc: "Stop a running worker." },
+        { term: "subway permissions", desc: "List worker permission requests." },
+        { term: "subway watch [--stream]", desc: "Wait for, or stream, permission requests and finished workers." },
+        { term: "subway mode [ask|auto_safe|auto_approve]", desc: "Show or set how workers get permissions." },
+        { term: "subway allow|always|deny <request_id>", desc: "Allow, always allow, or deny a worker permission request." },
+        { term: "subway tail <worker_id>", desc: "Show a worker's status and log." },
+        { term: "subway locks | track [name] | quota [source]", desc: "Show active file leases, view a shared context track, or inspect token quota." },
+        { term: "subway install | status | uninstall", desc: "Install, check connection status, or uninstall agent registrations." },
+        { term: "subway <tool> '<json args>'", desc: "Call any MCP tool directly." },
       ]
     },
     {

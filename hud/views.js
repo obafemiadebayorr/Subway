@@ -454,7 +454,7 @@ export function settingsCard(settings, permissionCount = 0) {
             id: "mcp_read_tools", label: "MCP tools counted as reads",
             trailing: h("input", {
               type: "text", class: "sp-input", value: principalMcpReadTools,
-              placeholder: "mcp__subway-context__read_symbol, ...",
+              placeholder: "mcp__subway__read_symbol, ...",
               "aria-label": "MCP tools counted as reads",
               on: { change: (e) => postPrincipal({ mcp_read_tools: e.target.value }) },
             }),
@@ -925,7 +925,7 @@ export function overview(d, link) {
     h("section", { class: "card" },
       h("h2", { class: "card-title" }, "Limits at a glance"),
       h("div", { class: "rows" }, compactLimits(providers, now))),
-    d.version ? h("footer", { class: "ov-version" }, `Subway Context v${d.version}`) : null,
+    d.version ? h("footer", { class: "ov-version" }, `Subway v${d.version}`) : null,
   ];
 }
 

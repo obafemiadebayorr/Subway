@@ -6,6 +6,7 @@ usage helpers read them at call time to preserve patch/test behavior.
 from __future__ import annotations
 
 import os
+import subway_home
 import re
 import time
 from typing import Any, Dict, Optional
@@ -33,16 +34,21 @@ from cli_tools import (
 
 def _writes_subway_state(command: str) -> bool:
     """Best effort: a shell can write a file in too many ways to catch them all, so this stops the plain ones."""
-    # Match the state folder as a path (".../.subway-context"), not names like the "subway.subway-context" extension id.
-    return bool(re.search(r">\s*\S*/\.subway-context\b|\btee\b.*/\.subway-context\b|"
-                          r"\bsed\s+-i.*/\.subway-context\b|\b(mv|cp|rm)\b.*/\.subway-context\b", command))
+    # Match the state folder as a path (".../.subway", or the old ".../.subway-context"), not names like the "subway.subway-context" extension id.
+    return bool(re.search(r">\s*\S*/\.subway(?:-context)?\b|\btee\b.*/\.subway(?:-context)?\b|"
+                          r"\bsed\s+-i.*/\.subway(?:-context)?\b|\b(mv|cp|rm)\b.*/\.subway(?:-context)?\b", command))
 
 
 DEFAULT_PRINCIPAL_MCP_READ_TOOLS = [
+    "mcp__subway__read_symbol",
     "mcp__subway-context__read_symbol",
+    "mcp__subway__context_slice",
     "mcp__subway-context__context_slice",
+    "mcp__subway__read_terminal",
     "mcp__subway-context__read_terminal",
+    "mcp__subway__search_terminal",
     "mcp__subway-context__search_terminal",
+    "mcp__subway__project_files",
     "mcp__subway-context__project_files",
 ]
 
@@ -51,7 +57,9 @@ def principal_mcp_read_tools(cfg):
     mcp_read_tools = (cfg or {}).get("principal_mcp_read_tools")
     if not isinstance(mcp_read_tools, list) or not all(isinstance(x, str) for x in mcp_read_tools):
         return list(DEFAULT_PRINCIPAL_MCP_READ_TOOLS)
-    return mcp_read_tools
+    # The MCP server was renamed from subway-context to subway: honor both spellings.
+    renamed = [t.replace("mcp__subway-context__", "mcp__subway__") for t in mcp_read_tools]
+    return list(dict.fromkeys(mcp_read_tools + renamed))
 
 
 def _principal_settings():
@@ -79,7 +87,7 @@ def resolve_read_reset(settings, provider):
 
 def _principal_reads_path():
     import server
-    sdir = getattr(server, "SUBWAY_DIR", None) or os.path.expanduser("~/.subway-context")
+    sdir = getattr(server, "SUBWAY_DIR", None) or subway_home.subway_dir()
     return os.path.join(sdir, "principal_reads.json")
 
 def _bump_principal_reads(session_id):
@@ -229,8 +237,8 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     n = _bump_principal_reads(sid)
                     if n > max_reads:
                         reset_mode = resolve_read_reset(read_budget, provider)
-                        tail = (" Resets at compaction, or run `subway-context read-budget reset`."
-                                if reset_mode == "compaction" else " Run `subway-context read-budget reset`.")
+                        tail = (" Resets at compaction, or run `subway read-budget reset`."
+                                if reset_mode == "compaction" else " Run `subway read-budget reset`.")
                         return _deny(f"Read budget reached ({n} reads, limit {max_reads}). Delegate this: spin a worker with spin_worker, "
                                      "and use code= packets in the brief instead of pulling code into this chat." + tail)
             try:
@@ -246,7 +254,7 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if cmd and _writes_subway_state(str(cmd)):
         return _deny("Budgets are the user's to change. Ask them to run it, or use the HUD.")
     if (tool_name in ("Bash", "run_command") or cmd is not None) and isinstance(cmd, str):
-        if (re.search(r"(subway-context|server\.py)\s+(budget|compaction)\b", cmd)
+        if (re.search(r"(subway(?:-context)?|server\.py)\s+(budget|compaction)\b", cmd)
                 or any(k in cmd for k in ("/api/budget", "/api/chat_budget", "/api/settings", "X-Subway-Token"))):
             return _deny("Budgets are the user's to change. Ask them to run it, or use the HUD.")
 
@@ -254,7 +262,7 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 tool_input.get("filepath") or tool_input.get("notebook_path")) if isinstance(tool_input, dict) else None
     if filepath and isinstance(filepath, str):
         cpath = _canon_path(filepath, cwd)
-        sdir = os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or os.path.expanduser("~/.subway-context")))
+        sdir = os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or subway_home.subway_dir()))
         sreal = os.path.realpath(sdir)
         creal = os.path.realpath(cpath)
         wdir = os.path.join(sdir, "worktrees")
@@ -306,7 +314,7 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# Shared Context Tracks (~/.subway-context/tracks/)
+# Shared Context Tracks (~/.subway/tracks/)
 # --------------------------------------------------------------------------
 
 _ALERTS_TRACK = "alerts"  # Reserved: the destructive-action audit log, not a conversation track.

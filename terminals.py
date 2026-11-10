@@ -7,6 +7,7 @@ Each terminal's record lives in its own file under base_dir, written through the
 write helper here (tempfile in the same folder + os.replace).
 """
 import contextlib
+import subway_home
 import glob
 import hashlib
 import json
@@ -28,8 +29,8 @@ ARCHIVE_SUBDIR = "archive"
 # Per-terminal control state: dropped from the record once the terminal is closed.
 CONTROL_KEYS = ("allow_commands", "capture_output", "share_enabled", "shell_integration", "tty")
 
-HOOK_BEGIN_MARKER = "# >>> subway-context terminal hook >>>"
-HOOK_END_MARKER = "# <<< subway-context terminal hook <<<"
+HOOK_BEGIN_MARKER = "# >>> subway terminal hook >>>"
+HOOK_END_MARKER = "# <<< subway terminal hook <<<"
 
 _SECRET_NAME_RE = re.compile(r"(token|secret|key|password|passwd|pwd|auth|credential|apikey)", re.IGNORECASE)
 _ENV_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
@@ -481,7 +482,7 @@ PROTECTED_EXCEPTIONS_DEFAULTS = ["npm stage publish"]
 LONG_FLAGS = {"-r": "--recursive", "-f": "--force"}
 
 _PROTECTED_PATHS = [
-    "~/.ssh", "~/.npmrc", "~/.aws", "~/.config/gh", "~/.subway-context", "~/.zshrc",
+    "~/.ssh", "~/.npmrc", "~/.aws", "~/.config/gh", "~/.subway", "~/.subway-context", "~/.zshrc",
     "~/.bashrc", "~/.zprofile", "~/.bash_profile", "~/.gitconfig", "~/Library/Keychains",
 ]
 _SEGMENT_SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;", ";&"}
@@ -1073,7 +1074,9 @@ _HOOK_SCRIPT = '''#!/usr/bin/env python3
 import sys, os, json, time, urllib.request, urllib.error, subprocess
 
 def _hud():
-    base = os.path.join(os.path.expanduser("~"), ".subway-context")
+    base = os.environ.get("SUBWAY_DIR") or os.path.join(os.path.expanduser("~"), ".subway")
+    if not os.environ.get("SUBWAY_DIR") and not os.path.lexists(base) and os.path.isdir(base + "-context"):
+        base += "-context"  # not moved to ~/.subway yet
     port = 7890
     try:
         with open(os.path.join(base, "hud.json")) as f:
@@ -1217,7 +1220,7 @@ _ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
   # $EPOCHREALTIME is empty until zsh/datetime is loaded; without it every command took no time.
   zmodload zsh/datetime 2>/dev/null
-  ( python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
+  ( python3 "$HOME/.subway/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
   _subway_preexec() {
     SUBWAY_CMD_START=$EPOCHREALTIME
     SUBWAY_CMD="$1"
@@ -1225,7 +1228,7 @@ _ZSH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   _subway_precmd() {
     local code=$?
     if [ -n "$SUBWAY_CMD" ]; then
-      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$EPOCHREALTIME" "$PWD" >/dev/null 2>&1 & )
+      ( python3 "$HOME/.subway/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "$EPOCHREALTIME" "$PWD" >/dev/null 2>&1 & )
       unset SUBWAY_CMD
     fi
     return $code
@@ -1236,7 +1239,7 @@ fi'''
 
 _BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   export SUBWAY_TERMINAL_ID="shell-$$-$RANDOM"
-  ( python3 "$HOME/.subway-context/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
+  ( python3 "$HOME/.subway/terminal_hook.py" optin "$SUBWAY_TERMINAL_ID" "$PWD" >/dev/null 2>&1 & )
   _subway_prev_debug_cmd=""
   if trap -p DEBUG | grep -q .; then
     _subway_prev_debug_cmd=$(trap -p DEBUG | sed -E "s/^trap -- '(.*)' DEBUG$/\\\\1/")
@@ -1250,7 +1253,7 @@ _BASH_BLOCK = '''if [ -z "$SUBWAY_TERMINAL_ID" ]; then
   _subway_precmd() {
     local code=$?
     if [ -n "$SUBWAY_CMD" ]; then
-      ( python3 "$HOME/.subway-context/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "${EPOCHREALTIME:-$(date +%s)}" "$PWD" >/dev/null 2>&1 & )
+      ( python3 "$HOME/.subway/terminal_hook.py" event "$SUBWAY_TERMINAL_ID" "$SUBWAY_CMD" "$code" "$SUBWAY_CMD_START" "${EPOCHREALTIME:-$(date +%s)}" "$PWD" >/dev/null 2>&1 & )
       unset SUBWAY_CMD
     fi
     return $code
@@ -1281,11 +1284,16 @@ def install_hook(shell: str = "", server_url: str = "", token: str = "") -> str:
             return f"Could not back up {rc_path}: {e}"
     content = _HOOK_BLOCK_RE.sub("", content)
     block = _ZSH_BLOCK if name == "zsh" else _BASH_BLOCK
+    # The hook calls the script by path: point it at this machine's state folder.
+    hook_dir, home_dir = subway_home.subway_dir(), os.path.expanduser("~")
+    if hook_dir.startswith(home_dir + os.sep):
+        hook_dir = "$HOME" + hook_dir[len(home_dir):]
+    block = block.replace("$HOME/.subway/terminal_hook.py", f"{hook_dir}/terminal_hook.py")
     new_content = content.rstrip("\n") + "\n\n" + HOOK_BEGIN_MARKER + "\n" + block + "\n" + HOOK_END_MARKER + "\n"
     try:
         with open(rc_path, "w", encoding="utf-8") as f:
             f.write(new_content)
-        subway_dir = os.path.join(os.path.expanduser("~"), ".subway-context")
+        subway_dir = subway_home.subway_dir()
         os.makedirs(subway_dir, exist_ok=True)
         with open(os.path.join(subway_dir, _HOOK_SCRIPT_NAME), "w", encoding="utf-8") as f:
             f.write(_HOOK_SCRIPT)
@@ -1308,14 +1316,14 @@ def uninstall_hook(shell: str = "") -> str:
     except OSError as e:
         return f"Could not read {rc_path}: {e}"
     if HOOK_BEGIN_MARKER not in content:
-        return f"No subway-context hook installed in {rc_path}."
+        return f"No Subway hook installed in {rc_path}."
     new_content = _HOOK_BLOCK_RE.sub("", content)
     try:
         with open(rc_path, "w", encoding="utf-8") as f:
             f.write(new_content)
     except OSError as e:
         return f"Could not write {rc_path}: {e}"
-    script_path = os.path.join(os.path.expanduser("~"), ".subway-context", _HOOK_SCRIPT_NAME)
+    script_path = os.path.join(subway_home.subway_dir(), _HOOK_SCRIPT_NAME)
     with contextlib.suppress(OSError):
         if os.path.exists(script_path):
             os.remove(script_path)

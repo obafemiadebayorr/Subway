@@ -371,5 +371,5 @@ def _wake_worker_milestone(worker_id: str, meta: Dict[str, Any], result: Dict[st
         _s._broadcast_track_internal(summary, track=str((meta or {}).get("track") or "main"), station_id=worker_id)
     with contextlib.suppress(Exception):
         from notify_driver import dispatch_notification
-        dispatch_notification("Subway Context: Worker Milestone", summary, kind="worker_milestone",
+        dispatch_notification("Subway: Worker Milestone", summary, kind="worker_milestone",
                               data={"worker_id": worker_id, "chat_id": chat_id, "status": status, "track": (meta or {}).get("track", "main")})

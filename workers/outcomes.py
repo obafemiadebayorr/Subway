@@ -382,7 +382,7 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
         if not iteration_id:
             if ((status in ("failed", "stopped", "timed_out", "budget_stopped") or current.get("priority") == "urgent")
                     and not result.get("rerouted_to") and not result.get("stall_alerted")):
-                _s.notify_desktop_event(f"worker_ended|{wid}|{status}", "Subway Context", message[:500], route="workers")
+                _s.notify_desktop_event(f"worker_ended|{wid}|{status}", "Subway", message[:500], route="workers")
             target_chat = current.get("launched_by") or current.get("thread") or current.get("thread_root")
             if target_chat:
                 try:

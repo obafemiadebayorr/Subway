@@ -1,6 +1,6 @@
 """GET /api/stats: worker-record analytics for the HUD Stats page.
 
-Sources (never includes secret/cmd/prompt): ~/.subway-context/workers/worker_*.json
+Sources (never includes secret/cmd/prompt): ~/.subway/workers/worker_*.json
 - usage.input, usage.output, usage.cache_read
 - meta.stats.{tool_calls,edits,thinking_tokens,files_changed,wall_seconds} when present
 - timestamps: started_at, completed_at, created_at
@@ -9,13 +9,14 @@ Sources (never includes secret/cmd/prompt): ~/.subway-context/workers/worker_*.j
 from __future__ import annotations
 
 import glob
+import subway_home
 import json
 import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-WORKERS_DIR = os.path.expanduser("~/.subway-context/workers")
+WORKERS_DIR = os.path.join(subway_home.subway_dir(), "workers")
 CLAUDE_PROJECTS_DIR: Optional[str] = None
 RANGES = {"1h": 3600, "5h": 5 * 3600, "24h": 24 * 3600, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400}
 METRICS = {"tokens", "time", "speed", "work", "tool_calls", "thinking", "cache", "failures"}
@@ -268,7 +269,7 @@ def compute(range_key: str = "24h", metric: str = "tokens", group: str = "provid
         "principal_cache_read": sess_data["principal_cache_read"],
         "worker_cache_read": sess_data["worker_cache_read"],
         "sources": [
-            "worker records (~/.subway-context/workers/worker_*.json): usage.input, usage.output, usage.cache_read",
+            "worker records (~/.subway/workers/worker_*.json): usage.input, usage.output, usage.cache_read",
             "worker records meta.stats when present: tool_calls, edits, thinking_tokens, files_changed, wall_seconds",
             "timestamps: started_at, completed_at, created_at",
             "speed derived from output tokens / wall_seconds (median tokens/sec, avg run seconds)",

@@ -1,4 +1,5 @@
 import json, queue, threading, time, uuid
+import subway_home
 from typing import Dict, Any, Optional, Set
 
 class SSEBroadcaster:
@@ -59,7 +60,7 @@ def broadcast_event(event_type: str, data: Dict[str, Any]) -> int:
 import os as _os
 
 def _spool_path() -> str:
-    base = _os.environ.get("SUBWAY_DIR") or _os.path.join(_os.path.expanduser("~"), ".subway-context")
+    base = subway_home.subway_dir()
     return _os.path.join(base, "sse_events.jsonl")
 
 

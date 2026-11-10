@@ -297,13 +297,13 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
 def _pi_session_from_ancestry() -> str:
     """This pi chat's session id, found via the process that spawned this server.
 
-    The wake extension writes ~/.subway-context/pi_sessions/<pi-pid> = sessionId,
+    The wake extension writes ~/.subway/pi_sessions/<pi-pid> = sessionId,
     and this MCP server is a child of that pi process. Walking the ancestor chain
     gives the RIGHT session; picking the newest transcript file does not, because
     several chats share a cwd and the newest file belongs to whichever chatted last.
     Falls back to the newest session file when no mapping is present yet.
     """
-    subway_dir = getattr(_s, "SUBWAY_DIR", os.path.join(os.path.expanduser("~"), ".subway-context"))
+    subway_dir = getattr(_s, "SUBWAY_DIR", os.path.join(os.path.expanduser("~"), ".subway"))
     mapping_dir = os.path.join(subway_dir, "pi_sessions")
     pid = os.getpid()
     for _ in range(6):

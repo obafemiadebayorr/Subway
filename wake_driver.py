@@ -619,7 +619,7 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
         except Exception:
             cfg = {}
 
-    title = f"Subway Context: {event.kind.replace('_', ' ').title()}"
+    title = f"Subway: {event.kind.replace('_', ' ').title()}"
     message = event.text or f"Worker {event.worker_id} event: {event.kind}"
     if pending_before:
         message = f"{message} (+{pending_before} earlier event(s) queued while this chat was throttled)"

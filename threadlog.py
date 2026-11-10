@@ -5,6 +5,7 @@ Extracted from server.py. DEFAULT_MODELS stays here (re-exported by server.py).
 from __future__ import annotations
 
 import contextvars
+import subway_home
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -96,7 +97,7 @@ def thread_log_read(thread: str, base_dir: Optional[str] = None) -> List[Dict[st
         except ImportError:
             bdir = None
     if not bdir:
-        bdir = os.path.expanduser("~/.subway-context")
+        bdir = subway_home.subway_dir()
     try:
         data = threads.read_thread(bdir, thread)
         return list(data.get("records") or [])

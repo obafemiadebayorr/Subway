@@ -64,7 +64,7 @@
   <path d="M 280 265 L 380 265" stroke="#3b82f6" stroke-width="3" stroke-dasharray="6,4" fill="none"/>
   <path d="M 280 375 L 380 300" stroke="#10b981" stroke-width="3" stroke-dasharray="6,4" fill="none"/>
 
-  <!-- Center Hub: Subway Context Server -->
+  <!-- Center Hub: Subway Server -->
   <g transform="translate(380, 110)" filter="url(#glow)">
     <rect width="300" height="310" rx="16" fill="url(#hub-grad)" stroke="#38bdf8" stroke-width="2"/>
     <rect x="20" y="18" width="260" height="36" rx="8" fill="#0369a1"/>

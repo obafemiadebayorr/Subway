@@ -233,7 +233,7 @@ def low_limit_notice() -> str:
                 notices.append((key, text))
     notes = []
     for key, text in notices:
-        if _s.notify_desktop_event(key, "Subway Context limit warning", text, route="usage"):
+        if _s.notify_desktop_event(key, "Subway limit warning", text, route="usage"):
             notes.append(text)
     return "[LOW LIMIT] " + "; ".join(notes) + ". Plan around it, and shed load if it's yours." if notes else ""
 

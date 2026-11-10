@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Governor: limits principal probe calls per turn, requiring worker delegation."""
 import contextlib
+import subway_home
 import json
 import os
 import re
@@ -25,7 +26,7 @@ ALWAYS_ALLOWED = {  # bare tool names (strip any "mcp__<server>__" prefix first)
 }
 
 LANDING_RE = re.compile(
-    r"^\s*(git (apply|status|diff --stat)|(node bin/)?subway-context(\.js)? (run|approve|workers|governor)\b)"
+    r"^\s*(git (apply|status|diff --stat)|(node bin/)?subway(?:-context)?(\.js)? (run|approve|workers|governor)\b)"
 )
 
 _SHELL_TOOLS = {
@@ -39,7 +40,7 @@ def _subway_dir() -> str:
     return (
         getattr(srv, "SUBWAY_DIR", None)
         or os.environ.get("SUBWAY_DIR")
-        or os.path.expanduser("~/.subway-context")
+        or subway_home.subway_dir()
     )
 
 
@@ -241,7 +242,7 @@ def check(provider, session_id, tool_name, tool_input=None, turn_key="") -> dict
                     f"[GOVERNOR] {used-1}/{limit} probe calls used this turn. "
                     f"Delegate: spin_worker with the exact code and edit. "
                     f"Still allowed: spin/approve/status/notes, and landing "
-                    f"(git apply, git status, git diff --stat, subway-context run)."
+                    f"(git apply, git status, git diff --stat, subway run)."
                 )
                 return {"allow": False, "used": used, "limit": limit, "reason": reason}
     except Exception:

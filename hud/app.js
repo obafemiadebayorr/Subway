@@ -25,7 +25,7 @@ const PAGES = {
   models: { label: "Models", sub: "How each model is ranked, and where that came from" },
   leases: { label: "Leases", sub: "Who holds which file" },
   ledger: { label: "Ledger", sub: "Shared decisions across agents" },
-  help: { label: "Help", sub: "Guides, terms, and commands for Subway Context" },
+  help: { label: "Help", sub: "Guides, terms, and commands for Subway" },
 };
 
 const nav = {};
@@ -262,7 +262,7 @@ function updateBadges(d) {
   const { badge } = nav.workers;
   badge.hidden = !waiting;
   badge.textContent = waiting;
-  document.title = waiting ? `(${waiting}) Subway Context` : "Subway Context";
+  document.title = waiting ? `(${waiting}) Subway` : "Subway";
 }
 
 let inFlight = null;

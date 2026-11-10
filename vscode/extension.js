@@ -36,7 +36,7 @@ async function updateHudSharingStatus() {
 
 function getHudPort() {
   try {
-    const hudPath = path.join(os.homedir(), '.subway-context', 'hud.json');
+    const hudPath = path.join(subwayHomeFile(), 'hud.json');
     if (fs.existsSync(hudPath)) {
       const data = JSON.parse(fs.readFileSync(hudPath, 'utf8'));
       if (data && data.port) {
@@ -62,7 +62,7 @@ function checkHealth(port) {
 
 function getHudToken() {
   try {
-    const tokenPath = path.join(os.homedir(), '.subway-context', 'hud_token');
+    const tokenPath = path.join(subwayHomeFile(), 'hud_token');
     return fs.readFileSync(tokenPath, 'utf8').trim();
   } catch (e) {
     return '';
@@ -262,7 +262,7 @@ async function pollTerminalRuns(terminal, entry) {
 
 function writeProbeResult(data, log) {
   try {
-    const dir = path.join(os.homedir(), '.subway-context');
+    const dir = path.join(subwayHomeFile());
     fs.mkdirSync(dir, { recursive: true });
     const targetFile = path.join(dir, 'inline_probe.json');
     const tmpFile = `${targetFile}.tmp-${process.pid}`;
@@ -279,7 +279,7 @@ function writeProbeResult(data, log) {
 }
 
 function claimProbeRequest() {
-  const reqPath = path.join(os.homedir(), '.subway-context', 'inline_probe_request.json');
+  const reqPath = path.join(subwayHomeFile(), 'inline_probe_request.json');
   let req = null;
   try {
     req = JSON.parse(fs.readFileSync(reqPath, 'utf8'));
@@ -339,7 +339,7 @@ function playNotificationChime() {
 
 function checkNotifications() {
   try {
-    const dir = path.join(os.homedir(), '.subway-context', 'editor_windows');
+    const dir = path.join(subwayHomeFile(), 'editor_windows');
     const notifyFile = path.join(dir, `${process.pid}.notify.json`);
     if (fs.existsSync(notifyFile)) {
       const raw = fs.readFileSync(notifyFile, 'utf8');
@@ -355,7 +355,7 @@ function checkNotifications() {
 }
 
 function startNotificationListener() {
-  const dir = path.join(os.homedir(), '.subway-context', 'editor_windows');
+  const dir = path.join(subwayHomeFile(), 'editor_windows');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
 
   try {
@@ -373,7 +373,7 @@ function startNotificationListener() {
 
 function writeWindowHeartbeat() {
   try {
-    const dir = path.join(os.homedir(), '.subway-context', 'editor_windows');
+    const dir = path.join(subwayHomeFile(), 'editor_windows');
     fs.mkdirSync(dir, { recursive: true });
     const targetFile = path.join(dir, `${process.pid}.json`);
     const tmpFile = `${targetFile}.tmp-${process.pid}`;
@@ -586,7 +586,7 @@ function findServerLauncher() {
     const pyBin = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
     return { cmd: pyBin, args: [serverPy] };
   }
-  return { cmd: 'subway-context', args: [] };
+  return { cmd: 'subway', args: [] };
 }
 
 async function startOrRestartServer(port) {
@@ -602,7 +602,7 @@ async function startOrRestartServer(port) {
   } catch (err) {
     try {
       const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-      const child = cp.spawn(npxCmd, ['-y', 'subway-context', 'hud', String(port), '--no-open'], {
+      const child = cp.spawn(npxCmd, ['-y', '@obafemi_adebayorr/subway', 'hud', String(port), '--no-open'], {
         detached: true,
         stdio: 'ignore',
         env
@@ -628,7 +628,11 @@ let agyWakeWatcher = null;
 const agyWakeOffsets = new Map();
 
 function subwayHomeFile() {
-  return path.join(os.homedir(), '.subway-context');
+  if (process.env.SUBWAY_DIR) return process.env.SUBWAY_DIR;
+  const fresh = path.join(os.homedir(), ".subway");
+  const legacy = path.join(os.homedir(), ".subway-context");
+  try { if (!fs.existsSync(fresh) && fs.lstatSync(legacy).isDirectory()) return legacy; } catch (_) {}
+  return fresh;
 }
 
 function agyLog(line) {
@@ -991,7 +995,7 @@ function activate(context) {
   const estTimer = setInterval(() => {
     if (!estDirty) return;
     estDirty = false;
-    const dir = process.env.SUBWAY_DIR || path.join(os.homedir(), '.subway-context');
+    const dir = subwayHomeFile();
     try {
       fs.mkdirSync(dir, { recursive: true });
       const f = path.join(dir, 'copilot_inline_estimate.json');
@@ -1059,7 +1063,7 @@ function deactivate() {
     notificationWatcher = null;
   }
   try {
-    const file = path.join(os.homedir(), '.subway-context', 'editor_windows', `${process.pid}.json`);
+    const file = path.join(subwayHomeFile(), 'editor_windows', `${process.pid}.json`);
     fs.unlinkSync(file);
   } catch (_) {}
 }

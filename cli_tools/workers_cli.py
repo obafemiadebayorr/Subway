@@ -41,7 +41,7 @@ def t_watch_workers(wait_seconds: int = 50) -> str:
             created = float(w.get("created_ts") or 0)
             if created and time.time() - created < 20:
                 continue  # Just queued: give it the same grace as notify_if_still_waiting.
-            _s.notify_desktop_event(f"worker_waiting|{w['id']}", "Subway Context",
+            _s.notify_desktop_event(f"worker_waiting|{w['id']}", "Subway",
                                  f"Worker {w['id']} waiting on your approval")
 
     deadline = time.time() + max(1, min(int(wait_seconds), 55))

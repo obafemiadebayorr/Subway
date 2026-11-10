@@ -1,4 +1,5 @@
 import os
+import subway_home
 import sys
 import json
 import tempfile
@@ -15,7 +16,7 @@ def _subway_dir() -> str:
     return (
         getattr(srv, "SUBWAY_DIR", None)
         or os.environ.get("SUBWAY_DIR")
-        or os.path.expanduser("~/.subway-context")
+        or subway_home.subway_dir()
     )
 
 def settings() -> dict:

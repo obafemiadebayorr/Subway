@@ -70,7 +70,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt_text = str(event.get("prompt") or "")
         for line in prompt_text.splitlines():
             line_str = line.strip()
-            m_comp = re.match(r"^!?\s*subway-context\s+compaction\s+(\S+)(?:\s+<?([\d.]+)\s*([kKmM]?)>?)?\s*$",
+            m_comp = re.match(r"^!?\s*subway(?:-context)?\s+compaction\s+(\S+)(?:\s+<?([\d.]+)\s*([kKmM]?)>?)?\s*$",
                               line_str, re.IGNORECASE)
             if m_comp:
                 at = None
@@ -83,7 +83,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         "additionalContext": res
                     }
                 }
-            m = re.match(r"^!?\s*subway-context\s+budget\s+(\S+)\s+(?:<([^>]+)>|(\S+))\s*$", line_str, re.IGNORECASE)
+            m = re.match(r"^!?\s*subway(?:-context)?\s+budget\s+(\S+)\s+(?:<([^>]+)>|(\S+))\s*$", line_str, re.IGNORECASE)
             if m:
                 scope = m.group(1).lower().strip()
                 raw_tok = (m.group(2) or m.group(3)).strip().replace(",", "")
@@ -117,8 +117,8 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         used = _s.chat_tokens_used(sid)
         if used is not None and used >= limit:
             label = "This chat's budget" if scope == "chat" else "The universal chat budget"
-            cmd = "subway-context budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" else "")
-            _s.notify_desktop_event(f"chat_budget_blocked|{sid or _s._self_id() or 'unknown-chat'}|{limit}", "Subway Context",
+            cmd = "subway budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" else "")
+            _s.notify_desktop_event(f"chat_budget_blocked|{sid or _s._self_id() or 'unknown-chat'}|{limit}", "Subway",
                                  f"{label} is reached: {used:,} of {limit:,} tokens. Add more with: {cmd}, or in the HUD.",
                                  route="overview")
             return {
@@ -149,7 +149,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     b_state[sid] = crossed
                     _s._save_json("prompt_banner_state.json", b_state)
                     label = "this chat's" if scope == "chat" else "the universal chat"
-                    cmd = f"subway-context budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" and sid else "")
+                    cmd = f"subway budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" and sid else "")
                     notices.append(f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). Add more with: {cmd}, or in the HUD.")
 
     prompt_text = str(event.get("prompt") or "")

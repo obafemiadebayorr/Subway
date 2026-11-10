@@ -6,6 +6,7 @@ Never fakes values: missing/failing collectors report in collection.collectors.
 from __future__ import annotations
 
 import glob
+import subway_home
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-WORKERS_DIR = os.path.expanduser("~/.subway-context/workers")
+WORKERS_DIR = os.path.join(subway_home.subway_dir(), "workers")
 _TTL = 1.0
 _cache: Dict[str, Any] = {"key": "diag", "at": 0.0, "value": None}
 _prev_disk: Dict[str, Any] = {"at": 0.0, "read_bytes": None, "write_bytes": None}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subway_home
 import os
 import re
 import time
@@ -15,7 +16,7 @@ except ImportError:
     except ImportError:
         _all_workers = None
 
-DIGEST_CACHE_FILE = os.path.expanduser("~/.subway-context/worker_digest.json")
+DIGEST_CACHE_FILE = os.path.join(subway_home.subway_dir(), "worker_digest.json")
 CACHE_TTL_SECONDS = 600
 
 ADVICE = {
@@ -36,7 +37,7 @@ FILE_RE = re.compile(r"[\w./-]+\.(?:py|js|mjs|css|md|json|html)")
 
 
 def _get_cache_path() -> str:
-    default_path = os.path.expanduser("~/.subway-context/worker_digest.json")
+    default_path = os.path.join(subway_home.subway_dir(), "worker_digest.json")
     if DIGEST_CACHE_FILE != default_path:
         return DIGEST_CACHE_FILE
     subway_dir = os.environ.get("SUBWAY_DIR")

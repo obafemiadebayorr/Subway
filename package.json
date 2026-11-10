@@ -1,23 +1,23 @@
 {
-  "name": "subway-context",
+  "name": "@obafemi_adebayorr/subway",
   "version": "1.3.7",
   "description": "On-demand multi-window context transit and workspace guard for AI coding agents (Claude Code, OpenCode, Antigravity)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ObaIsSoft/Subway.git"
+    "url": "git+https://github.com/obafemiadebayorr/Subway.git"
   },
-  "homepage": "https://github.com/ObaIsSoft/Subway#readme",
+  "homepage": "https://github.com/obafemiadebayorr/Subway#readme",
   "bugs": {
-    "url": "https://github.com/ObaIsSoft/Subway/issues"
+    "url": "https://github.com/obafemiadebayorr/Subway/issues"
   },
-  "main": "bin/subway-context.js",
+  "main": "bin/subway.js",
   "bin": {
-    "subway-context": "bin/subway-context.js",
-    "subway": "bin/subway-context.js"
+    "subway": "bin/subway.js",
+    "subway-context": "bin/subway-context.js"
   },
   "scripts": {
     "test": "python3 -m unittest discover -s tests",
-    "build:vsix": "cd vscode && npx -y @vscode/vsce@3 package --skip-license -o subway-context.vsix",
+    "build:vsix": "cd vscode && npx -y @vscode/vsce@3 package --skip-license -o subway.vsix",
     "prepack": "find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; npm run build:vsix"
   },
   "engines": {
@@ -38,6 +38,7 @@
   "files": [
     "bin",
     "server.py",
+    "subway_home.py",
     "worker_supervision",
     "hud_server",
     "copilot_inline.py",
@@ -86,7 +87,7 @@
     "install.py",
     "README.md",
     "hud",
-    "vscode/subway-context.vsix"
+    "vscode/subway.vsix"
   ],
   "dependencies": {
     "acorn": "^8.19.0"

@@ -1,4 +1,5 @@
 import os
+import subway_home
 import re
 import json
 import shutil
@@ -150,12 +151,12 @@ def check_provider(provider: str, model: str) -> List[str]:
         if not shutil.which(bin_name):
             warnings.append(f"provider CLI not found: {provider}")
 
-    # (b) model listed in ~/.subway-context/bad_models.json (read it; it's JSON — handle dict or list)
+    # (b) model listed in ~/.subway/bad_models.json (read it; it's JSON — handle dict or list)
     if model:
-        subway_dir = os.environ.get("SUBWAY_DIR") or os.path.expanduser("~/.subway-context")
+        subway_dir = subway_home.subway_dir()
         bad_models_path = os.path.join(subway_dir, "bad_models.json")
         if not os.path.exists(bad_models_path):
-            bad_models_path = os.path.expanduser("~/.subway-context/bad_models.json")
+            bad_models_path = os.path.join(subway_dir, "bad_models.json")
 
         if os.path.exists(bad_models_path):
             try:

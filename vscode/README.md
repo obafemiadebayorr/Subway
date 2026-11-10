@@ -1,11 +1,11 @@
-# Subway Context Editor Extension
+# Subway Editor Extension
 
-This extension integrates the Subway Context HUD directly into VS Code, Cursor, Windsurf, and Google Antigravity IDE using VS Code's internal browser (`simpleBrowser`).
+This extension integrates the Subway HUD directly into VS Code, Cursor, Windsurf, and Google Antigravity IDE using VS Code's internal browser (`simpleBrowser`).
 
 ## Installation
 
 ### Automatic (Recommended)
-The Subway Context installer sets up the extension automatically for detected editors:
+The Subway installer sets up the extension automatically for detected editors:
 ```bash
 python3 install.py
 ```
@@ -23,14 +23,14 @@ If you prefer to install it manually:
    ```
    Or inside `vscode/`:
    ```bash
-   npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway-context.vsix
+   npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway.vsix
    ```
 
 2. Install the `.vsix` into your editor:
-   - **VS Code**: `code --install-extension vscode/subway-context.vsix`
-   - **Cursor**: `cursor --install-extension vscode/subway-context.vsix`
-   - **Windsurf**: `windsurf --install-extension vscode/subway-context.vsix`
-   - **Antigravity IDE**: `~/.antigravity-ide/antigravity-ide/bin/agy-ide --install-extension vscode/subway-context.vsix`
+   - **VS Code**: `code --install-extension vscode/subway.vsix`
+   - **Cursor**: `cursor --install-extension vscode/subway.vsix`
+   - **Windsurf**: `windsurf --install-extension vscode/subway.vsix`
+   - **Antigravity IDE**: `~/.antigravity-ide/antigravity-ide/bin/agy-ide --install-extension vscode/subway.vsix`
 
 ## Usage
 - Open the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) and run **Subway: Open HUD**.

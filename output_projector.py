@@ -1,4 +1,5 @@
 import os
+import subway_home
 import re
 import secrets
 from pathlib import Path
@@ -8,7 +9,7 @@ def _get_subway_dir() -> Path:
     subway_dir = os.environ.get("SUBWAY_DIR")
     if subway_dir:
         return Path(subway_dir)
-    return Path.home() / ".subway-context"
+    return Path(subway_home.subway_dir())
 
 
 def _parse_pass_summary(cmd: str, out: str) -> str:
@@ -136,7 +137,7 @@ def project(cmd: str, rc: int, out: str, log_id: str = "") -> str:
     if not log_id:
         log_id = f"term_{secrets.token_hex(3)}"
 
-    # Save the full output to ~/.subway-context/logs/<log_id>.log (create the dir)
+    # Save the full output to ~/.subway/logs/<log_id>.log (create the dir)
     logs_dir = _get_subway_dir() / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / f"{log_id}.log"

@@ -76,7 +76,7 @@ def ttl_cached(seconds: float) -> Callable[..., Any]:
 
 
 def log(*a: Any) -> None:
-    print("[subway-context]", *a, file=sys.stderr, flush=True)
+    print("[subway]", *a, file=sys.stderr, flush=True)
 
 
 def clip(s: str, n: int) -> str:

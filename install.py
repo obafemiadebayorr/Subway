@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Subway Context — Universal Interactive Installer & Connector.
+"""Subway — Universal Interactive Installer & Connector.
 
-Connects Subway Context across coding agent environments with full user control:
+Connects Subway across coding agent environments with full user control:
 - Auto-detects installed coding agents.
 - Shows disclaimer and detected paths before making any changes.
 - Supports installing on ALL detected agents or SELECTING specific ones (e.g. just 2 of 3).
@@ -18,6 +18,7 @@ Usage:
 """
 
 import glob
+import subway_home
 import json
 import os
 import select
@@ -107,7 +108,7 @@ def get_default_paths() -> Tuple[str, str]:
 def server_command(server_py: str, py_bin: str) -> List[str]:
     if "/_npx/" in server_py.replace("\\", "/"):
         npx = "npx.cmd" if sys.platform == "win32" else "npx"
-        return [npx, "-y", "subway-context"]
+        return [npx, "-y", "@obafemi_adebayorr/subway"]
     return [py_bin, server_py]
 
 
@@ -354,6 +355,25 @@ def install_governor_adapters(repo_dir: Optional[str] = None) -> bool:
     return True
 
 
+def _migrate_claude_tool_names(home: str = "") -> None:
+    """Subway's MCP server was renamed from subway-context: carry Claude permission rules over to mcp__subway__*."""
+    base = os.path.join(home or os.path.expanduser("~"), ".claude")
+    for name in ("settings.json", "settings.local.json"):
+        path = os.path.join(base, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            if "mcp__subway-context__" not in text:
+                continue
+            json.loads(text)
+            with open(path + ".subway-rename.bak", "w", encoding="utf-8") as fh:
+                fh.write(text)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text.replace("mcp__subway-context__", "mcp__subway__"))
+        except (OSError, ValueError):
+            continue
+
+
 def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
     config_path = os.path.expanduser("~/.claude.json")
     try:
@@ -373,7 +393,9 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
     base_cmd = server_command(server_py, py_bin)
     servers = data.setdefault("mcpServers", {})
-    servers["subway-context"] = {
+    _migrate_claude_tool_names()
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "command": base_cmd[0],
         "args": base_cmd[1:]
     }
@@ -384,9 +406,9 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
     if isinstance(hooks, dict):
         if "/_npx/" in server_py.replace("\\", "/"):
             npx = "npx.cmd" if sys.platform == "win32" else "npx"
-            hook_cmd = f"{shlex.quote(npx)} -y subway-context hook-guard"
-            hook_prompt_cmd = f"{shlex.quote(npx)} -y subway-context hook-prompt"
-            hook_precompact_cmd = f"{shlex.quote(npx)} -y subway-context hook-precompact"
+            hook_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-guard"
+            hook_prompt_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-prompt"
+            hook_precompact_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-precompact"
         else:
             hook_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-guard"
             hook_prompt_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-prompt"
@@ -443,12 +465,12 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
     cmds_dir = os.path.expanduser("~/.claude/commands")
     _safe_write_marked_file(
         os.path.join(cmds_dir, "opencode.md"),
-        "Read the latest decisions and files modified by OpenCode terminal agent via Subway Context:\n"
+        "Read the latest decisions and files modified by OpenCode terminal agent via Subway:\n"
         "Call MCP tool `read_chat(chat_id=\"@opencode\", mode=\"decisions\", since=\"last\")` and summarize the results.\n"
     )
     _safe_write_marked_file(
         os.path.join(cmds_dir, "gemini.md"),
-        "Read the latest decisions and files modified by the Antigravity/Gemini session via Subway Context:\n"
+        "Read the latest decisions and files modified by the Antigravity/Gemini session via Subway:\n"
         "Call MCP tool `read_chat(chat_id=\"@agy-latest\", mode=\"decisions\", since=\"last\")` and summarize the results.\n"
     )
     _safe_write_marked_file(
@@ -471,7 +493,8 @@ def install_antigravity(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
     base_cmd = server_command(server_py, py_bin)
     servers = data.setdefault("mcpServers", {})
-    servers["subway-context"] = {
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "command": base_cmd[0],
         "args": base_cmd[1:]
     }
@@ -480,22 +503,22 @@ def install_antigravity(server_py: str, py_bin: str) -> Tuple[bool, str]:
     # Antigravity visual @ skills (~/.gemini/config/skills/)
     skills_base = os.path.expanduser("~/.gemini/config/skills")
     for s_name, s_desc, s_call in (
-        ("opencode", "Subway Context connector to OpenCode terminal agent.", 'read_chat(chat_id="@opencode", mode="decisions", since="last")'),
-        ("claude", "Subway Context connector to Claude Code.", 'read_chat(chat_id="@claude-latest", mode="decisions", since="last")'),
-        ("subway", "Subway Context multi-window agent transit system.", "list_chats()"),
+        ("opencode", "Subway connector to OpenCode terminal agent.", 'read_chat(chat_id="@opencode", mode="decisions", since="last")'),
+        ("claude", "Subway connector to Claude Code.", 'read_chat(chat_id="@claude-latest", mode="decisions", since="last")'),
+        ("subway", "Subway multi-window agent transit system.", "list_chats()"),
     ):
         s_file = os.path.join(skills_base, s_name, "SKILL.md")
         s_content = (
             f"---\nname: {s_name}\ndescription: {s_desc}\n---\n\n"
             f"# {s_name.capitalize()} Transit Connector\n\n"
-            f"When mentioned or invoked with `@{s_name}`, call Subway Context MCP tool `{s_call}`.\n"
+            f"When mentioned or invoked with `@{s_name}`, call Subway MCP tool `{s_call}`.\n"
         )
         _safe_write_marked_file(s_file, s_content)
 
     # Lifecycle hook: guard & read-budget gate
     npx = shutil.which("npx")
-    if npx and os.path.exists(os.path.join(os.path.dirname(server_py), "bin", "subway-context.js")):
-        hook_cmd = f"{shlex.quote(npx)} -y subway-context hook-guard"
+    if npx and os.path.exists(os.path.join(os.path.dirname(server_py), "bin", "subway.js")):
+        hook_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-guard"
     else:
         hook_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-guard"
 
@@ -535,7 +558,8 @@ def install_opencode(server_py: str, py_bin: str) -> Tuple[bool, str]:
     base_cmd = server_command(server_py, py_bin)
     mcp_obj = data.setdefault("mcp", {})
     servers = mcp_obj.setdefault("servers", {})
-    servers["subway-context"] = {
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "type": "local",
         "command": base_cmd
     }
@@ -566,7 +590,8 @@ def install_copilot_cli(server_py: str, py_bin: str) -> Tuple[bool, str]:
     if not isinstance(mcp_servers, dict):
         mcp_servers = {}
         data["mcpServers"] = mcp_servers
-    mcp_servers["subway-context"] = {
+    mcp_servers.pop("subway-context", None)
+    mcp_servers["subway"] = {
         "type": "local",
         "command": cmd[0],
         "args": cmd[1:],
@@ -602,7 +627,7 @@ def _sync_deepai_models(agent_dirs: List[str]) -> str:
     if not api_key:
         return ""
 
-    subway_pi = os.path.join(home, ".subway-context", "pi")
+    subway_pi = os.path.join(subway_home.subway_dir(home), "pi")
     os.makedirs(subway_pi, exist_ok=True)
     all_dirs = [subway_pi] + list(agent_dirs)
 
@@ -646,7 +671,7 @@ def _sync_deepai_models(agent_dirs: List[str]) -> str:
 
 
 def _pi_budget_guard_config_path() -> str:
-    subway_dir = os.environ.get("SUBWAY_DIR") or os.path.join(os.path.expanduser("~"), ".subway-context")
+    subway_dir = subway_home.subway_dir()
     return os.path.join(subway_dir, "pi_budget_guard.json")
 
 
@@ -661,7 +686,8 @@ def install_pi(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
     base_cmd = server_command(server_py, py_bin)
     servers = data.setdefault("mcpServers", {})
-    servers["subway-context"] = {
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "command": base_cmd[0],
         "args": base_cmd[1:]
     }
@@ -711,7 +737,7 @@ def install_pi(server_py: str, py_bin: str) -> Tuple[bool, str]:
         budget_cfg = {
             "server_py": os.path.abspath(server_py),
             "py_bin": py_bin,
-            "subway_dir": os.environ.get("SUBWAY_DIR") or os.path.join(os.path.expanduser("~"), ".subway-context"),
+            "subway_dir": subway_home.subway_dir(),
         }
         _atomic_write_json(budget_cfg_path, budget_cfg)
         budget_msg = f"; budget guard config written to {budget_cfg_path}"
@@ -754,7 +780,8 @@ def install_cursor(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
     base_cmd = server_command(server_py, py_bin)
     servers = data.setdefault("mcpServers", {})
-    servers["subway-context"] = {
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "command": base_cmd[0],
         "args": base_cmd[1:]
     }
@@ -765,9 +792,9 @@ def install_cursor(server_py: str, py_bin: str) -> Tuple[bool, str]:
     if os.path.exists(skills_dir):
         subway_skill = os.path.join(skills_dir, "subway", "SKILL.md")
         content = (
-            "---\nname: subway\ndescription: Subway Context multi-window agent transit system.\n---\n\n"
-            "# Subway Context Connector\n\n"
-            "Use Subway Context to read decisions and changes from other coding agents:\n"
+            "---\nname: subway\ndescription: Subway multi-window agent transit system.\n---\n\n"
+            "# Subway Connector\n\n"
+            "Use Subway to read decisions and changes from other coding agents:\n"
             "- `read_chat(chat_id=\"@claude-latest\", mode=\"decisions\")`\n"
             "- `read_chat(chat_id=\"@agy-latest\", mode=\"decisions\")`\n"
             "- `list_chats()` to list active sessions across agents.\n"
@@ -789,7 +816,8 @@ def install_devin(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
     base_cmd = server_command(server_py, py_bin)
     servers = data.setdefault("mcpServers", {})
-    servers["subway-context"] = {
+    servers.pop("subway-context", None)
+    servers["subway"] = {
         "command": base_cmd[0],
         "args": base_cmd[1:]
     }
@@ -798,6 +826,9 @@ def install_devin(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
 
 def install_all() -> int:
+    moved = subway_home.migrate()
+    if moved:
+        print(f"  {moved}")
     server_py, py_bin = get_default_paths()
     envs = detect_environments()
     detected_keys = [k for k, v in envs.items() if v["detected"]]
@@ -831,8 +862,8 @@ def remove_target(target: str) -> bool:
         if os.path.exists(c_path):
             try:
                 d = _load_json(c_path)
-                if "mcpServers" in d and "subway-context" in d["mcpServers"]:
-                    del d["mcpServers"]["subway-context"]
+                if "mcpServers" in d and any(k in d["mcpServers"] for k in ("subway", "subway-context")):
+                    for k in ("subway", "subway-context"): d["mcpServers"].pop(k, None)
                     _atomic_write_json(c_path, d)
                     print("  ✓ Claude Code: Disconnected from ~/.claude.json")
                     removed = True
@@ -933,8 +964,8 @@ def remove_target(target: str) -> bool:
         if os.path.exists(a_path):
             try:
                 d = _load_json(a_path)
-                if "mcpServers" in d and "subway-context" in d["mcpServers"]:
-                    del d["mcpServers"]["subway-context"]
+                if "mcpServers" in d and any(k in d["mcpServers"] for k in ("subway", "subway-context")):
+                    for k in ("subway", "subway-context"): d["mcpServers"].pop(k, None)
                     _atomic_write_json(a_path, d)
                     print("  ✓ Antigravity: Disconnected from ~/.gemini/config/mcp_config.json")
                     removed = True
@@ -981,8 +1012,8 @@ def remove_target(target: str) -> bool:
         if os.path.exists(o_path):
             try:
                 d = _load_json(o_path)
-                if "mcp" in d and "servers" in d["mcp"] and "subway-context" in d["mcp"]["servers"]:
-                    del d["mcp"]["servers"]["subway-context"]
+                if "mcp" in d and "servers" in d["mcp"] and any(k in d["mcp"]["servers"] for k in ("subway", "subway-context")):
+                    for k in ("subway", "subway-context"): d["mcp"]["servers"].pop(k, None)
                     _atomic_write_json(o_path, d)
                     print("  ✓ OpenCode: Disconnected from ~/.config/opencode/opencode.json")
                     removed = True
@@ -1009,8 +1040,8 @@ def remove_target(target: str) -> bool:
         if os.path.exists(p_path):
             try:
                 d = _load_json(p_path)
-                if "mcpServers" in d and "subway-context" in d["mcpServers"]:
-                    del d["mcpServers"]["subway-context"]
+                if "mcpServers" in d and any(k in d["mcpServers"] for k in ("subway", "subway-context")):
+                    for k in ("subway", "subway-context"): d["mcpServers"].pop(k, None)
                     _atomic_write_json(p_path, d)
                     print(f"  ✓ pi (DeepAI Code): Disconnected from {p_path}")
                     removed = True
@@ -1022,8 +1053,8 @@ def remove_target(target: str) -> bool:
         if os.path.exists(cp_path):
             try:
                 d = _load_json(cp_path)
-                if "mcpServers" in d and isinstance(d["mcpServers"], dict) and "subway-context" in d["mcpServers"]:
-                    del d["mcpServers"]["subway-context"]
+                if "mcpServers" in d and isinstance(d["mcpServers"], dict) and any(k in d["mcpServers"] for k in ("subway", "subway-context")):
+                    for k in ("subway", "subway-context"): d["mcpServers"].pop(k, None)
                     _atomic_write_json(cp_path, d)
                     print(f"  ✓ Copilot CLI: Disconnected from {cp_path}")
                     removed = True
@@ -1159,7 +1190,7 @@ def _probe_mcp_server(full_cmd: List[str], timeout: float = 10.0) -> Tuple[bool,
 
 
 def check_status() -> None:
-    print("🚇 Subway Context Connection Status:\n")
+    print("🚇 Subway Connection Status:\n")
     targets = [
         ("Claude Code", os.path.expanduser("~/.claude.json"), "claude"),
         ("Antigravity", os.path.expanduser("~/.gemini/config/mcp_config.json"), "antigravity"),
@@ -1179,11 +1210,11 @@ def check_status() -> None:
 
         if key in ("claude", "antigravity", "pi"):
             servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
-            entry = servers.get("subway-context")
+            entry = servers.get("subway") or servers.get("subway-context")
         else:
             mcp = data.get("mcp", {}) if isinstance(data, dict) else {}
             servers = mcp.get("servers", {}) if isinstance(mcp, dict) else {}
-            entry = servers.get("subway-context")
+            entry = servers.get("subway") or servers.get("subway-context")
 
         if not entry:
             print("  Registered: no")
@@ -1341,7 +1372,7 @@ def ensure_notifier(interactive: bool, auto_yes: bool) -> str:
 def ensure_editor_extension(interactive: bool, auto_yes: bool) -> List[str]:
     """Offer or install Subway HUD editor extension in detected editors."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    vsix_path = os.path.join(pkg_dir, "vscode", "subway-context.vsix")
+    vsix_path = os.path.join(pkg_dir, "vscode", "subway.vsix")
 
     agy_ide = os.path.expanduser("~/.antigravity-ide/antigravity-ide/bin/agy-ide")
     devin_cli = shutil.which("devin") or (
@@ -1368,19 +1399,21 @@ def ensure_editor_extension(interactive: bool, auto_yes: bool) -> List[str]:
 
         try:
             proc = subprocess.run([cli_path, "--list-extensions"], capture_output=True, text=True, timeout=5)
-            has_ext = proc.returncode == 0 and "subway.subway-context" in (proc.stdout or "").lower()
+            listed = (proc.stdout or "").lower().split() if proc.returncode == 0 else []
         except Exception:
-            has_ext = False
+            listed = []
+        has_ext = "subway.subway" in listed
+        old_ext = "subway.subway-context" in listed  # the extension's id before the rename
 
         if has_ext:
-            print(f"  ✓ Editor extension: {name} already has subway.subway-context installed.")
+            print(f"  ✓ Editor extension: {name} already has subway.subway installed.")
             results.append("installed")
             continue
 
         if not os.path.exists(vsix_path):
             print(f"\n  ! Editor extension for {name}: {vsix_path} not found.")
             print("    To build it: npm run build:vsix")
-            print("    (or: cd vscode && npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway-context.vsix)")
+            print("    (or: cd vscode && npx -y @vscode/vsce@3 package --allow-missing-repository --skip-license -o subway.vsix)")
             results.append("missing-vsix")
             continue
 
@@ -1398,6 +1431,11 @@ def ensure_editor_extension(interactive: bool, auto_yes: bool) -> List[str]:
                 results.append("declined")
                 continue
 
+        if old_ext:
+            try:
+                subprocess.run([cli_path, "--uninstall-extension", "subway.subway-context"], capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                pass
         print(f"  Installing Subway extension in {name} ({cli_path} --install-extension {vsix_path})...")
         try:
             done = subprocess.run([cli_path, "--install-extension", vsix_path], timeout=60).returncode == 0
@@ -1429,7 +1467,7 @@ def main() -> None:
             if a in ("--remove", "--uninstall") and i + 1 < len(args) and not args[i + 1].startswith("-"):
                 target = args[i + 1]
                 break
-        print(f"🚇 Disconnecting Subway Context ({target})...\n")
+        print(f"🚇 Disconnecting Subway ({target})...\n")
         if target == "all":
             remove_all()
         else:
@@ -1438,14 +1476,14 @@ def main() -> None:
         return
 
     server_py, py_bin = get_default_paths()
-    print("🚇 Subway Context Universal Connector\n")
+    print("🚇 Subway Universal Connector\n")
     print("Environment Detection:")
     envs = detect_environments()
     detected_keys = [k for k, v in envs.items() if v["detected"]]
 
     if not detected_keys:
         print("\n⚠️  No supported agent environments (Claude, Antigravity, OpenCode, pi) were detected.")
-        print("Please install at least one supported tool before connecting Subway Context.")
+        print("Please install at least one supported tool before connecting Subway.")
         return
 
     print("\nDisclaimer & Privacy:")
@@ -1484,7 +1522,7 @@ def main() -> None:
         print("No environments selected. Exiting without changes.")
         return
 
-    print(f"\nProceeding to connect Subway Context to {len(selected_keys)} environment(s):")
+    print(f"\nProceeding to connect Subway to {len(selected_keys)} environment(s):")
     installers = {
         "claude": install_claude,
         "antigravity": install_antigravity,

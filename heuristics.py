@@ -16,7 +16,7 @@ FILE_PATH_RE = re.compile(
 )
 
 # --------------------------------------------------------------------------
-# Stations & Checkpoints (~/.subway-context/)
+# Stations & Checkpoints (~/.subway/)
 # --------------------------------------------------------------------------
 
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")

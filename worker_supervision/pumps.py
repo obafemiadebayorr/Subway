@@ -118,7 +118,7 @@ def _is_test_run_command(tool_name: str, params: Any, test_commands: List[str]) 
     return any(t in cmd for t in test_commands)
 
 
-_MCP_PREFIX_RE = re.compile(r"^(?:mcp__)?subway[-_]context(?:__|_|\.)")
+_MCP_PREFIX_RE = re.compile(r"^(?:mcp__)?subway(?:[-_]context)?(?:__|_|\.)")
 
 
 def _role_kind(role: Any = "", caps: Any = None) -> str:
@@ -177,7 +177,7 @@ def _check_git_log_clamp(run: Dict[str, Any], write: Callable[[str], None], tool
 
 
 def _bare_tool_name(tool_name: Any) -> str:
-    """`mcp__subway_context__spin_worker` / `subway-context_spin_worker` -> `spin_worker`."""
+    """`mcp__subway__spin_worker` / `subway_spin_worker` (or the old subway-context prefix) -> `spin_worker`."""
     name = str(tool_name or "")
     name = _MCP_PREFIX_RE.sub("", name)
     return name.rsplit("__", 1)[-1]

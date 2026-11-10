@@ -244,11 +244,11 @@ def budget_ping_notice(scope: str, used: int, limit: int, label: Optional[str] =
     else:
         key = f"budget_warning|provider|{scope}|{window or '5h'}|{reset_at or 'unknown'}|{limit}|{level}"
     label = label or scope
-    cmd = f"subway-context budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
+    cmd = f"subway budget {scope} <tokens>" + (f" --chat {chat_id}" if scope == "chat" and chat_id else "")
     message = (f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). "
                f"Add more with: {cmd}, or in the HUD.")
     if desktop:
-        return message if _s.notify_desktop_event(key, "Subway Context budget warning", message, route="overview") else ""
+        return message if _s.notify_desktop_event(key, "Subway budget warning", message, route="overview") else ""
     now = time.time()
     with _s._state_lock("pings"):
         sent = _s._load_json("limit_pings.json")

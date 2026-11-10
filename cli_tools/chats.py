@@ -110,7 +110,7 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
     if not matches:
         return f"No matches found across active agents for: '{target}'."
 
-    lines = [f"# Subway Context: Search results for '{target}':"]
+    lines = [f"# Subway: Search results for '{target}':"]
     for m in matches:
         c = m["chat"]
         idx = m["exchange_index"]
@@ -209,7 +209,7 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
             advance = not bridge  # A look back through history must not rewind the live position.
             anchor_info = f"Transit delta since watermark ({_s.fmt_ts(last_cp.get('ts'))}); boarding at station [{start_idx}]"
             if start_idx >= len(ex):
-                result = (f"# subway-context: {c['source'].upper()} `{target_id}`\n"
+                result = (f"# Subway: {c['source'].upper()} `{target_id}`\n"
                           f"Segment: {seg_notice}\n"
                           f"No new stations since your last transit ({len(ex)} stations, watermark {_s.fmt_ts(last_cp.get('ts'))}).")
                 return f"{result}\n{last_tool}" if last_tool else result

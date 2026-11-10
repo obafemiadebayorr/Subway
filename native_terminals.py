@@ -1,4 +1,4 @@
-"""Native macOS terminal integration for Subway Context (Terminal.app and iTerm2).
+"""Native macOS terminal integration for Subway (Terminal.app and iTerm2).
 
 Pure functions and one subprocess runner for controlling Terminal.app and iTerm2
 via AppleScript (osascript).

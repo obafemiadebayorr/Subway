@@ -121,7 +121,7 @@ def refresh_benchmarks(force: bool = False) -> None:
         import urllib.request
         for offset in (0, 100, 200, 300):
             url = f"{source_url}&offset={offset}&length=100"
-            req = urllib.request.Request(url, headers={"User-Agent": "subway-context"})
+            req = urllib.request.Request(url, headers={"User-Agent": "subway"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rows = data.get("rows")
@@ -241,7 +241,7 @@ def run_stage3_edit_ping(model_id: str, provider: str, runner_fn: Optional[Calla
 def update_discovered_model_benchmark(base_dir: str, provider: str, model_id: str, benchmark_result: Dict[str, Any]) -> Dict[str, Any]:
     """Atomically record benchmark outcome into discovered_models.json."""
     if not base_dir:
-        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway"))
     disc_path = os.path.join(base_dir, "discovered_models.json")
     tmp_path = os.path.join(base_dir, f".disc_bench_{os.getpid()}_{time.time_ns()}.tmp")
 

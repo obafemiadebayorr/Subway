@@ -7,6 +7,7 @@ standard library and never imports server, so either side can change without a c
 from __future__ import annotations
 
 import contextlib
+import subway_home
 import hashlib
 import json
 import os
@@ -168,7 +169,7 @@ def record_edge(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         s_mod = sys.modules.get("state")
         base = str(getattr(s_mod, "SUBWAY_DIR", "")) if s_mod else ""
     if not base:
-        base = os.path.expanduser("~/.subway-context")
+        base = subway_home.subway_dir()
 
     ts = at if at is not None else time.time()
     record(base, thread_id=parent_id, kind=kind, node=parent_id, peer=child_id, data=detail, at=ts)

@@ -1,4 +1,4 @@
-"""Compact pipe table formatter for Subway Context CLI and tools."""
+"""Compact pipe table formatter for Subway CLI and tools."""
 import datetime
 import time
 from typing import Any, Sequence

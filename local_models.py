@@ -5,6 +5,7 @@ Moved from server.py (Subway 1.3.5). Rule: server-level names are read late thro
 from __future__ import annotations
 
 import base64
+import subway_home
 import concurrent.futures
 import contextlib
 import contextvars
@@ -186,7 +187,7 @@ def refresh_benchmarks(force: bool = False) -> None:
         import urllib.request
         for offset in (0, 100, 200, 300):
             url = f"{base_url}&offset={offset}&length=100"
-            req = urllib.request.Request(url, headers={"User-Agent": "subway-context"})
+            req = urllib.request.Request(url, headers={"User-Agent": "subway"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rows = data.get("rows")
@@ -757,7 +758,7 @@ def _validate_model_for_provider(provider: str, model: str) -> Tuple[bool, str, 
 
 def load_discovered_models(base_dir: str = "") -> Dict[str, Any]:
     if not base_dir:
-        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway"))
     path = os.path.join(base_dir, "discovered_models.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -771,7 +772,7 @@ def load_discovered_models(base_dir: str = "") -> Dict[str, Any]:
 
 def save_discovered_models(base_dir: str, data: Dict[str, Any]) -> None:
     if not base_dir:
-        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway"))
     path = os.path.join(base_dir, "discovered_models.json")
     tmp_path = os.path.join(base_dir, f".disc_models_{os.getpid()}_{time.time_ns()}.tmp")
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -799,7 +800,7 @@ def _is_pi_model_free(model_id: str) -> bool:
 
 class DynamicModelCatalog:
     def __init__(self, base_dir: str = ""):
-        self.base_dir = base_dir or getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        self.base_dir = base_dir or getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway"))
 
     def get_models(self) -> Dict[str, Dict[str, Any]]:
         data = load_discovered_models(self.base_dir)
@@ -897,7 +898,7 @@ def _discover_edge_models(timeout: float = 1.0) -> List[Dict[str, Any]]:
         req = urllib.request.Request(url)
         if ep["api_key"]:
             req.add_header("Authorization", f"Bearer {ep['api_key']}")
-        req.add_header("User-Agent", "Subway-Context/1.3.7")
+        req.add_header("User-Agent", "Subway/1.3.7")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -1797,7 +1798,7 @@ def pi_agent_dir() -> str:
     if override:
         return os.path.expanduser(override)
     home = getattr(_s, "HOME", os.path.expanduser("~"))
-    subway_pi = os.path.join(home, ".subway-context", "pi")
+    subway_pi = os.path.join(subway_home.subway_dir(home), "pi")
     if os.path.isfile(os.path.join(subway_pi, "models.json")):
         return subway_pi
     # DeepAI Code: ~/.deepai-code/userdata/<app>/pi/<app> (glob the app segment).

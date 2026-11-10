@@ -1,10 +1,10 @@
-"""Agent-to-agent dialogue layer for Subway Context.
+"""Agent-to-agent dialogue layer for Subway.
 
 Threaded conversations between stations (agents/workers/user) with optional
 consensus proposals. Messages addressed to running workers are delivered via
 the existing instruct_worker(now=True) path; others queue in the thread.
 
-Storage: ~/.subway-context/agent_chats/<safe-name>.json (atomic, locked).
+Storage: ~/.subway/agent_chats/<safe-name>.json (atomic, locked).
 """
 
 from __future__ import annotations

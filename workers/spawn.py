@@ -862,7 +862,7 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             f"- Budget: {budget_msg}\n\n"
             f"{budget_line}"
             f"Only your user can launch this worker. They can approve it in the Live HUD, run "
-            f"`subway-context approve {worker_id}`, or give you the approval code shown in those places "
+            f"`subway approve {worker_id}`, or give you the approval code shown in those places "
             f"for approve_worker(worker_id='{worker_id}', approval_code=...).")
     if preflight_lines:
         queued += "\n\n- Preflight:\n" + "\n".join(f"  - {line}" for line in preflight_lines)
@@ -1681,7 +1681,7 @@ def _launch_worker(worker_id: str) -> str:
         meta.update({"status": "failed", "report": f"Could not start supervisor: {exc}"})
         _s._save_worker(meta)
         if not meta.get("iteration_id"):
-            _s.notify_desktop_event(f"worker_ended|{worker_id}|failed", "Subway Context",
+            _s.notify_desktop_event(f"worker_ended|{worker_id}|failed", "Subway",
                                  f"Worker {worker_id} failed to start: {exc}", route="workers")
         return f"Error spawning approved worker process: {exc}"
     close_fn = getattr(err_handle, "close", None)
@@ -1713,7 +1713,7 @@ def notify_if_still_waiting(key: str, message: str, still_waiting: Callable[[], 
         time.sleep(delay)
         try:
             if still_waiting():
-                _s.notify_desktop_event(key, "Subway Context", message, route=route)
+                _s.notify_desktop_event(key, "Subway", message, route=route)
         except Exception as exc:
             _s._log_notification_failure("waiting check", exc)
     threading.Thread(target=later, daemon=True).start()
@@ -1780,7 +1780,7 @@ def t_spin_batch(role: str, prompt: str, input_glob: str, output_file: str, mode
     return (f"[APPROVAL REQUIRED] Batch `{worker_id}` is queued in PENDING APPROVAL state.\n"
             f"- Files: {len(files)}\n- Model: **{chosen}** ({msg})\n- Results: `{out_path}`\n\n"
             f"Only your user can launch this. It resumes where it stopped if it's interrupted. They can approve it in the Live HUD, "
-            f"run `subway-context approve {worker_id}`, or give you the approval code.")
+            f"run `subway approve {worker_id}`, or give you the approval code.")
 
 
 def _chunks(text: str, size: int) -> List[str]:
@@ -1793,7 +1793,7 @@ def t_approve_worker(worker_id: str, approval_code: str = "") -> str:
         return f"Error: worker `{worker_id}` not found."
     if not hmac.compare_digest((approval_code or "").strip().upper(), vars(_s)["approval_code"](worker_id)):
         return (f"[APPROVAL REFUSED] Worker `{worker_id}` needs the approval code shown to your user in the "
-                f"Live HUD or by `subway-context workers`. Ask them for it, or ask them to approve it there.")
+                f"Live HUD or by `subway workers`. Ask them for it, or ask them to approve it there.")
     _s._thread_record(_s._thread_root(_s._load_worker(worker_id) or {"id": worker_id}), "approved", worker_id,
                    data={"by": "approval code"})
     return _s._launch_worker(worker_id)
@@ -2359,7 +2359,7 @@ def pending_worker_pings(chat: str, consume: bool = True) -> List[str]:
                 with contextlib.suppress(OSError):
                     with open(os.path.join(rdir, f"{wid}.md"), "w", encoding="utf-8") as fh:
                         fh.write(str(reason))
-                reason = f"{_s.one_line(str(reason), 160)} (full: ~/.subway-context/reports/{wid}.md)"
+                reason = f"{_s.one_line(str(reason), 160)} (full: ~/{os.path.basename(_s.SUBWAY_DIR)}/reports/{wid}.md)"
             reason_str = f": {reason}" if reason else ""
             prefix = "[URGENT] " if w.get("priority") == "urgent" else ""
             lines.append(f"{prefix}[WORKER] {wid} ({role}) {status}{reason_str}")

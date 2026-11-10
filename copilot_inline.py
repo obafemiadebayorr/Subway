@@ -267,7 +267,7 @@ def fallback_to_worker_model(worker_id: str, prompt: str, prefix: str = "", suff
 def execute_inline_completion(worker_id: str, prompt: str, prefix: str = "", suffix: str = "",
                                 filepath: str = "", base_dir: str = "", timeout: float = 5.0) -> Dict[str, Any]:
     if not base_dir:
-        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        base_dir = getattr(_s, "SUBWAY_DIR", os.path.expanduser("~/.subway"))
 
     ok, reason = check_inline_eligibility(worker_id, prompt=prompt, filepath=filepath,
                                           prefix=prefix, suffix=suffix, base_dir=base_dir)

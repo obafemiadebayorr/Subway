@@ -193,7 +193,7 @@ def _cli_path(ed: Dict[str, Any]) -> Optional[str]:
 def _has_extension(cli: str) -> bool:
     try:
         res = subprocess.run([cli, "--list-extensions"], capture_output=True, text=True, timeout=5)
-        return res.returncode == 0 and "subway.subway-context" in (res.stdout or "").lower()
+        return res.returncode == 0 and "subway.subway" in (res.stdout or "").lower()
     except Exception:
         return False
 
@@ -219,7 +219,7 @@ def _find_editor_cli():
         if cli and _s._has_extension(cli):
             return cli, host["scheme"]
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        vsix = os.path.join(root, "vscode", "subway-context.vsix")
+        vsix = os.path.join(root, "vscode", "subway.vsix")
         _s.EDITOR_HINT["text"] = (f"The Subway extension isn't installed in {host['name']}, so the HUD opened in your browser. "
                                f"To open it in the editor: {cli or host['cli'][0]} --install-extension {vsix}")
         return None, None
@@ -264,7 +264,7 @@ def _open_hud(port: int) -> None:
         opened = False
         cli, scheme = _s._find_editor_cli()
         if cli and scheme:
-            uri = f"{scheme}://subway.subway-context/open?port={port}"
+            uri = f"{scheme}://subway.subway/open?port={port}"
             try:
                 res = subprocess.run([cli, "--open-url", uri], capture_output=True, timeout=5)
                 if res.returncode == 0:
@@ -289,7 +289,7 @@ def _open_hud(port: int) -> None:
             if _s.EDITOR_HINT.get("text"):
                 _s.log(_s.EDITOR_HINT["text"])
                 with contextlib.suppress(Exception):
-                    _s.notify_desktop_event("editor_extension_missing|editor", "Subway Context", _s.EDITOR_HINT["text"][:180])
+                    _s.notify_desktop_event("editor_extension_missing|editor", "Subway", _s.EDITOR_HINT["text"][:180])
 
 def t_start_hud(port: int = 0) -> str:
     """Start the Live HUD as its own process, so it outlives any one agent window."""

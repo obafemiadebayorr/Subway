@@ -1,4 +1,4 @@
-"""Forks, rewind and resume engine for subway-context (W13).
+"""Forks, rewind and resume engine for Subway (W13).
 
 Handles:
 - Part (a): detect_forked_chat: linking forked sessions to parent in threads.py with 'forked' edge,

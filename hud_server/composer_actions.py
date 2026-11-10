@@ -12,6 +12,7 @@ Imports nothing from handlers.py.
 from __future__ import annotations
 
 import json
+import subway_home
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -306,7 +307,7 @@ def compact(payload: Dict[str, Any], base_dir: Optional[str] = None) -> Dict[str
             except Exception:
                 target_dir = None
         if not target_dir:
-            target_dir = os.path.expanduser("~/.subway-context")
+            target_dir = subway_home.subway_dir()
 
         th_dir = os.path.join(target_dir, "threads")
         os.makedirs(th_dir, exist_ok=True)

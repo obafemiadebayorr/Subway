@@ -131,7 +131,7 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
         if notifier:
             error = _s._run_notification_command(
                 "terminal-notifier",
-                [notifier, "-title", title, "-message", message, "-sound", "default", "-group", "subway-context", "-open", url],
+                [notifier, "-title", title, "-message", message, "-sound", "default", "-group", "subway", "-open", url],
                 timeout=3,
             )
             return "terminal-notifier", error
@@ -156,7 +156,7 @@ def _send_desktop_notification(title: str, message: str, route: str = "workers")
             def _linux_wait() -> None:
                 try:
                     res = subprocess.run(
-                        [notifier, "--app-name", "Subway Context", "--action=open=Open", "--wait", title, message],
+                        [notifier, "--app-name", "Subway", "--action=open=Open", "--wait", title, message],
                         capture_output=True, text=True,
                     )
                     return_code = getattr(res, "returncode", 0)

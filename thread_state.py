@@ -7,6 +7,7 @@ other process can read and update it without losing an edit. Standard library on
 from __future__ import annotations
 
 import contextlib
+import subway_home
 import glob
 import json
 import os
@@ -45,7 +46,7 @@ def _base_dir(base_dir: Optional[str] = None) -> str:
         import server as _s
         return str(_s.SUBWAY_DIR)
     except Exception:
-        return os.environ.get("SUBWAY_DIR", os.path.expanduser("~/.subway-context"))
+        return subway_home.subway_dir()
 
 
 def _path(base_dir: str) -> str:
@@ -140,7 +141,7 @@ def get_thread_settings(thread_id: str, base_dir: Optional[str] = None) -> Dict[
         except ImportError:
             bdir = None
     if not bdir:
-        bdir = os.path.expanduser("~/.subway-context")
+        bdir = subway_home.subway_dir()
     res = dict(get(bdir, thread_id))
     try:
         import server as _s

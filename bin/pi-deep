@@ -20,7 +20,7 @@
 
 set -eu
 
-# 1. Data dir: explicit override wins, then Subway Context's direct config, then app userdata, then OSS default.
+# 1. Data dir: explicit override wins, then Subway's direct config, then app userdata, then OSS default.
 if [ -z "${PI_CODING_AGENT_DIR:-}" ]; then
   if [ -f "$HOME/.subway-context/pi/models.json" ]; then
     PI_CODING_AGENT_DIR="$HOME/.subway-context/pi"

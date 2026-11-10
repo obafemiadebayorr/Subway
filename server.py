@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""subway-context: an on-demand, multi-window context transit system for AI coding agents.
+"""Subway: an on-demand, multi-window context transit system for AI coding agents.
 
 Connects Antigravity, Claude Code, OpenCode (terminal), and any MCP-compatible agent.
 Named after a subway transit system: jump between windows, lines, and stations on demand
@@ -25,12 +25,13 @@ Data sources (read-only):
   * OpenCode:     ~/.local/share/opencode/opencode.db
   * GitHub Copilot: ~/.copilot/session-state/*/events.jsonl and VS Code User chatSessions/*.jsonl
 Writes:
-  * ~/.subway-context/ (aliases, checkpoints, note inboxes, leases, tracks, workers, HUD token)
+  * ~/.subway/ (aliases, checkpoints, note inboxes, leases, tracks, workers, HUD token)
   * ~/.config/opencode/agents/ (generated @alias stubs, marked <!-- subway-auto-stub -->)
 """
 from __future__ import annotations
 
 import atexit
+import subway_home
 import base64
 import concurrent.futures
 import contextlib
@@ -111,7 +112,7 @@ def _discover_pi_dir() -> str:
 
 
 PI_DIR = _discover_pi_dir()
-SUBWAY_DIR = os.environ.get("SUBWAY_DIR", os.path.join(HOME, ".subway-context"))
+SUBWAY_DIR = subway_home.subway_dir()
 LOCKS_FILE = os.path.join(SUBWAY_DIR, "locks.json")
 WORKERS_DIR = os.path.join(SUBWAY_DIR, "workers")
 TRACKS_DIR = os.path.join(SUBWAY_DIR, "tracks")
@@ -161,7 +162,7 @@ from chat_readers import extract_files_from_text
 
 
 # --------------------------------------------------------------------------
-# Stations & Checkpoints (~/.subway-context/)
+# Stations & Checkpoints (~/.subway/)
 # --------------------------------------------------------------------------
 
 from store import (_ensure_subway_dir, _state_lock, _write_json_atomic, _load_json, _save_json)
@@ -1631,25 +1632,25 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 _cli_tools.handle = handle
 
 
-USAGE = """Subway Context v{version}
+USAGE = """Subway v{version}
 
-  subway-context                     Run as an MCP server over stdio
-  subway-context hud [port] [--open] Start the Live HUD on {host}
-  subway-context workers             List workers, with approval codes for pending ones
-  subway-context approve <worker_id> Launch a pending worker
-  subway-context reject <worker_id> [reason]
-  subway-context stop <worker_id>    Stop a running worker
-  subway-context permissions         List worker permission requests
-  subway-context watch [--stream]    Wait for, or stream, permission requests and finished workers
-  subway-context mode [ask|auto_safe|auto_approve]  Show or set how workers get permissions
-  subway-context allow|always|deny <request_id>
-  subway-context tail <worker_id>    Show a worker's status and log
-  subway-context locks | track [name] | quota [source]
-  subway-context pair [list]           Devices asking to connect; pair approve <id> | pair deny <id> | pair revoke <device_id>
-  subway-context wake                  Whether this Mac can be woken, and how to enable it; wake queue to see what waits
-  subway-context notify test           Send a test desktop notification
-  subway-context install | status | uninstall
-  subway-context <tool> '<json args>' Call any MCP tool directly"""
+  subway                     Run as an MCP server over stdio
+  subway hud [port] [--open] Start the Live HUD on {host}
+  subway workers             List workers, with approval codes for pending ones
+  subway approve <worker_id> Launch a pending worker
+  subway reject <worker_id> [reason]
+  subway stop <worker_id>    Stop a running worker
+  subway permissions         List worker permission requests
+  subway watch [--stream]    Wait for, or stream, permission requests and finished workers
+  subway mode [ask|auto_safe|auto_approve]  Show or set how workers get permissions
+  subway allow|always|deny <request_id>
+  subway tail <worker_id>    Show a worker's status and log
+  subway locks | track [name] | quota [source]
+  subway pair [list]           Devices asking to connect; pair approve <id> | pair deny <id> | pair revoke <device_id>
+  subway wake                  Whether this Mac can be woken, and how to enable it; wake queue to see what waits
+  subway notify test           Send a test desktop notification
+  subway install | status | uninstall
+  subway <tool> '<json args>' Call any MCP tool directly"""
 
 
 from permissions import run_hook_guard

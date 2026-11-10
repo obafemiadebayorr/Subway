@@ -1,6 +1,6 @@
 """Composer context endpoints: project_files, context_slice, and thread_export.
 
-Implements Subway Context Composer §3.1b endpoints.
+Implements Subway Composer §3.1b endpoints.
 """
 from __future__ import annotations
 
