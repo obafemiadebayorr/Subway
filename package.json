@@ -1,0 +1,94 @@
+{
+  "name": "subway-context",
+  "version": "1.3.7",
+  "description": "On-demand multi-window context transit and workspace guard for AI coding agents (Claude Code, OpenCode, Antigravity)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ObaIsSoft/Subway.git"
+  },
+  "homepage": "https://github.com/ObaIsSoft/Subway#readme",
+  "bugs": {
+    "url": "https://github.com/ObaIsSoft/Subway/issues"
+  },
+  "main": "bin/subway-context.js",
+  "bin": {
+    "subway-context": "bin/subway-context.js",
+    "subway": "bin/subway-context.js"
+  },
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests",
+    "build:vsix": "cd vscode && npx -y @vscode/vsce@3 package --skip-license -o subway-context.vsix",
+    "prepack": "find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; npm run build:vsix"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "claude-code",
+    "opencode",
+    "antigravity",
+    "multi-agent",
+    "context-transit",
+    "workspace-guard"
+  ],
+  "author": "Obafemi",
+  "license": "MIT",
+  "files": [
+    "bin",
+    "server.py",
+    "worker_supervision",
+    "hud_server",
+    "copilot_inline.py",
+    "local_models.py",
+    "permissions.py",
+    "cli_tools",
+    "workers",
+    "usage",
+    "chat_readers",
+    "store.py",
+    "terminals.py",
+    "native_terminals.py",
+    "threads.py",
+    "agent_chat.py",
+    "binary_discovery.py",
+    "caffeinate.py",
+    "composer_context.py",
+    "composer_mail.py",
+    "concurrency.py",
+    "forks.py",
+    "governor.py",
+    "guard.py",
+    "heuristics.py",
+    "iteration.py",
+    "mcp_tasks.py",
+    "notify_driver.py",
+    "output_projector.py",
+    "pairing.py",
+    "pairing_prompt.py",
+    "preflight.py",
+    "registry.py",
+    "reply_styles.py",
+    "sse_stream.py",
+    "station.py",
+    "tables.py",
+    "thread_state.py",
+    "threadlog.py",
+    "usage_glue.py",
+    "usage_pi.py",
+    "wake.py",
+    "wake_driver.py",
+    "wake_queue.py",
+    "worker_digest.py",
+    "live_reload.py",
+    "model_benchmarks.py",
+    "install.py",
+    "README.md",
+    "hud",
+    "vscode/subway-context.vsix"
+  ],
+  "dependencies": {
+    "acorn": "^8.19.0"
+  }
+}

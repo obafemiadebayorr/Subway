@@ -1,0 +1,331 @@
+/* hud/tethers.css - Tethered overlay and pods */
+
+.tt-container {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 20rem;
+  pointer-events: none;
+  z-index: 2;
+  overflow: visible;
+}
+
+.tt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.tt-docked {
+  position: absolute;
+  inset: 0;
+}
+
+.tt-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  transition: opacity var(--duration-fast, 0.15s) ease;
+}
+
+.tt-tether {
+  stroke: var(--line);
+  fill: none;
+  stroke-width: 0.125rem;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  transition: opacity var(--duration-fast, 0.15s) ease;
+}
+
+.tt-tether-dashed {
+  stroke: var(--muted);
+  stroke-dasharray: 0.35rem 0.35rem;
+}
+
+.tt-tether-error {
+  stroke: var(--danger, var(--red, var(--text)));
+  stroke-width: 0.1875rem;
+}
+
+.tt-pod {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: auto;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 7.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 0.0625rem solid var(--line-soft);
+  border-radius: var(--radius-md, 0.75rem);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-sm, none);
+  font-size: 0.8125rem;
+  cursor: grab;
+  user-select: none;
+  will-change: transform;
+  transition: opacity var(--duration-fast, 0.15s) ease, border-color var(--duration-fast, 0.15s) ease, box-shadow var(--duration-fast, 0.15s) ease;
+}
+
+.tt-pod:focus-visible {
+  outline: 0.125rem solid var(--accent, var(--line));
+  outline-offset: 0.125rem;
+}
+
+.tt-pod-dashed {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.tt-pod-dragging {
+  cursor: grabbing;
+  z-index: 3;
+}
+
+.tt-pod-crown {
+  border-color: var(--accent, var(--line));
+  box-shadow: 0 0 0 0.0625rem var(--accent, var(--line));
+}
+
+.tt-pod-icon {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.375rem;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2, var(--bg));
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.tt-pod-label {
+  max-width: 6rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-pod-meta {
+  margin-left: auto;
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.tt-pod-badge {
+  font-size: 0.6875rem;
+  color: var(--muted);
+}
+
+.tt-pod-badge-hidden {
+  display: none;
+}
+
+.tt-retract {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  background: var(--surface);
+  border: 0.0625rem solid var(--line-soft);
+  border-radius: var(--radius-sm, 0.375rem);
+  color: var(--text);
+  cursor: pointer;
+  padding: 0;
+  transition: background-color var(--duration-fast, 0.15s) ease, border-color var(--duration-fast, 0.15s) ease;
+}
+
+.tt-retract:hover {
+  background: var(--surface-2, var(--surface));
+  border-color: var(--line);
+}
+
+.tt-retract:focus-visible {
+  outline: 0.125rem solid var(--accent, var(--line));
+  outline-offset: 0.125rem;
+}
+
+.tt-retract[aria-pressed="true"] {
+  background: var(--surface-2, var(--surface));
+  border-color: var(--accent, var(--line));
+  color: var(--accent, var(--text));
+}
+
+.tt-retract:empty,
+.tt-retract[hidden],
+.tt-docked:empty,
+.tt-pods-popover:empty {
+  display: none;
+}
+
+.tt-pods-dd {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.tt-pods-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 1.75rem;
+  padding: 0 0.5rem;
+  border: 0;
+  border-radius: var(--radius-sm, 0.5rem);
+  background: transparent;
+  color: var(--cmp-ink, var(--text));
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  pointer-events: auto;
+  position: relative;
+  transition: background-color var(--duration-fast, 0.15s) ease, color var(--duration-fast, 0.15s) ease;
+}
+
+.tt-pods-menu-btn svg,
+.tt-pods-menu-btn .li {
+  width: 0.875rem;
+  height: 0.875rem;
+  font-size: 0.875rem;
+}
+
+.tt-pods-menu-btn .cmp-lbl {
+  max-width: 10ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tt-pods-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1rem;
+  height: 1rem;
+  padding: 0 0.25rem;
+  border-radius: var(--radius-full, 9999rem);
+  background: var(--accent);
+  color: var(--text-on-accent, var(--surface));
+  font-size: 0.625rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.tt-pods-badge-hidden {
+  display: none;
+}
+
+.tt-pods-menu-btn:hover,
+.tt-pods-menu-btn[aria-expanded="true"] {
+  background: var(--cmp-hover, var(--surface-2));
+  color: var(--cmp-ink, var(--text));
+}
+
+.tt-pods-menu-btn:focus-visible {
+  outline: 0.125rem solid var(--accent, var(--line));
+  outline-offset: 0.125rem;
+}
+
+.tt-pods-popover {
+  position: absolute;
+  min-width: 11rem;
+  padding: 0.5rem;
+  background: var(--surface);
+  border: 0.0625rem solid var(--line-soft);
+  border-radius: var(--radius-md, 0.5rem);
+  box-shadow: 0 0.5rem 1.25rem var(--shadow, rgba(0, 0, 0, 0.25));
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  z-index: 20;
+}
+
+.tt-pods-popover[hidden] {
+  display: none;
+}
+
+.tt-pods-item {
+  display: flex;
+  justify-content: space-between;
+  white-space: nowrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
+  border-radius: var(--radius-sm, 0.25rem);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  color: var(--text);
+  user-select: none;
+  transition: background-color var(--duration-fast, 0.15s) ease;
+}
+
+.tt-pods-item:hover {
+  background: var(--surface-2, var(--surface));
+}
+
+
+.tt-retracted .tt-pod,
+.tt-retracted .tt-tether,
+.tt-retracted .tt-svg {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.tt-composer-field {
+  position: relative;
+}
+
+.tt-tether-host {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+@media (min-width: 64rem) {
+  .tt-container {
+    min-height: 24rem;
+  }
+
+  .tt-pod {
+    min-width: 8.75rem;
+    padding: 0.625rem 0.875rem;
+    font-size: 0.875rem;
+  }
+
+  .tt-pod-label {
+    max-width: 7.5rem;
+  }
+
+  .tt-pods-menu-btn {
+    font-size: 0.8125rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tt-svg,
+  .tt-tether,
+  .tt-pod,
+  .tt-retract,
+  .tt-pods-menu-btn,
+  .tt-pods-item {
+    transition: none;
+    animation: none;
+  }
+}
+
+.tt-keyboard .tt-svg { display: none; }
+.tt-keyboard .tt-pod { position: fixed; top: auto; bottom: calc(var(--tt-kb-bottom, 0rem) + 0.5rem); left: calc(0.5rem + var(--tt-chip-i, 0) * 3rem); width: 2.5rem; height: 2.5rem; transform: none; pointer-events: auto; }
+

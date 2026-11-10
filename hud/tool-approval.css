@@ -1,0 +1,500 @@
+/* AI Tool Approval — ported to vanilla CSS for Subway HUD.
+ * Source: KokonutUI ai-tool-approval.tsx (MIT, @kokonutui).
+ * Tailwind classes mapped to ta-* classes; colours/radii from theme tokens.
+ * Tablet/desktop-first: base targets tablet, desktop tweaks at 64rem. */
+
+.ta-root {
+  --ta-ease: cubic-bezier(0.23, 1, 0.32, 1);
+  --ta-hold: 900ms;
+  width: 100%;
+  background: var(--hover);
+  border-radius: var(--radius);
+  padding: 0.375rem;
+}
+
+/* ---- Trace lines (decided calls) ---- */
+
+.ta-traces {
+  padding: 0.25rem 0.625rem 0.375rem;
+}
+
+.ta-line-wrap {
+  min-width: 0;
+}
+
+.ta-line {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.625rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.375rem 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ta-line:disabled {
+  cursor: default;
+}
+
+.ta-line:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.ta-status {
+  display: flex;
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.ta-status svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.ta-verb {
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.ta-verb-dim {
+  color: var(--muted);
+}
+
+.ta-code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78125rem;
+  color: var(--text);
+}
+
+.ta-code-dim {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--line);
+}
+
+.ta-line .ta-tool-svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform 200ms var(--ta-ease);
+}
+
+.ta-line:hover .ta-tool-svg {
+  color: var(--text);
+}
+
+.ta-line-open .ta-tool-svg {
+  transform: rotate(90deg);
+}
+
+.ta-output-wrap {
+  display: grid;
+  overflow: hidden;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 220ms var(--ta-ease), opacity 220ms var(--ta-ease);
+  opacity: 0;
+}
+
+.ta-output-wrap.ta-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.ta-output {
+  min-height: 0;
+  overflow-x: auto;
+  margin: 0 0 0.375rem 1.625rem;
+  border-radius: var(--radius-sm);
+  background: var(--card-sub-bg);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  color: var(--muted);
+}
+
+/* ---- The current approval card ---- */
+
+.ta-current {
+  min-width: 0;
+}
+
+.ta-waiting {
+  margin: 0;
+  padding: 0 0.625rem 0.375rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ta-card {
+  border-radius: var(--radius);
+  background: var(--raised);
+  box-shadow: inset 0 0 0 1px var(--line-soft), 0 0.0625rem 0.125rem var(--scrim);
+  padding: 0.75rem;
+  outline: none;
+}
+
+.ta-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.625rem;
+}
+
+.ta-icon-badge {
+  display: flex;
+  width: 1.75rem;
+  height: 1.75rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: var(--card-sub-bg);
+  color: var(--muted);
+}
+
+.ta-tool-svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.ta-title {
+  margin: 0;
+  font-family: inherit;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--text);
+}
+
+.ta-tool {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.ta-badge {
+  margin-left: auto;
+  border-radius: var(--radius-sm);
+  background: var(--red-soft);
+  padding: 0.125rem 0.375rem;
+  font-weight: 500;
+  font-size: 0.6875rem;
+  color: var(--red);
+}
+
+.ta-input {
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+  border-radius: var(--radius-sm);
+  background: var(--card-sub-bg);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  padding: 0.625rem 0.75rem;
+  font-family: var(--font-mono), monospace;
+  font-size: 0.8125rem;
+  line-height: 1.625;
+  color: var(--text);
+}
+
+.ta-prompt {
+  user-select: none;
+  color: var(--muted);
+}
+
+.ta-input-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.375rem 1rem;
+  margin: 0;
+  border-radius: var(--radius-sm);
+  background: var(--card-sub-bg);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  padding: 0.625rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.ta-input-key {
+  margin: 0;
+  color: var(--muted);
+}
+
+.ta-input-val {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0;
+  font-family: var(--font-mono), monospace;
+  color: var(--text);
+}
+
+.ta-reason {
+  margin: 0.5rem 0 0;
+  font-size: 0.75rem;
+  line-height: 1.625;
+  color: var(--muted);
+}
+
+.ta-actions {
+  display: flex;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ta-always {
+  display: flex;
+  cursor: pointer;
+  user-select: none;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.ta-always-box {
+  width: 0.875rem;
+  height: 0.875rem;
+  cursor: pointer;
+  accent-color: var(--text);
+}
+
+.ta-always-tool {
+  font-family: var(--font-mono), monospace;
+}
+
+.ta-asksevery {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.ta-actions-right {
+  display: flex;
+  margin-left: auto;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.ta-deny {
+  height: 2rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0 0.75rem;
+  background: none;
+  font: inherit;
+  font-size: 0.875rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background-color 150ms var(--ta-ease), color 150ms var(--ta-ease);
+}
+
+.ta-deny:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.ta-deny:focus-visible,
+.ta-allow:focus-visible,
+.ta-hold:focus-visible,
+.ta-line:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.ta-allow {
+  height: 2rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0 0.75rem;
+  background: var(--accent);
+  font: inherit;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--accent-ink);
+  cursor: pointer;
+  transition: background-color 150ms var(--ta-ease);
+}
+
+.ta-allow:hover {
+  background: var(--accent-strong);
+}
+
+/* Hold-to-allow for destructive calls: the red fill wipes across while
+   held and runs back quickly when let go early, so a slip never confirms. */
+
+.ta-hold {
+  position: relative;
+  height: 2rem;
+  overflow: hidden;
+  user-select: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0 0.75rem;
+  background: var(--red-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--red) 15%, transparent);
+  font: inherit;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: var(--red);
+  cursor: pointer;
+}
+
+.ta-hold-fill {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--red);
+  color: var(--accent-ink);
+  clip-path: inset(0 100% 0 0);
+  transition: clip-path 200ms var(--ta-ease);
+}
+
+.ta-holding .ta-hold-fill {
+  clip-path: inset(0 0 0 0);
+  transition: clip-path var(--ta-hold) linear;
+}
+
+/* ---- Status icons ---- */
+
+.ta-spin {
+  width: 0.875rem;
+  height: 0.875rem;
+  animation: ta-spin 0.8s linear infinite;
+}
+
+.ta-spin-track {
+  stroke: var(--line);
+  fill: none;
+}
+
+.ta-spin-arc {
+  stroke: var(--text);
+  fill: none;
+}
+
+@keyframes ta-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ta-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+}
+
+.ta-status-ok {
+  width: 0.875rem;
+  height: 0.875rem;
+  color: var(--text);
+}
+
+.ta-status-bad,
+.ta-status-dim {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.ta-status-bad {
+  color: var(--red);
+}
+
+.ta-status-dim {
+  color: var(--muted);
+}
+
+/* ---- Enter animations (AnimatePresence ports; applied once per element) ---- */
+
+.ta-enter {
+  animation: ta-fade-in 240ms var(--ta-ease);
+}
+
+.ta-enter .ta-card {
+  animation: ta-card-in 220ms var(--ta-ease);
+}
+
+.ta-enter .ta-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: ta-draw-on 300ms var(--ta-ease) forwards;
+}
+
+@keyframes ta-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes ta-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+    filter: blur(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes ta-draw-on {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* ---- Desktop ---- */
+
+@media (min-width: 64rem) {
+  .ta-root {
+    padding: 0.5rem;
+  }
+
+  .ta-card {
+    padding: 0.875rem;
+  }
+
+  .ta-output {
+    margin-left: 1.75rem;
+  }
+}
+
+/* ---- Reduced motion (MotionConfig reducedMotion="user") ---- */
+
+@media (prefers-reduced-motion: reduce) {
+  .ta-root,
+  .ta-root *,
+  .ta-root *::before,
+  .ta-root *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .ta-enter .ta-draw {
+    stroke-dashoffset: 0;
+  }
+}

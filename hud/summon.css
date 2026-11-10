@@ -1,0 +1,174 @@
+/* T1 — summon button + floating composer panel. Tablet-first (48rem+), desktop at 64rem+. Theme variables only. */
+
+.tt-summon {
+  position: fixed;
+  right: var(--space-4, 1rem);
+  bottom: calc(var(--tt-nav-h, 0rem) + var(--space-4, 1rem));
+  z-index: 60;
+  width: var(--tt-summon-size, 3.25rem);
+  height: var(--tt-summon-size, 3.25rem);
+  display: grid;
+  place-items: center;
+  border: var(--border-w, 0.0625rem) solid var(--line-soft, var(--border));
+  border-radius: 50%;
+  background: var(--surface, var(--card-bg));
+  color: var(--ink);
+  cursor: grab;
+  touch-action: none;
+  box-shadow: var(--shadow-pop, 0 0.25rem 0.75rem rgb(0 0 0 / 0.25));
+  transition: transform var(--dur-fast, 120ms) var(--ease-out, ease-out);
+}
+
+.tt-summon:active {
+  cursor: grabbing;
+}
+
+.tt-summon:focus-visible,
+.tt-sheet-close:focus-visible,
+.tt-sheet-head:focus-visible {
+  outline: var(--focus-w, 0.125rem) solid var(--accent);
+  outline-offset: var(--space-1, 0.25rem);
+}
+
+/* Non-visual: kept only in case anything still probes for an outside-click catcher. */
+.tt-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 65;
+  background: transparent;
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+.tt-scrim[hidden] {
+  display: none;
+}
+
+/* Floating composer panel — sized to content, not a full-screen sheet. */
+.tt-sheet {
+  position: fixed;
+  right: var(--space-4, 1rem);
+  bottom: calc(var(--tt-nav-h, 0rem) + var(--space-4, 1rem) + var(--tt-summon-size, 3.25rem) + var(--space-2, 0.5rem));
+  z-index: 70;
+  width: min(24rem, 90vw);
+  max-height: min(40rem, 85vh);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface, var(--card-bg));
+  border: var(--border-w, 0.0625rem) solid var(--line-soft, var(--border));
+  border-radius: var(--radius, 0.5rem);
+  box-shadow: var(--shadow-pop, 0 0.25rem 0.75rem rgb(0 0 0 / 0.25));
+  overflow: hidden;
+  box-sizing: border-box;
+  opacity: 1;
+  transition: opacity var(--dur-fast, 150ms) var(--ease-out, ease-out);
+}
+
+.tt-sheet[hidden] {
+  display: none;
+}
+
+.tt-sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 0.5rem);
+  padding: var(--space-3, 0.75rem) var(--space-4, 1rem);
+  border-bottom: var(--border-w, 0.0625rem) solid var(--line-soft, var(--border));
+  background: var(--surface, var(--card-bg));
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+}
+
+.tt-sheet-head:active {
+  cursor: grabbing;
+}
+
+.tt-sheet-title {
+  font-size: var(--text-base, 1rem);
+  font-weight: 700;
+  color: var(--strong, var(--ink));
+}
+
+.tt-sheet-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap-min, 2rem);
+  height: var(--tap-min, 2rem);
+  border-radius: var(--radius, 0.375rem);
+  border: var(--border-w, 0.0625rem) solid transparent;
+  background: transparent;
+  color: var(--muted, var(--ink));
+  cursor: pointer;
+  padding: 0;
+}
+
+.tt-sheet-close:hover {
+  background: var(--surface-hover, color-mix(in srgb, var(--strong) 8%, transparent));
+  color: var(--strong, var(--ink));
+}
+
+.tt-sheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.tt-summon[hidden] {
+  display: none;
+}
+
+@media (min-width: 64rem) {
+  .tt-summon {
+    width: var(--tt-summon-size-desktop, 3.5rem);
+    height: var(--tt-summon-size-desktop, 3.5rem);
+  }
+
+  .tt-sheet {
+    width: min(26rem, 90vw);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tt-summon,
+  .tt-scrim,
+  .tt-sheet {
+    transition: none;
+    animation: none;
+  }
+}
+
+
+.tt-sheet-grip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1.25rem;
+  height: 1.25rem;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.tt-sheet-grip::before {
+  content: "";
+  position: absolute;
+  top: 0.3125rem;
+  left: 0.3125rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-top: var(--border-w, 0.0625rem) solid var(--line);
+  border-left: var(--border-w, 0.0625rem) solid var(--line);
+  border-top-left-radius: 0.25rem;
+  opacity: 0.8;
+}
+.tt-sheet-grip:hover::before { border-color: var(--accent); opacity: 1; }
+.tt-sheet.tt-sized .tt-sheet-body,
+.tt-sheet.tt-sized .tt-composer-field,
+.tt-sheet.tt-sized .cmp,
+.tt-sheet.tt-sized .cmp-frame,
+.tt-sheet.tt-sized .cmp-box { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.tt-sheet.tt-sized .cmp-input { flex: 1 1 auto; max-height: none; }

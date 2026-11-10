@@ -1,0 +1,17 @@
+/* Shared motion, the same curve and timings as the settings stack panel (stackpanel.js). */
+:root { --mo-ease: cubic-bezier(0.23, 1, 0.32, 1); --mo-enter: 280ms; --mo-exit: 220ms; --mo-slide: 420ms; --mo-press: 120ms; }
+@keyframes mo-in { from { opacity: 0; transform: translateX(-1.5rem); } to { opacity: 1; transform: none; } }
+@keyframes mo-rise { from { opacity: 0; transform: translateY(.5rem); } to { opacity: 1; transform: none; } }
+.mo-enter { animation: mo-in var(--mo-enter) var(--mo-ease) both; }
+.mo-stagger > * { animation: mo-rise var(--mo-enter) var(--mo-ease) both; animation-delay: calc(var(--mo-i, 0) * 40ms); }
+button, .btn, .nav-item { transition: transform var(--mo-press) var(--mo-ease), background-color var(--mo-press) var(--mo-ease); }
+button:active:not(:disabled), .btn:active:not(:disabled) { transform: scale(.97); }
+.nav-item { position: relative; }
+.nav-item::after { content: ""; position: absolute; inset: auto 20% 0 20%; height: .15rem; border-radius: 1rem;
+  background: currentColor; transform: scaleX(0); opacity: 0; transition: transform var(--mo-slide) var(--mo-ease), opacity var(--mo-enter) var(--mo-ease); }
+.nav-item[aria-current="page"]::after { transform: scaleX(1); opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .mo-enter, .mo-stagger > * { animation: none; }
+  button, .btn, .nav-item, .nav-item::after { transition: none; }
+  button:active, .btn:active { transform: none; }
+}

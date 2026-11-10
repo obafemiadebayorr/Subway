@@ -1,0 +1,65 @@
+{
+  "name": "subway-context",
+  "displayName": "Subway Context",
+  "description": "Subway Context HUD integration for VS Code and Antigravity",
+  "version": "0.1.3",
+  "publisher": "subway",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ObaIsSoft/Subway.git",
+    "directory": "vscode"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "subway.runServer",
+        "title": "Subway: Run / Restart Server"
+      },
+      {
+        "command": "subway.openHud",
+        "title": "Subway: Open HUD"
+      },
+      {
+        "command": "subway.shareTerminal",
+        "title": "Subway: Share This Terminal"
+      },
+      {
+        "command": "subway.stopSharingTerminal",
+        "title": "Subway: Stop Sharing This Terminal"
+      },
+      {
+        "command": "subway.allowTerminalCommands",
+        "title": "Subway: Allow Commands From HUD In This Terminal"
+      },
+      {
+        "command": "subway.probeInlineCompletion",
+        "title": "Subway: Probe Inline Completion"
+      },
+      {
+        "command": "subway.agyWake",
+        "title": "Subway: Deliver text to the Antigravity agent panel"
+      }
+    ],
+    "configuration": {
+      "title": "Subway Context",
+      "properties": {
+        "subway.terminalSharing.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable capturing commands from terminals you explicitly share with Subway Context."
+        }
+      }
+    }
+  }
+}
