@@ -5,6 +5,9 @@ import { sankeyChart, liveLineChart, bellButton, undoButton, notchGauge, barChar
 import { switchButton } from "./switch-button.js";
 import { stackPanel } from "./stackpanel.js";
 import { loadWake, wakeRuleRows, wakeStatusRows, wakeStatusNote } from "./wake.js";
+import { loadFastmail, fastmailRows } from "./fastmail.js";
+import { loadSignin, signinRows } from "./mcp_signin.js";
+import { activityRow, ensureStartedStamps, loadActivity, recentActivity, stampLine, startedEntry } from "./activity.js";
 
 export function renderSection(section) {
   return (section && section.rows) || [];
@@ -174,13 +177,37 @@ let currentSettingsPage = "settings";
 let governorStatusCache = null;
 let governorStatusLastFetch = 0;
 
+/* Item 30: say where a permission change reached. ACP workers (OpenCode, local, custom) re-read
+   the mode at each request, so a tighter mode applies to them now; other running workers keep
+   their launch mode until relaunched. Loosening never widens a running worker. */
+const PERM_RANK = { ask: 0, auto_safe: 1, auto_approve: 2 };
+const LIVE_PERMISSION_PROVIDERS = new Set(["opencode", "local", "custom"]);
+export function permissionReach(from, to, label, workers) {
+  const live = (workers || []).filter((w) => ["running", "launching"].includes(w.status));
+  const head = `Permissions set to ${label || to}.`;
+  if (!live.length || from === to) return head;
+  const n = (k) => `${k} running worker${k === 1 ? "" : "s"}`;
+  if ((PERM_RANK[to] ?? 0) > (PERM_RANK[from] ?? 0)) {
+    return `${head} New workers use it; ${n(live.length)} keep their stricter launch mode.`;
+  }
+  const now = live.filter((w) => LIVE_PERMISSION_PROVIDERS.has(String(w.provider || "").toLowerCase()));
+  const later = live.length - now.length;
+  const parts = [];
+  if (now.length) parts.push(`applied to ${n(now.length)} now`);
+  if (later) parts.push(`${n(later)} pick it up when relaunched`);
+  const body = parts.join("; ");
+  return `${head} ${body.charAt(0).toUpperCase()}${body.slice(1)}.`;
+}
+
 export function settingsCard(settings, permissionCount = 0) {
   const s = settings || {};
   const cap = s.capacity || {};
   const loc = cap.local || {};
+  const hub = cap.hub || {};
   const currentCompaction = s.compaction || "suggest";
   const currentCaffeinate = (s.caffeinate || "off").toLowerCase();
   const currentBranchMode = Boolean(s.git_branch_mode);
+  const currentLandMode = (s.land_mode === "queue" || s.land_mode === "manual") ? s.land_mode : "merge";
   const targetList = Array.isArray(s.notification_targets) ? s.notification_targets : ["ide", "desktop"];
   const has = (t) => targetList.includes(t);
   const withTarget = (t, on) => (on ? targetList.filter((x) => x !== t) : [...targetList, t]);
@@ -202,20 +229,31 @@ export function settingsCard(settings, permissionCount = 0) {
       h("button", { type: "button", class: "sp-step", "aria-label": "Increase", on: { click: () => onChange(current() + 1) } }, "+"));
   };
   /* Like stepper but treats 0 as a real value (off). */
-  const numField = (value, min, max, onChange) => {
+  const numField = (value, min, max, onChange, label) => {
     const cur = () => { const n = Number(value); return Number.isFinite(n) ? n : min; };
     return h("span", { class: "sp-stepper" },
-      h("button", { type: "button", class: "sp-step", "aria-label": "Decrease", on: { click: () => onChange(Math.max(min, cur() - 1)) } }, "\u2212"),
+      h("button", { type: "button", class: "sp-step", "aria-label": `Decrease ${label || "value"}`, on: { click: () => onChange(Math.max(min, cur() - 1)) } }, "\u2212"),
       h("input", {
         type: "number", class: "sp-num", min, max, inputmode: "numeric",
-        "aria-label": "Value", value: Number.isFinite(Number(value)) ? Number(value) : min,
+        "aria-label": label || "Value", value: Number.isFinite(Number(value)) ? Number(value) : min,
         on: { change: (e) => { const v = parseInt(e.target.value, 10); onChange(Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : min); } },
       }),
-      h("button", { type: "button", class: "sp-step", "aria-label": "Increase", on: { click: () => onChange(Math.min(max, cur() + 1)) } }, "+"));
+      h("button", { type: "button", class: "sp-step", "aria-label": `Increase ${label || "value"}`, on: { click: () => onChange(Math.min(max, cur() + 1)) } }, "+"));
   };
 
   const choice = (id, label, selected, onSelect) => ({ id, label, selected: Boolean(selected), onSelect });
   const flag = (id, label, checked, onSelect, detail) => ({ id, label, checked: Boolean(checked), onSelect, detail });
+
+  /* Delegation: which shapes may run (multiselect), and iteration-mode defaults. */
+  const SHAPES = [["tree", "Tree"], ["mesh", "Mesh"], ["pipeline", "Pipeline"], ["adaptive", "Adaptive"]];
+  const shapeList = Array.isArray(s["delegation.shapes"]) ? s["delegation.shapes"] : SHAPES.map(([k]) => k);
+  const toggleShape = (k) => {
+    const on = shapeList.includes(k);
+    if (on && shapeList.length === 1) { toast("Keep at least one delegation shape on"); return; }
+    save({ "delegation.shapes": SHAPES.map(([x]) => x).filter((x) => (x === k ? !on : shapeList.includes(x))) });
+  };
+  const itv = (k, d) => (Number.isFinite(Number(s[`iteration.${k}`])) && s[`iteration.${k}`] !== null ? Number(s[`iteration.${k}`]) : d);
+  const roundsLabel = itv("max_rounds", 4) ? `${itv("max_rounds", 4)} rounds` : "No round limit";
 
   /* Archive retention. These keys were read by archive_maintain() but had no way to be
      set from anywhere, so the feature could not be turned on. */
@@ -249,6 +287,30 @@ export function settingsCard(settings, permissionCount = 0) {
   const builderNudge = Number.isFinite(Number(tc.nudge_builder_calls)) ? Number(tc.nudge_builder_calls) : 5;
   const defaultNudge = Number.isFinite(Number(tc.nudge_default_calls)) ? Number(tc.nudge_default_calls) : 7;
   const hardStopNudge = Number.isFinite(Number(tc.no_edit_tool_calls)) ? Number(tc.no_edit_tool_calls) : 12;
+  /* Token controls, flat state keys (doctor, code packets, thoughts, nudge,
+     projector, table rows). The backend may not carry every key yet, so each
+     read falls back to the documented default. */
+  const intState = (value, dflt, min, max) => {
+    if (value === null || value === undefined || value === "") return dflt;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  };
+  const boolState = (value, dflt) => {
+    if (value === null || value === undefined || value === "") return dflt;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    return ["true", "1", "on", "yes"].includes(String(value).trim().toLowerCase());
+  };
+  /* nudge_builder_calls / nudge_other_calls are the new flat names; the same
+     values still arrive nested under token_controls on older backends. */
+  const nudgeBuilderCalls = intState(
+    s.nudge_builder_calls !== undefined ? s.nudge_builder_calls : tc.nudge_builder_calls, 5, 1, 50);
+  const nudgeOtherCalls = intState(
+    s.nudge_other_calls !== undefined ? s.nudge_other_calls : tc.nudge_default_calls, 7, 1, 50);
+  const projectorEnabled = boolState(s.projector_enabled, true);
+  const tableRows = intState(s.table_rows, 20, 5, 200);
+  const cleanupMode = s.worktree_cleanup === "on" ? "on" : "off";
   const tcGov = tc.governor || {};
   const govEnabled = tcGov.enabled !== false;
   const govLimit = Number.isFinite(Number(tcGov.probe_calls_per_turn)) ? Number(tcGov.probe_calls_per_turn) : 6;
@@ -291,6 +353,14 @@ export function settingsCard(settings, permissionCount = 0) {
   const replyDefault = (s.reply_style && s.reply_style.default) || "concise";
   const replyProv = (s.reply_style && s.reply_style.providers) || {};
   const replyLabel = (v) => (REPLY_STYLES.find(([k]) => k === v) || [])[1] || "";
+  const settingSelect = (label, key, current, options) => h("select", {
+    "aria-label": label, value: String(current),
+    on: { change: (event) => save({ [key]: event.target.value }) },
+  }, ...options.map(([v, text]) => h("option", { value: v }, text)));
+  const DOCTOR_TOKEN_CHOICES = [50000, 100000, 150000, 200000, 400000, 1000000];
+  const doctorTokens = Number(s.doctor_budget_tokens) || 150000;
+  const doctorTokenOptions = (DOCTOR_TOKEN_CHOICES.includes(doctorTokens) ? DOCTOR_TOKEN_CHOICES : [...DOCTOR_TOKEN_CHOICES, doctorTokens].sort((a, b) => a - b))
+    .map((n) => [String(n), `${n.toLocaleString()} tokens`]);
   const pages = {
     settings: {
       title: "Settings",
@@ -300,6 +370,7 @@ export function settingsCard(settings, permissionCount = 0) {
             { id: "permissions", label: "Permissions", detail: permLabel, tone: autoApprove ? "danger" : undefined, to: "permissions" },
             { id: "workers", label: "Workers", detail: `${s.god_mode ? "God mode" : "Standard"} \u00b7 ${s.max_workers || "Auto"} max`, to: "workers" },
             { id: "local", label: "Local models", detail: `${s.max_local_workers || "Auto"} max`, to: "local" },
+            { id: "mcp", label: "Shared MCP", detail: s.hub_concurrency_limits === false ? "No limits" : `${s.hub_max_local || "Auto"} local · ${s.hub_max_remote || "Auto"} remote`, to: "mcp" },
             { id: "context", label: "Context", detail: compactionLabel, to: "context" },
             { id: "archive", label: "Archive", detail: `${archiveLabel(archive.compress_days)} compress \u00b7 ${archiveLabel(archive.delete_days)} delete \u00b7 ${archiveLabel(archive.branch_days)} branch`, to: "archive" },
             { id: "wake", label: "Wake-ups", detail: wakeLabel(wake.policy), to: "wake" },
@@ -312,6 +383,7 @@ export function settingsCard(settings, permissionCount = 0) {
             { id: "reply", label: "Reply style", detail: ((s.reply_style && s.reply_style.default) || "concise").charAt(0).toUpperCase() + ((s.reply_style && s.reply_style.default) || "concise").slice(1), to: "reply" },
             { id: "tokens", label: "Token controls", detail: resetModeLabel, to: "tokens" },
             { id: "git", label: "Git", detail: currentBranchMode ? "Branch track on" : "Branch track off", to: "git" },
+            { id: "storage", label: "Storage", detail: cleanupMode === "on" ? "Cleanup on" : "Cleanup off", to: "storage" },
             { id: "notifications", label: "Notifications", detail: targetList.length ? targetList.join(", ") : "Off", to: "notifications" },
             { id: "startup", label: "Startup", detail: openInLabel, to: "startup" },
           ],
@@ -323,7 +395,10 @@ export function settingsCard(settings, permissionCount = 0) {
       sections: [
         {
           rows: Object.entries(permModes).map(([key, label]) =>
-            choice(key, label, key === permMode, () => save({ permission_mode: key }))),
+            choice(key, label, key === permMode, () => {
+              const reach = permissionReach(permMode, key, label, (get("status") || {}).workers || []);
+              Promise.resolve(save({ permission_mode: key })).then(() => { if (reach) toast(reach); });
+            })),
           footer: autoApprove
             ? "Workers will not ask before running commands. A chat can override this for itself on the Threads page."
             : "How spun agents get permission to act. A chat can override this for itself on the Threads page.",
@@ -343,6 +418,63 @@ export function settingsCard(settings, permissionCount = 0) {
           rows: [{ id: "max", label: "Max workers", trailing: stepper(s.max_workers, cap.auto_limit || "Auto", 1, 128, (v) => save({ max_workers: v })) }],
           footer: `${cap.auto_limit || cap.machine || "Auto"} suggested with ${cap.free_ram_gb || "?"} GB RAM free. Leave empty for the automatic limit.`,
         },
+        {
+          title: "Code packets",
+          rows: [
+            { id: "packets", label: "Code packets", detail: "Briefs that name files must carry their code", trailing: h("select", {
+              "aria-label": "Code packets", value: String(s.code_packets_mode || "auto"),
+              on: { change: (event) => save({ code_packets_mode: event.target.value }) },
+            },
+            h("option", { value: "auto" }, "Auto (builders)"),
+            h("option", { value: "require" }, "Require"),
+            h("option", { value: "warn" }, "Warn"),
+            h("option", { value: "off" }, "Off")) },
+          ],
+          footer: "Auto refuses a builder brief that names files but carries no code; research, review and planner roles are exempt. Warn only reminds.",
+        },
+        {
+          title: "Delegation",
+          rows: [
+            { id: "delegation", label: "Delegation", detail: `${shapeList.length} shape${shapeList.length === 1 ? "" : "s"} \u00b7 ${roundsLabel}`, to: "workers_delegation" },
+          ],
+        },
+        {
+          title: "Compression (experimental)",
+          rows: [
+            { id: "unitsbudget", label: "Unit call budget", trailing: h("select", {
+              "aria-label": "Unit call budget", value: String(s.units_budget || "pool"),
+              on: { change: (event) => save({ units_budget: event.target.value }) },
+            },
+            h("option", { value: "pool" }, "Shared pool"),
+            h("option", { value: "per_unit" }, "Fixed per unit")) },
+            { id: "rangemax", label: "Range widen limit", detail: "Above this, ranges return only nearby lines plus the signature", trailing: stepper(Number(s.packet_range_max_lines) || 120, 120, 20, 2000, (v) => save({ packet_range_max_lines: Math.max(20, Math.min(2000, v)) })) },
+            { id: "skelmin", label: "Skeleton from", detail: "Files longer than this get skeleton packets", trailing: stepper(Number(s.skeleton_min_lines) || 400, 400, 50, 5000, (v) => save({ skeleton_min_lines: Math.max(50, Math.min(5000, v)) })) },
+            { id: "wholemax", label: "Whole-file limit", detail: "Files up to this many lines are sent whole", trailing: stepper(Number(s.whole_file_max_lines) || 400, 400, 50, 5000, (v) => save({ whole_file_max_lines: Math.max(50, Math.min(5000, v)) })) },
+          ],
+          footer: "Experimental. Unit chains share one call pool and pay off on long jobs (5+ steps); on small tasks they cost about the same as one worker. Skeletons are for context code only: give the worker the full code of whatever it edits. Range packets send only the lines you ask for when the function is longer than the limit.",
+        },
+        {
+          title: "Guards",
+          rows: [
+            { id: "hardstop", label: "Hard stop", detail: "Tool calls without an edit before a worker is stopped", trailing: stepper(s.no_edit_tool_calls != null ? s.no_edit_tool_calls : hardStopNudge, 12, 2, 50, (v) => save({ no_edit_tool_calls: Math.max(2, Math.min(50, v)) })) },
+            { id: "projlines", label: "Failure lines", detail: "Lines of a failing test run shown to the agent", trailing: stepper(Number(s.projector_max_lines) || 40, 40, 5, 400, (v) => save({ projector_max_lines: Math.max(5, Math.min(400, v)) })) },
+          ],
+          footer: "The full output is always kept in the terminal log.",
+        },
+        {
+          title: "Failure doctor",
+          rows: [
+            { id: "doc-mode", label: "Doctor", detail: "Queue a fix agent when a worker fails", trailing: settingSelect("Failure doctor", "doctor_mode", s.doctor_mode || "auto", [["auto", "Auto (builders)"], ["on", "Always"], ["off", "Off"]]) },
+            { id: "doc-budget", label: "Doctor budget", detail: "Dynamic follows what the failed worker spent", trailing: settingSelect("Doctor budget", "doctor_budget_mode", s.doctor_budget_mode || "dynamic", [["dynamic", "Dynamic"], ["fixed", "Fixed"]]) },
+            { id: "doc-tokens", label: "Max tokens", detail: "Used when the budget is fixed", trailing: settingSelect("Doctor max tokens", "doctor_budget_tokens", doctorTokens, doctorTokenOptions) },
+            { id: "doc-model", label: "Model", detail: "Empty lets Subway pick a cheap one", trailing: h("input", {
+              type: "text", "aria-label": "Doctor model", value: s.doctor_model == null ? "" : String(s.doctor_model),
+              placeholder: "auto", style: "width:min(14rem,100%);min-width:0",
+              on: { change: (event) => save({ doctor_model: event.target.value.trim() }) },
+            }) },
+          ],
+          footer: "A single cheap agent reads why a worker failed and queues the fix. It always waits for your approval. A spin can override this with doctor=off|on|auto.",
+        },
       ],
     },
     local: {
@@ -355,11 +487,56 @@ export function settingsCard(settings, permissionCount = 0) {
           ],
         },
         {
+          rows: [{
+            id: "privacy-routing",
+            label: "Privacy routing",
+            trailing: h("select", {
+              "aria-label": "Privacy routing",
+              value: String(s.private_routing || "auto"),
+              on: { change: (event) => save({ private_routing: event.target.value }) },
+            },
+            h("option", { value: "local_only" }, "Local models only"),
+            h("option", { value: "auto" }, "Auto"),
+            h("option", { value: "off" }, "Off")),
+          }],
+          footer: "Detect private content and keep it local when a local model is available.",
+        },
+        {
           rows: [{ id: "maxlocal", label: "Max local workers", trailing: stepper(s.max_local_workers, loc.auto_local_workers || "Auto", 1, 32, (v) => save({ max_local_workers: v })) }],
           footer: `Fits about ${loc.auto_local_workers || 1} instance(s)${loc.model_needs_gb ? ` (~${loc.model_needs_gb} GB per model)` : ""} in ${loc.safe_room_gb || cap.free_ram_gb || "?"} GB.`,
         },
       ],
     },
+    mcp: (() => {
+      if (openSpPage === "mcp") {
+        loadSignin(() => document.dispatchEvent(new Event("subway:rerender")));
+      }
+      return {
+      title: "Shared MCP",
+      sections: [
+        {
+          title: "Sign-in",
+          rows: signinRows(),
+          footer: "Subway signs in to each HTTP server itself, so workers never see your tokens. Without it, Subway borrows Claude Code's sign-in.",
+        },
+        {
+          rows: [
+            flag("hubconc", "Concurrency", s.hub_concurrency_limits !== false, () => save({ hub_concurrency_limits: s.hub_concurrency_limits === false }), "Cap how many workers use lent MCP servers at once. Extra workers wait in the queue."),
+          ],
+        },
+        {
+          title: "Local servers",
+          rows: [{ id: "hublocal", label: "Max workers with their own copy", trailing: stepper(s.hub_max_local, hub.auto_hub_local || "Auto", 1, 32, (v) => save({ hub_max_local: v })) }],
+          footer: `Each worker runs its own copy of a heavy server such as a browser (~${hub.hub_local_ram_mb || 400} MB). About ${hub.auto_hub_local || 1} fit in ${cap.free_ram_gb || "?"} GB free. Shared servers like Paper keep one copy and never count.`,
+        },
+        {
+          title: "Remote servers",
+          rows: [{ id: "hubremote", label: "Max workers on remote servers", trailing: stepper(s.hub_max_remote, hub.auto_hub_remote || 16, 1, 64, (v) => save({ hub_max_remote: v })) }],
+          footer: "Remote servers such as Notion connect with your own sign-in and use almost no memory.",
+        },
+      ],
+      };
+    })(),
     context: {
       title: "Context",
       sections: [
@@ -412,6 +589,7 @@ export function settingsCard(settings, permissionCount = 0) {
     wake: (() => {
       if (openSpPage === "wake") {
         loadWake(() => document.dispatchEvent(new Event("subway:rerender")));
+        loadFastmail(() => document.dispatchEvent(new Event("subway:rerender")));
       }
       const statusRows = wakeStatusRows();
       return {
@@ -435,6 +613,11 @@ export function settingsCard(settings, permissionCount = 0) {
             title: "Status",
             rows: statusRows,
             footer: statusRows.note || wakeStatusNote(),
+          },
+          {
+            title: "Fast mail",
+            rows: fastmailRows(),
+            footer: "Messages sent through Subway's fast mail queue. Mute a peer to stop hearing from them.",
           },
         ],
       };
@@ -503,13 +686,104 @@ export function settingsCard(settings, permissionCount = 0) {
     }])),
     tokens: {
       title: "Token controls",
+      back: "settings",
       sections: [
         {
           rows: [
             { id: "governor", label: "Delegation governor", detail: `${govEnabled ? "On" : "Off"} \u00b7 ${govLimit} per turn`, to: "tokens_governor" },
-            { id: "reads", label: "Read limit", detail: resetModeLabel, to: "tokens_reads" },
-            { id: "nudges", label: "Nudges", detail: `${builderNudge} builders \u00b7 ${defaultNudge} others`, to: "tokens_nudges" },
           ],
+        },
+        {
+          title: "No-edit nudge",
+          rows: [
+            {
+              id: "nudge_builder",
+              label: "Builders",
+              detail: "Tool calls before a worker that hasn't edited is nudged",
+              trailing: numField(nudgeBuilderCalls, 1, 50, (v) => save({ nudge_builder_calls: v }), "Builders"),
+            },
+            {
+              id: "nudge_other",
+              label: "Others",
+              detail: "Tool calls before a worker that hasn't edited is nudged",
+              trailing: numField(nudgeOtherCalls, 1, 50, (v) => save({ nudge_other_calls: v }), "Others"),
+            },
+          ],
+          footer: "A worker that has not edited anything is reminded to write or report back.",
+        },
+        {
+          title: "Test output projector",
+          rows: [
+            flag(
+              "projector",
+              "Test output projector",
+              projectorEnabled,
+              () => save({ projector_enabled: !projectorEnabled }),
+              "Show a short summary of a test run instead of its raw output.",
+            ),
+          ],
+        },
+        {
+          title: "Table rows",
+          rows: [
+            {
+              id: "table_rows",
+              label: "Rows per table",
+              detail: "How many rows a table shows before it scrolls",
+              trailing: numField(tableRows, 5, 200, (v) => save({ table_rows: v })),
+            },
+          ],
+        },
+        {
+          title: "Read-count reset",
+          rows: [
+            choice("read_reset_compaction", "At compaction", currentBudgetReset === "compaction", () => save({ read_budget_reset: "compaction" })),
+            choice("read_reset_forever", "Never", currentBudgetReset === "forever", () => save({ read_budget_reset: "forever" })),
+          ],
+          footer: "The principal's read count (limit 200) clears at this point.",
+        },
+        {
+          title: "Applies to",
+          rows: [
+            choice("read_scope_all", "All chats", currentBudgetScope === "all", () => save({ read_budget_scope: "all" })),
+            choice("read_scope_provider", "This provider only", currentBudgetScope === "provider", () => save({ read_budget_scope: "provider" })),
+          ],
+        },
+        {
+          title: "Reset now",
+          rows: [
+            {
+              id: "read_reset_now",
+              label: "Reset read count now",
+              trailing: h("button", {
+                class: "btn",
+                type: "button",
+                on: { click: () => save({ read_budget_reset_now: true }) },
+              }, "Reset"),
+            },
+          ],
+        },
+      ],
+    },
+    workers_delegation: {
+      title: "Delegation",
+      back: "workers",
+      sections: [
+        {
+          title: "Delegation shapes",
+          rows: SHAPES.map(([k, label]) => flag(`shape_${k}`, label, shapeList.includes(k), () => toggleShape(k))),
+          footer: "Tree: workers spawn sub-workers. Mesh: iteration rounds. Pipeline: then= chains. Adaptive: learned routing. Iteration needs Mesh on.",
+        },
+        {
+          title: "Iteration mode",
+          rows: [
+            { id: "it_threshold", label: "Goal threshold", detail: "Percent the self and peer scores must both reach", trailing: numField(itv("threshold_pct", 85), 1, 100, (v) => save({ "iteration.threshold_pct": v }), "Goal threshold") },
+            { id: "it_rounds", label: "Max rounds", detail: "0 means no limit", trailing: numField(itv("max_rounds", 4), 0, 20, (v) => save({ "iteration.max_rounds": v }), "Max rounds") },
+            { id: "it_stall", label: "Stall stop", detail: "Rounds without gain before stopping; 0 never stops", trailing: numField(itv("stall_rounds", 2), 0, 10, (v) => save({ "iteration.stall_rounds": v }), "Stall stop") },
+            { id: "it_seconds", label: "Seconds per round", detail: "0 means no cap", trailing: numField(itv("round_seconds", 600), 0, 7200, (v) => save({ "iteration.round_seconds": v }), "Seconds per round") },
+            { id: "it_tokens", label: "Tokens per round", detail: "0 means no cap", trailing: numField(itv("round_tokens", 350000), 0, 5000000, (v) => save({ "iteration.round_tokens": v }), "Tokens per round") },
+          ],
+          footer: "Defaults for spin_iteration when a call leaves them out.",
         },
       ],
     },
@@ -587,6 +861,39 @@ export function settingsCard(settings, permissionCount = 0) {
         {
           rows: [flag("branch", "Branch track mode", currentBranchMode, () => save({ git_branch_mode: !currentBranchMode }))],
           footer: "Named branches and merge commits, so isolated workers render as a parallel tree.",
+        },
+        {
+          title: "Chat branches",
+          rows: [flag("chatbranch", "Require a chat branch", Boolean(s.chat_branch_auto), () => save({ chat_branch_auto: !s.chat_branch_auto }))],
+          footer: "When a second chat edits a tree another chat is editing, it must call chat_branch first and land with land_chat. Enforced in Claude Code; other agents are told.",
+        },
+        {
+          title: "Landing mode",
+          rows: [
+            choice("land-auto", "Auto", currentLandMode === "merge", () => save({ land_mode: "merge" })),
+            choice("land-queue", "Queue", currentLandMode === "queue", () => save({ land_mode: "queue" })),
+            choice("land-manual", "Manual", currentLandMode === "manual", () => save({ land_mode: "manual" })),
+          ],
+          footer: "Auto merges a finished worker's branch back even with uncommitted edits, which stay uncommitted; \"preserve\" is treated as Auto. Queue holds branches until no worker in the repo is running (subway land flushes). Manual never merges on its own: the branch waits for you (subway land <branch>). A worker that changed a file someone is editing keeps its branch either way.",
+        },
+      ],
+    },
+    storage: {
+      title: "Storage",
+      back: "settings",
+      sections: [
+        {
+          title: "Worktree cleanup",
+          rows: [
+            choice("cleanup_off", "Off", cleanupMode !== "on", () => save({ worktree_cleanup: "off" })),
+            choice("cleanup_on", "On", cleanupMode === "on", () => save({ worktree_cleanup: "on" })),
+          ],
+          footer: "Remove a worker's worktree once its work is merged. Worktrees with uncommitted work are always kept.",
+        },
+        {
+          title: "Worker logs",
+          rows: [{ id: "log_days", label: "Compress after (days)", detail: "0 keeps every log as it is", trailing: numField(intState(s.worker_log_days, 14, 0, 365), 0, 365, (v) => save({ worker_log_days: v }), "Compress after days") }],
+          footer: "Finished workers' logs older than this are gzipped to save space.",
         },
       ],
     },
@@ -1234,7 +1541,20 @@ function pagedRegion(key, label, kids) {
 
 async function showLog(id) {
   const pre = h("pre", {}, "Loading…");
-  modal(`Log: ${id}`, pre);
+  const history = h("div", { class: "audit-history" },
+    h("div", { class: "card-sub" }, "History"),
+    h("div", { class: "audit-list" }, h("div", { class: "empty" }, "Loading…")));
+  modal(`Log: ${id}`, h("div", { class: "log-view" }, history, pre));
+  api(`/api/audit?worker_id=${encodeURIComponent(id)}&limit=20`)
+    .then((d) => {
+      const entries = (d && d.entries) || [];
+      history.replaceChildren(
+        h("div", { class: "card-sub" }, "History"),
+        entries.length ? h("div", { class: "audit-list" }, entries.map(activityRow)) : h("div", { class: "empty" }, "No activity recorded for this worker."));
+    })
+    .catch((e) => {
+      history.replaceChildren(h("div", { class: "card-sub" }, "History"), h("div", { class: "empty" }, e.message));
+    });
   try {
     const d = await api(`/api/worker_log?id=${encodeURIComponent(id)}`);
     pre.textContent = d.log || "(no output)";
@@ -1565,6 +1885,8 @@ function workerRow(w, past) {
           routeTo ? h("b", { class: "wcard-to" }, routeTo) : null),
         w.id ? h("div", { class: "wcard-id mono" }, w.id) : null),
       h("div", { class: "wcard-head-side" }, pill, toggle)),
+    stampLine(startedEntry(w.id), w.started_at || w.created_at),
+    w.id ? workerMediaStrip(w.id, w.role || w.id) : null,
     flags.length ? h("div", { class: "wcard-chips" }, flags) : null,
     factList(stubFacts, "wcard-facts-stub"),
     h("div", { class: "wcard-perf", "aria-hidden": "true" }),
@@ -1693,6 +2015,7 @@ function openHistory(d, opts = {}) {
     if (!allEntries.length) {
       container.appendChild(h("div", { class: "empty" }, view === "archived" ? "No archived workers." : "No finished workers."));
     } else {
+      ensureStartedStamps(allEntries.map((w) => w.id));
       for (const w of allEntries) container.appendChild(workerRow(w, true));
     }
   }
@@ -1976,8 +2299,101 @@ export function modelsPage(d) {
 }
 
 let archivedCount = null; // last archived-worker total, kept across workersPage rebuilds
+/* Workers this station started on linked stations (roadmap 66). Approve or reject the waiting ones here. */
+export const remoteWorkersState = { rows: [], loadedAt: 0, loading: false, busy: "" };
+/* Screenshots from linked stations: fetched with the token header (never in the URL) and shown as blob URLs. */
+const mediaBlobs = new Map();
+function mediaUrl(ref, n) {
+  const key = `${ref}|${n}`;
+  const hit = mediaBlobs.get(key);
+  if (hit) return hit === "loading" ? "" : hit;
+  mediaBlobs.set(key, "loading");
+  const m = document.querySelector('meta[name="subway-token"]');
+  fetch(`/api/remote_workers/media?id=${encodeURIComponent(ref)}&name=${encodeURIComponent(n)}`,
+    { headers: { "X-Subway-Token": m ? m.content : "" } })
+    .then((r) => (r.ok ? r.blob() : null))
+    .then((b) => { if (b) { mediaBlobs.set(key, URL.createObjectURL(b)); document.dispatchEvent(new Event("subway:rerender")); } })
+    .catch(() => {});
+  return "";
+}
+/* Image names per worker (local or worker_x@station), refreshed on worker_media events or every 30 s. */
+const mediaLists = new Map();
+function workerMediaNames(ref) {
+  const hit = mediaLists.get(ref);
+  if (hit && (hit.loading || Date.now() - hit.at < 30000)) return hit.names;
+  const names = hit ? hit.names : [];
+  mediaLists.set(ref, { names, at: Date.now(), loading: true });
+  api(`/api/remote_workers/media?id=${encodeURIComponent(ref)}`)
+    .then((d) => { mediaLists.set(ref, { names: (d && d.names) || [], at: Date.now(), loading: false }); if ((d && d.names || []).length !== names.length) document.dispatchEvent(new Event("subway:rerender")); })
+    .catch(() => mediaLists.set(ref, { names, at: Date.now(), loading: false }));
+  return names;
+}
+export function forgetWorkerMedia(ref) { mediaLists.delete(ref); }
+function workerMediaStrip(ref, label) {
+  const names = workerMediaNames(ref);
+  if (!names.length) return null;
+  return h("div", { class: "remote-worker-media" }, names.slice(0, 6).map((n) => {
+    const u = mediaUrl(ref, n);
+    return u ? h("a", { href: u, target: "_blank", rel: "noopener" }, h("img", { src: u, alt: `Screenshot from ${label}`, loading: "lazy" })) : null;
+  }));
+}
+async function loadRemoteWorkers(force = false) {
+  const st = remoteWorkersState;
+  if (st.loading || (!force && Date.now() - st.loadedAt < 15000)) return;
+  st.loading = true;
+  try { const d = await api("/api/remote_workers"); st.rows = (d && d.workers) || []; } catch (_) { /* keep last */ }
+  st.loading = false;
+  st.loadedAt = Date.now();
+  document.dispatchEvent(new Event("subway:rerender"));
+}
+function remoteWorkersCard() {
+  loadRemoteWorkers();
+  const rows = remoteWorkersState.rows;
+  if (!rows.length) return null;
+  const act = async (kind, ref) => {
+    remoteWorkersState.busy = ref;
+    document.dispatchEvent(new Event("subway:rerender"));
+    try {
+      if (kind === "approve") await api("/api/approve_worker", { id: ref });
+      else if (kind === "reject") await api("/api/reject_worker", { id: ref });
+      else if (kind === "land") await api("/api/remote_workers/land", { id: ref });
+    }
+    catch (e) { toast(String((e && e.message) || e).replace(/^Error:\s*/, "")); }
+    remoteWorkersState.busy = "";
+    loadRemoteWorkers(true);
+  };
+  const row = (w) => {
+    const ref = `${w.worker_id}@${w.station}`;
+    const pending = w.status === "pending_approval";
+    const busy = remoteWorkersState.busy === ref;
+    return h("div", { class: "remote-worker" },
+      h("div", { class: "remote-worker-main" },
+        h("strong", {}, w.role || w.worker_id),
+        h("span", { class: "tag" }, `on ${w.station}`),
+        h("span", { class: "tag" + (w.status === "failed" || w.status === "error" ? " bad" : "") }, w.status || "starting"),
+        h("span", { class: "remote-worker-meta" }, [w.provider, w.model, ref].filter(Boolean).join(" · "))),
+      pending ? h("div", { class: "remote-worker-actions" },
+        h("button", { class: "btn primary", type: "button", disabled: busy || undefined, on: { click: () => act("approve", ref) } }, "Approve"),
+        h("button", { class: "btn", type: "button", disabled: busy || undefined, on: { click: () => act("reject", ref) } }, "Reject")) : null,
+      (w.has_patch && !w.landed) ? h("div", { class: "remote-worker-actions" },
+        h("button", { class: "btn primary", type: "button", disabled: busy || undefined, on: { click: () => act("land", ref) } }, "Land here")) : null,
+      w.landed ? h("span", { class: "tag" }, `landed ${w.landed}`) : null,
+      (w.media && w.media.length) ? h("div", { class: "remote-worker-media" },
+        w.media.slice(0, 6).map((n) => {
+          const u = mediaUrl(ref, n);
+          return u ? h("a", { href: u, target: "_blank", rel: "noopener" },
+            h("img", { src: u, alt: `Screenshot from ${w.station}`, loading: "lazy" })) : null;
+        })) : null,
+      w.report ? h("details", { class: "remote-worker-report" }, h("summary", {}, "Report"), h("pre", {}, w.report)) : null);
+  };
+  return h("section", { class: "card remote-workers-card" },
+    h("h2", { class: "card-title" }, "On linked stations"),
+    h("div", { class: "card-sub" }, "Workers started from here on your other stations."),
+    rows.slice(0, 30).map(row));
+}
 export function workersPage(d) {
   const workers = d.workers || [];
+  ensureStartedStamps(workers.map((w) => w.id));
   const activeCount = workers.filter((w) => ["running", "launching", "stopping"].includes(w.status)).length;
   const cap = (d.settings && d.settings.capacity) || {};
   const limits = (!d.settings || !d.settings.capacity || cap.limits_off)
@@ -2059,7 +2475,7 @@ export function workersPage(d) {
     h("div", { class: "worker-stats-row" },
       stat("Running", running.length, running.length ? "live" : ""),
       stat("Waiting on you", waiting.length, waiting.length ? "warn" : ""),
-      stat("Pending approvals", (d.permissions || []).length),
+      stat("Permission requests", (d.permissions || []).length, (d.permissions || []).length ? "warn" : ""),
       stat("Finished", totalHist)));
   const group = (title, list) => list.length ? h("section", { class: "card worker-group" },
     h("div", { class: "card-head" }, h("h2", { class: "card-title" }, title), h("span", { class: "tag num" }, String(list.length))),
@@ -2067,6 +2483,7 @@ export function workersPage(d) {
 
   return [
     permissionsCard(d.permissions || [], d.settings || {}),
+    remoteWorkersCard(),
     h("div", { class: "controls-grid" }, settingsCard(d.settings, (d.permissions || []).length), terminalCommandsCard(d.settings)),
     hasChatScope ? null : chatBudgetCard,
     hero,
@@ -2561,14 +2978,18 @@ function openNode(n, chat) {
       (n.id && n.id !== chat.id) ? h("button", { class: "btn", type: "button", on: { click: () => openLogs(n.id) } }, "Open log") : null)));
 }
 
-function threadCanvasView(chats) {
+function threadPicker(chats) {
   if (!chats.some((c) => c.id === threads.graphSel)) threads.graphSel = chats[0].id;
   const shown = chats.slice(0, 14);
-  const picker = h("div", { class: "thread-picker" }, shown.map((c) => {
+  return h("div", { class: "thread-picker" }, shown.map((c) => {
     return h("button", { class: "thread-pick", type: "button", "aria-pressed": String(c.id === threads.graphSel),
       on: { click: () => { threads.graphSel = c.id; document.dispatchEvent(new Event("subway:rerender")); } } },
       c.title || "(untitled)");
   }), chats.length > shown.length ? h("span", { class: "row-sub", style: "align-self:center;white-space:nowrap" }, `+${chats.length - shown.length} more`) : null);
+}
+
+function threadCanvasView(chats) {
+  const picker = threadPicker(chats);
 
   const readout = h("div", { class: "graph-readout", hidden: true });
   const chat = chats.find((c) => c.id === threads.graphSel) || chats[0];
@@ -2586,6 +3007,118 @@ function threadCanvasView(chats) {
       zbtn("100%", () => canvas._setZoom(1), "Reset zoom")));
 
   return h("div", { class: "thread-canvas-wrap" }, picker, toolbar, readout, canvas);
+}
+
+/* Timeline: x = time, y = lanes. A worker takes the first lane free at its start, so work that ran
+   at the same time stacks and work that ran in sequence shares a lane, like a git graph. Lane 0 is
+   the initiator; merged workers drop a dot back onto it. */
+function tlTime(v) { const t = v ? new Date(v).getTime() : NaN; return Number.isFinite(t) ? t : NaN; }
+
+function tlEdgeKind(w) {
+  if (w.rerouted_from || w.escalated_from || w.status === "rerouted") return "rerouted";
+  if (w.verdict || /review/i.test(String(w.role || ""))) return "reviewed";
+  if (w.triggered_by && !w.parent_id) return "handed_off";
+  return "spawned";
+}
+
+const TL_DASH = { spawned: null, rerouted: "6 4", reviewed: "1 3", handed_off: "2 3" };
+
+function timelineCanvas(chat) {
+  const now = Date.now();
+  const f = threads.tlFilter || (threads.tlFilter = { provider: "", state: "" });
+  const all = (Array.isArray(chat.workers) ? chat.workers : []).map((w) => {
+    const start = tlTime(w.started_at || w.created_at);
+    const end = tlTime(w.completed_at);
+    return { w, start, end: Number.isFinite(end) ? Math.max(end, start) : now };
+  }).filter((r) => Number.isFinite(r.start)).sort((a, b) => a.start - b.start);
+  const rows = all.filter((r) => (!f.provider || r.w.provider === f.provider)
+    && (!f.state || String(r.w.status || "") === f.state));
+
+  const laneEnd = [];
+  rows.forEach((r) => {
+    let i = laneEnd.findIndex((e) => e <= r.start);
+    if (i < 0) { i = laneEnd.length; laneEnd.push(0); }
+    laneEnd[i] = r.end;
+    r.lane = i + 1;
+  });
+  const byId = new Map(rows.map((r) => [r.w.id, r]));
+  const lanes = laneEnd.length;
+
+  const t0 = rows.length ? Math.min(...rows.map((r) => r.start)) : now - 1;
+  const t1 = rows.length ? Math.max(...rows.map((r) => r.end)) : now;
+  const PAD = 16, LH = 30;
+  const W = Math.max(720, Math.min(4000, 240 + rows.length * 70));
+  const x = (t) => PAD + ((t - t0) / Math.max(1, t1 - t0)) * (W - 2 * PAD - 160);
+  const y = (lane) => PAD + lane * LH + LH / 2;
+  const H = y(lanes) + LH;
+
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, ...kids) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) if (v != null) n.setAttribute(k, String(v));
+    kids.forEach((c) => { if (c) n.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
+    return n;
+  };
+  const svg = el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": `Timeline of ${chat.title || "thread"}`, class: "tl-svg" });
+
+  // Lane 0: the initiator.
+  svg.appendChild(el("line", { x1: PAD, x2: W - PAD, y1: y(0), y2: y(0), stroke: "currentColor", "stroke-opacity": 0.35, "stroke-width": 2 }));
+  svg.appendChild(el("text", { x: PAD, y: y(0) - 8, "font-size": 11, fill: "currentColor" }, chat.title || "Initiator"));
+
+  rows.forEach((r) => {
+    const w = r.w;
+    const kind = tlEdgeKind(w);
+    const parent = byId.get(w.parent_id || w.triggered_by);
+    const py = y(parent ? parent.lane : 0);
+    const colour = providerColour(w.provider);
+    const sx = x(r.start), ex = Math.max(x(r.end), sx + 6);
+    svg.appendChild(el("path", { d: `M ${sx} ${py} L ${sx} ${y(r.lane)}`, fill: "none", stroke: colour,
+      "stroke-width": kind === "handed_off" ? 1 : 1.5, "stroke-dasharray": TL_DASH[kind] }));
+    const st = String(w.status || "");
+    const outline = st === "failed" ? "#d33" : (st === "pending_approval" || st === "waiting") ? "#e0a100" : st === "running" ? "currentColor" : null;
+    const bar = el("rect", { x: sx, y: y(r.lane) - 7, width: ex - sx, height: 14, rx: 4, fill: colour, "fill-opacity": 0.85,
+      stroke: outline, "stroke-width": outline ? 2 : null, "stroke-dasharray": st === "running" ? "3 2" : null,
+      tabindex: 0, role: "button", style: "cursor:pointer",
+      "aria-label": `${w.role || w.id}, ${st || "unknown"}` },
+      el("title", {}, `${w.role || w.id} · ${[w.provider, w.model].filter(Boolean).join(" · ")} · ${st}`));
+    const open = () => openNode({ id: w.id, label: w.role || "worker", sub: [w.provider, w.model].filter(Boolean).join(" · "),
+      status: w.status, verdict: w.verdict, tokens: workerTokens(w) }, chat);
+    bar.addEventListener("click", open);
+    bar.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+    svg.appendChild(bar);
+    svg.appendChild(el("text", { x: ex + 6, y: y(r.lane) + 4, "font-size": 11, fill: "currentColor" },
+      `${w.role || w.id}${kind === "rerouted" ? " ↪" : ""}${st === "failed" ? " ✕" : ""}`));
+    const sha = w.merge_commit || w.merged_commit || "";
+    if (w.merged || sha) {
+      svg.appendChild(el("path", { d: `M ${ex} ${y(r.lane)} L ${ex} ${y(0)}`, stroke: colour, "stroke-width": 1, "stroke-dasharray": "2 2", fill: "none" }));
+      svg.appendChild(el("circle", { cx: ex, cy: y(0), r: 4, fill: colour },
+        el("title", {}, sha ? `merged ${String(sha).slice(0, 8)}` : "merged")));
+    }
+  });
+
+  const multi = rows.some((r) => r.w.parent_id && r.w.triggered_by && r.w.parent_id !== r.w.triggered_by);
+  const deep = rows.some((r) => byId.has(r.w.parent_id || r.w.triggered_by));
+  const shape = !rows.length ? "empty" : multi ? "mesh" : lanes <= 1 ? "chain" : deep ? "tree" : "fan-out";
+
+  const chip = (field, value, label) => h("button", { class: "thread-pick", type: "button", "aria-pressed": String(f[field] === value),
+    on: { click: () => { f[field] = f[field] === value ? "" : value; document.dispatchEvent(new Event("subway:rerender")); } } }, label);
+  const providers = [...new Set(all.map((r) => r.w.provider).filter(Boolean))];
+  const states = [...new Set(all.map((r) => String(r.w.status || "")).filter(Boolean))];
+  const filters = h("div", { class: "thread-picker", role: "group", "aria-label": "Timeline filters" },
+    providers.map((p) => chip("provider", p, p)), states.map((s) => chip("state", s, s)));
+
+  const wrap = h("div", { class: "tl-scroll", style: "overflow:auto;max-width:100%;max-height:70vh" });
+  wrap.appendChild(svg);
+  return { filters, wrap, readout: `${rows.length} node${rows.length === 1 ? "" : "s"} · ${lanes} lane${lanes === 1 ? "" : "s"} · shape: ${shape}` };
+}
+
+function threadTimelineView(chats) {
+  const picker = threadPicker(chats);
+  const chat = chats.find((c) => c.id === threads.graphSel) || chats[0];
+  const tl = timelineCanvas(chat);
+  const toolbar = h("div", { class: "graph-toolbar" }, h("span", { class: "row-sub" }, `${tl.readout} · click a bar to open it`));
+  return h("div", { class: "thread-canvas-wrap" }, picker, toolbar, tl.filters, tl.wrap);
 }
 
 let ctxMenuEl = null;
@@ -2827,15 +3360,64 @@ export function exclusionsCard(exclusionsData, onUpdate) {
     pagedRegion("thread-exclusions", "Thread exclusions list", body));
 }
 
+/* Chats on linked stations (roadmap 66). Read-only here: opening one reads it over the tunnel in decisions mode. */
+const linkedOpen = new Map();   // "id@station" -> { loading, text, error }
+function linkedStationsCard(stations) {
+  if (!Array.isArray(stations) || !stations.length) return null;
+  const rerender = () => document.dispatchEvent(new Event("subway:rerender"));
+  const openChat = async (ref) => {
+    if (linkedOpen.has(ref)) { linkedOpen.delete(ref); rerender(); return; }
+    linkedOpen.set(ref, { loading: true });
+    rerender();
+    try {
+      const d = await api(`/api/peers/read_chat?id=${encodeURIComponent(ref)}&mode=decisions`);
+      linkedOpen.set(ref, { text: (d && (d.text || d.error)) || "" });
+    } catch (e) {
+      linkedOpen.set(ref, { error: String(e) });
+    }
+    rerender();
+  };
+  const group = (s) => {
+    const tag = s.denied ? h("span", { class: "tag" }, "not granted")
+      : s.offline ? h("span", { class: "tag bad" }, "offline")
+      : h("span", { class: "tag" }, `${s.chats.length} chats`);
+    const rows = (s.chats || []).map((c) => {
+      const ref = `${c.alias || String(c.id || "").slice(0, 12)}@${s.station}`;
+      const st = linkedOpen.get(ref);
+      return h("div", { class: "linked-chat" },
+        h("button", { class: "linked-chat-row", type: "button", "aria-expanded": String(!!st),
+          on: { click: () => openChat(ref) } },
+          h("span", { class: "linked-chat-title" }, c.title || "(untitled)"),
+          h("span", { class: "linked-chat-meta" }, [c.source, ref].filter(Boolean).join(" · "))),
+        st ? h("pre", { class: "linked-chat-text" }, st.loading ? "Reading over the tunnel…" : (st.error || st.text || "")) : null);
+    });
+    return h("div", { class: "linked-station" },
+      h("div", { class: "linked-station-head" }, h("strong", {}, s.station), tag),
+      rows.length ? h("div", { class: "linked-chat-list" }, rows) : null);
+  };
+  return h("section", { class: "card linked-stations-card" },
+    h("h2", { class: "card-title" }, "Linked stations"),
+    h("div", { class: "card-sub" }, "Chats on your other stations, as far as each link allows. Tap one to read its decisions."),
+    stations.map(group));
+}
+
 export function threadsPage(d, chats, onRefresh, error = "") {
   const chatList = Array.isArray(chats) ? chats : [];
   const scopeBtn = h("button", { class: "btn" + (threads.scope === "all" ? " active" : ""), type: "button",
     "aria-pressed": String(threads.scope === "all"),
     on: { click: () => { threads.scope = threads.scope === "all" ? "subway" : "all"; onRefresh(); } } },
     threads.scope === "all" ? "All chats" : "Only chats that used Subway");
+  if (!threads._viewLoaded) {
+    threads._viewLoaded = true;
+    try { const v = localStorage.getItem("subway.threadView"); if (v === "image" || v === "canvas" || v === "timeline") threads.view = v; } catch (_) { /* storage blocked */ }
+  }
   const viewBtn = (key, label) => h("button", { type: "button", "aria-pressed": String(threads.view === key),
-    on: { click: () => { threads.view = key; document.dispatchEvent(new Event("subway:rerender")); } } }, label);
-  const viewSeg = h("div", { class: "seg", role: "group", "aria-label": "Thread view" }, viewBtn("image", "Image"), viewBtn("canvas", "Canvas"));
+    on: { click: () => {
+      threads.view = key;
+      try { localStorage.setItem("subway.threadView", key); } catch (_) { /* storage blocked */ }
+      document.dispatchEvent(new Event("subway:rerender"));
+    } } }, label);
+  const viewSeg = h("div", { class: "seg", role: "group", "aria-label": "Thread view" }, viewBtn("image", "Image"), viewBtn("canvas", "Canvas"), viewBtn("timeline", "Timeline"));
 
   const toolbar = h("div", { class: "threads-toolbar" },
     h("div", {}, h("h2", { class: "card-title" }, "Threads"),
@@ -2846,6 +3428,7 @@ export function threadsPage(d, chats, onRefresh, error = "") {
   if (error) body = h("div", { class: "err" }, `Could not load threads: ${error}`);
   else if (!chatList.length) body = trainEmpty();
   else if (threads.view === "canvas") body = threadCanvasView(chatList);
+  else if (threads.view === "timeline") body = threadTimelineView(chatList);
   else {
     for (const id of [...threadPanels.keys()]) {
       if (!chatList.some((c) => c.id === id)) threadPanels.delete(id);
@@ -2861,9 +3444,10 @@ export function threadsPage(d, chats, onRefresh, error = "") {
   const composer = h("div", { class: "tt-composer-field", "data-thread": canvasChat || "" }, tetherHost, composerEl);
   return [
     h("section", { class: "card threads-card" }, toolbar, body, composer),
+    linkedStationsCard(threads.linked),
     threadLogsCard(d?.thread_logs || d?.thread_log),
     exclusionsFold(d?.exclusions, onRefresh),
-  ];
+  ].filter(Boolean);
 }
 
 /* Workers spun per day, for the overview terrain (fed by app.js). */
@@ -3237,7 +3821,7 @@ export function terminalsPage(d, rows, onRefresh, error = "", loading = false, s
 }
 
 /* Ledger */
-export const ledger = { track: "main", entries: [] };
+export const ledger = { track: "main", entries: [], activity: false };
 
 export function renderLedgerEntries(entriesList) {
   const list = entriesList || ledger.entries;
@@ -3285,7 +3869,7 @@ function openLedgerDetail(e) {
   modal(e.message ? (e.message.length > 60 ? `${e.message.slice(0, 60)}…` : e.message) : "Ledger entry", content);
 }
 
-export function trackCard(trackData, onSwitch) {
+export function trackCard(trackData, onSwitch, activityToggle) {
   const data = trackData || {};
   if (data.error) {
     return h("section", { class: "card track-card", "aria-labelledby": "track-card-title" },
@@ -3353,8 +3937,31 @@ export function trackCard(trackData, onSwitch) {
     h("div", { class: "card-head" },
       h("h2", { class: "card-title", id: "track-card-title" }, `Track: ${trackName}`),
       h("span", { class: "tag mono" }, `${rawEntries.length} entries`)),
-    trackSelector,
+    (trackSelector || activityToggle) ? h("div", { class: "track-tools" }, trackSelector, activityToggle) : null,
     body);
+}
+
+function ledgerActivityCard() {
+  const list = h("div", { class: "audit-list" });
+  const paint = () => {
+    const entries = recentActivity();
+    list.replaceChildren(...(entries.length
+      ? entries.map((e) => activityRow(e))
+      : [h("div", { class: "empty" }, "No activity yet.")]));
+  };
+  paint();
+  const onActivity = () => {
+    if (!list.isConnected) { document.removeEventListener("subway:activity", onActivity); return; }
+    paint();
+  };
+  document.addEventListener("subway:activity", onActivity);
+  if (!recentActivity().length) loadActivity();
+  return h("section", { class: "card activity-card" },
+    h("div", { class: "card-head" },
+      h("div", {}, h("h2", { class: "card-title" }, "Activity"),
+        h("div", { class: "card-sub" }, "The last 100 actions, newest first.")),
+      h("span", { class: "tag num" }, String(recentActivity().length))),
+    list);
 }
 
 export function ledgerPage(d, onSwitch) {
@@ -3363,8 +3970,21 @@ export function ledgerPage(d, onSwitch) {
   const msg = h("input", { required: true, autocomplete: "off" });
   const files = h("input", { autocomplete: "off" });
   const trackData = d.track || { track: ledger.track, entries: ledger.entries, tracks: d.tracks };
+  const activityToggle = h("button", {
+    class: ledger.activity ? "btn primary" : "btn",
+    type: "button",
+    "aria-pressed": String(Boolean(ledger.activity)),
+    on: {
+      click: async () => {
+        ledger.activity = !ledger.activity;
+        if (ledger.activity) await loadActivity();
+        document.dispatchEvent(new Event("subway:rerender"));
+      },
+    },
+  }, "Activity");
   return [
-    trackCard(trackData, onSwitch),
+    trackCard(trackData, onSwitch, activityToggle),
+    ledger.activity ? ledgerActivityCard() : null,
     h("section", { class: "card" },
       h("div", { class: "card-head" }, h("h2", { class: "card-title" }, "Broadcast Decision"),
         h("button", { class: "btn", type: "button", on: { click: async () => {
@@ -3377,5 +3997,5 @@ export function ledgerPage(d, onSwitch) {
         if (await act("/api/broadcast", { message: msg.value, track: ledger.track, files: list, station_id: "hud-user" })) onSwitch(ledger.track);
       } } }, field("Post to this track", msg, true), field("Files, comma separated (optional)", files, true),
         h("div", { class: "btns field full" }, h("button", { class: "btn primary", type: "submit" }, "Post"))))
-  ];
+  ].filter(Boolean);
 }

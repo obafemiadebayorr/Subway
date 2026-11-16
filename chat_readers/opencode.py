@@ -96,8 +96,12 @@ def opencode_read_segments(sid: str) -> List[List[Dict[str, Any]]]:
     return segs if segs else [[]]
 
 
+def _opencode_db_path() -> str:
+    return os.path.join(_s.OPENCODE_DIR, "opencode.db")
+
+
 def _opencode_db() -> Optional[sqlite3.Connection]:
-    p = os.path.join(_s.OPENCODE_DIR, "opencode.db")
+    p = _opencode_db_path()
     if not os.path.exists(p):
         return None
     for uri in (f"file:{p}?mode=ro", f"file:{p}?immutable=1"):

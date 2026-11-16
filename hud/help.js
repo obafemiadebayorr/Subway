@@ -29,7 +29,7 @@ export function helpPage() {
       items: [
         { term: "Overview", desc: "What needs you (pending approvals, alerts, low limits), and what's actively running." },
         { term: "Threads", desc: "Chats that used Subway, and everything they started: nodes, edges, cost and per-thread settings. Toggle between the Image (card) view and the Canvas (node graph) view." },
-        { term: "Usage", desc: "Limits and tokens, as reported by each tool and provider, with budget tracking." },
+        { term: "Usage", desc: "Limits and tokens, as reported by each tool and provider, with budget tracking. Below them, stats: time, speed, work done, tokens and thinking across every worker." },
         { term: "Workers", desc: "Delegated agents, their real-time state, live logs, and pending permissions." },
         { term: "Models", desc: "How each model is ranked, benchmark scores, and where that ranking came from." },
         { term: "Leases", desc: "Who holds which file, preventing agents from making conflicting edits simultaneously." },
@@ -55,6 +55,9 @@ export function helpPage() {
         { term: "track record routing", desc: "Assigning worker tasks to models based on task type and historical success." },
         { term: "out of quota", desc: "Occurs when a provider or model runs out of tokens or hits rate limits, pausing work or falling back." },
         { term: "desktop alerts", desc: "System notifications sent when workers need approval, finish tasks, or approach budget limits." },
+        { term: "fastmail", desc: "Fast mail: short messages between chats delivered through Subway's queue, with state tracking (queued, delivered, read, replied) and per-peer muting." },
+        { term: "ask_room", desc: "Broadcast a question to every chat on a track and collect their answers in one place." },
+        { term: "reply_note", desc: "Reply to a fast mail message; threads the reply under the original and marks it replied." },
       ]
     },
     {

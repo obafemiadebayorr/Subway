@@ -31,6 +31,10 @@ def t_answer_permission(request_id: str, decision: str) -> str:
         # tool answer would let an agent approve its own command (npm publish included).
         return (f"[REFUSED] `{request_id}` is a terminal command. Your user approves it in the HUD "
                 "or in the prompt their chat shows; agents can't answer it.")
+    if rec.get("kind") == "fastmail_offline":
+        # Resuming an offline chat spends the user's budget; only the user approves in the HUD.
+        return (f"[REFUSED] `{request_id}` is an offline fastmail resume. Your user approves it in the HUD; "
+                "agents can't answer it.")
     return _s._answer_permission(request_id, decision, _s._short_id(me))
 
 

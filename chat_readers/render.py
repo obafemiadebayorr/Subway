@@ -114,7 +114,7 @@ def render_exchange(i: int, e: Dict[str, Any], user_label: str, max_assistant: i
     return "\n\n".join(out)
 
 
-def render_decisions(exchanges: List[Tuple[int, Dict[str, Any]]], max_chars: int) -> Tuple[str, Optional[int]]:
+def render_decisions(exchanges: List[Tuple[int, Dict[str, Any]]], max_chars: int, include_thoughts: bool = True) -> Tuple[str, Optional[int]]:
     """Extract a comprehensive Decision, Intent & Architecture Log.
 
     Returns the rendered log and the index of the last exchange actually covered,
@@ -133,7 +133,7 @@ def render_decisions(exchanges: List[Tuple[int, Dict[str, Any]]], max_chars: int
 
         # Capture key rationale from thoughts
         thought_points = []
-        for th in e.get("thoughts", []):
+        for th in (e.get("thoughts", []) if include_thoughts else []):
             for sentence in re.split(r"(?<=[.!?\n])\s+", th):
                 s = sentence.strip()
                 if 20 < len(s) < 350 and _s.DECISION_RE.search(s):
@@ -298,7 +298,7 @@ def render_chat(meta: Dict[str, Any], turns: List[Dict[str, Any]], mode: str, n:
         sel = list(enumerate(ex))[-max(1, n):]
 
     if mode == "decisions":
-        text, last = _s.render_decisions(sel, max_chars)
+        text, last = _s.render_decisions(sel, max_chars, include_thoughts)
         if delivery is not None:
             delivery["last"] = last
         return "\n".join(header) + text

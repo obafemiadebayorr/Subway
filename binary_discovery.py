@@ -12,6 +12,21 @@ import sys
 from typing import Optional
 
 
+def _is_windows() -> bool:
+    return os.name == "nt" or sys.platform == "win32"
+
+
+def _which_win(name: str) -> Optional[str]:
+    p = shutil.which(name)
+    if p or not _is_windows():
+        return p
+    for ext in (".cmd", ".bat", ".exe"):
+        p = shutil.which(f"{name}{ext}")
+        if p:
+            return p
+    return None
+
+
 def find_claude_binary() -> Optional[str]:
     """Dynamically locate Claude Code binary across system PATH, user bins, or IDE extension bundles."""
     import server
@@ -19,7 +34,7 @@ def find_claude_binary() -> Optional[str]:
     env_bin = os.environ.get("CLAUDE_BIN")
     if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
         return env_bin
-    p = shutil.which("claude") or (shutil.which("claude.cmd") if sys.platform == "win32" else None)
+    p = _which_win("claude")
     if p:
         return p
     candidates = [
@@ -32,14 +47,15 @@ def find_claude_binary() -> Optional[str]:
         *sorted(glob.glob(os.path.join(HOME, ".antigravity-ide", "extensions", "anthropic.claude-code-*", "resources", "native-binary", "claude")), key=os.path.getmtime, reverse=True),
         os.path.join(HOME, "Library", "Application Support", "Claude", "claude"),
     ]
-    if sys.platform == "win32":
+    if _is_windows():
         appdata = os.environ.get("APPDATA", "")
         localappdata = os.environ.get("LOCALAPPDATA", "")
         if appdata:
-            candidates.append(os.path.join(appdata, "npm", "claude.cmd"))
-            candidates.append(os.path.join(appdata, "npm", "claude"))
+            for ext in (".cmd", ".bat", ".exe", ""):
+                candidates.append(os.path.join(appdata, "npm", f"claude{ext}"))
         if localappdata:
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "claude.cmd"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "claude.bat"), recursive=True))
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "claude.exe"), recursive=True))
     for c in candidates:
         if os.path.exists(c) or os.path.lexists(c):
@@ -55,7 +71,7 @@ def find_opencode_binary() -> Optional[str]:
     if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
         return env_bin
     for name in ("opencode", "opencode2"):
-        p = shutil.which(name) or (shutil.which(f"{name}.cmd") if sys.platform == "win32" else None)
+        p = _which_win(name)
         if p:
             return p
     candidates = [
@@ -66,15 +82,16 @@ def find_opencode_binary() -> Optional[str]:
         "/opt/homebrew/bin/opencode",
         "/opt/homebrew/bin/opencode2",
     ]
-    if sys.platform == "win32":
+    if _is_windows():
         appdata = os.environ.get("APPDATA", "")
         localappdata = os.environ.get("LOCALAPPDATA", "")
         if appdata:
             for name in ("opencode", "opencode2"):
-                candidates.append(os.path.join(appdata, "npm", f"{name}.cmd"))
-                candidates.append(os.path.join(appdata, "npm", name))
+                for ext in (".cmd", ".bat", ".exe", ""):
+                    candidates.append(os.path.join(appdata, "npm", f"{name}{ext}"))
         if localappdata:
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "opencode*.cmd"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "opencode*.bat"), recursive=True))
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "opencode*.exe"), recursive=True))
     for c in candidates:
         if os.path.exists(c) or os.path.lexists(c):
@@ -89,18 +106,19 @@ def find_agy_binary() -> Optional[str]:
     env_bin = os.environ.get("AGY_BIN")
     if env_bin and os.path.exists(env_bin):
         return env_bin
-    p = shutil.which("agy") or (shutil.which("agy.cmd") if sys.platform == "win32" else None)
+    p = _which_win("agy")
     if p:
         return p
     candidates = [os.path.join(HOME, ".gemini", "bin", "agy")]
-    if sys.platform == "win32":
+    if _is_windows():
         appdata = os.environ.get("APPDATA", "")
         localappdata = os.environ.get("LOCALAPPDATA", "")
         if appdata:
-            candidates.append(os.path.join(appdata, "npm", "agy.cmd"))
-            candidates.append(os.path.join(appdata, "npm", "agy"))
+            for ext in (".cmd", ".bat", ".exe", ""):
+                candidates.append(os.path.join(appdata, "npm", f"agy{ext}"))
         if localappdata:
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "agy*.cmd"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "agy*.bat"), recursive=True))
             candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "agy*.exe"), recursive=True))
     for candidate in candidates:
         if os.path.exists(candidate):
@@ -115,7 +133,7 @@ def find_copilot_binary() -> Optional[str]:
     env_bin = os.environ.get("COPILOT_BIN")
     if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
         return env_bin
-    p = shutil.which("copilot") or (shutil.which("copilot.cmd") if sys.platform == "win32" else None)
+    p = _which_win("copilot")
     if p:
         return p
     candidates = [
@@ -131,6 +149,8 @@ def find_copilot_binary() -> Optional[str]:
 
 def _pi_wrapper() -> Optional[str]:
     """The repo's headless launcher, which pins PI_CODING_AGENT_DIR so the deepai/* models resolve."""
+    if _is_windows():
+        return None
     w = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "pi-deep")
     return w if os.path.isfile(w) and os.access(w, os.X_OK) else None
 
@@ -150,8 +170,8 @@ def find_pi_binary() -> Optional[str]:
     wrapper = _pi_wrapper()
     if wrapper:
         return wrapper
-    for name in ("pi", "deepai") + (("pi.cmd",) if sys.platform == "win32" else ()):
-        p = shutil.which(name)
+    for name in ("pi", "deepai"):
+        p = _which_win(name)
         if p and not _is_app_bundle(p):
             return p
     candidates = [
@@ -159,6 +179,16 @@ def find_pi_binary() -> Optional[str]:
         "/usr/local/bin/pi",
         "/opt/homebrew/bin/pi",
     ]
+    if _is_windows():
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        if appdata:
+            for ext in (".cmd", ".bat", ".exe", ""):
+                candidates.append(os.path.join(appdata, "npm", f"pi{ext}"))
+        if localappdata:
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "pi*.cmd"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "pi*.bat"), recursive=True))
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "**", "pi*.exe"), recursive=True))
     for c in candidates:
         if os.path.exists(c) or os.path.lexists(c):
             return c
@@ -172,7 +202,7 @@ def find_cursor_binary() -> Optional[str]:
     env_bin = os.environ.get("CURSOR_BIN")
     if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
         return env_bin
-    p = shutil.which("cursor") or (shutil.which("cursor.cmd") if sys.platform == "win32" else None)
+    p = _which_win("cursor")
     if p:
         return p
     candidates = [
@@ -181,13 +211,33 @@ def find_cursor_binary() -> Optional[str]:
         "/usr/local/bin/cursor",
         os.path.join(HOME, ".local", "bin", "cursor"),
     ]
-    if sys.platform == "win32":
+    if _is_windows():
         localappdata = os.environ.get("LOCALAPPDATA", "")
         if localappdata:
             candidates.extend([
                 os.path.join(localappdata, "Programs", "cursor", "Cursor.exe"),
                 os.path.join(localappdata, "cursor", "bin", "cursor.cmd"),
             ])
+    for c in candidates:
+        if os.path.exists(c) or os.path.lexists(c):
+            return c
+    return None
+
+
+def find_cursor_agent() -> Optional[str]:
+    """Locate cursor-agent CLI binary."""
+    import server
+    HOME = server.HOME
+    env_bin = os.environ.get("CURSOR_AGENT_BIN")
+    if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
+        return env_bin
+    p = shutil.which("cursor-agent") or _which_win("cursor-agent")
+    if p:
+        return p
+    candidates = [
+        os.path.join(HOME, ".local", "bin", "cursor-agent"),
+        "/usr/local/bin/cursor-agent",
+    ]
     for c in candidates:
         if os.path.exists(c) or os.path.lexists(c):
             return c
@@ -201,10 +251,19 @@ def find_devin_binary() -> Optional[str]:
     env_bin = os.environ.get("DEVIN_BIN")
     if env_bin and (os.path.exists(env_bin) or os.path.lexists(env_bin)):
         return env_bin
-    for name in ("devin-desktop", "devin"):
-        p = shutil.which(name) or (shutil.which(f"{name}.cmd") if sys.platform == "win32" else None)
-        if p:
-            return p
+    rust_cli = "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"
+    if os.path.exists(rust_cli) or os.path.lexists(rust_cli):
+        return rust_cli
+    user_rust_cli = os.path.join(HOME, "Applications", "Devin.app", "Contents", "Resources", "app", "extensions", "windsurf", "devin", "bin", "devin")
+    if os.path.exists(user_rust_cli) or os.path.lexists(user_rust_cli):
+        return user_rust_cli
+    p = shutil.which("devin") or _which_win("devin")
+    if p:
+        return p
+    # Fallback to devin-desktop (GUI)
+    p = _which_win("devin-desktop")
+    if p:
+        return p
     candidates = [
         "/Applications/Devin.app/Contents/Resources/app/bin/devin-desktop",
         os.path.join(HOME, "Applications", "Devin.app", "Contents", "Resources", "app", "bin", "devin-desktop"),
@@ -212,7 +271,7 @@ def find_devin_binary() -> Optional[str]:
         "/usr/local/bin/devin-desktop",
         os.path.join(HOME, ".local", "bin", "devin-desktop"),
     ]
-    if sys.platform == "win32":
+    if _is_windows():
         localappdata = os.environ.get("LOCALAPPDATA", "")
         if localappdata:
             candidates.append(os.path.join(localappdata, "Programs", "devin", "Devin.exe"))

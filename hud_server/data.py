@@ -87,7 +87,14 @@ import server as _s
 
 
 def _compile_hud_data(project: str = "") -> Dict[str, Any]:
-    """Compile a full snapshot of the Subway transit network for the HUD."""
+    """Compile a full snapshot of the Subway transit network for the HUD. Model health answers
+    are pinned for the build (see local_models.bad_state_pinned)."""
+    import local_models
+    with local_models.bad_state_pinned():
+        return _compile_hud_data_unpinned(project)
+
+
+def _compile_hud_data_unpinned(project: str = "") -> Dict[str, Any]:
     _s._ensure_subway_dir()
     state = _s.load_locks()
     now = time.time()
@@ -173,7 +180,10 @@ def _compile_hud_data(project: str = "") -> Dict[str, Any]:
         "settings": _live_settings(cfg_data, low_limits, benchmarks_meta, tracks_summary, quotas_data),
         "tracks": tracks_summary,
         "quotas": quotas_data,
+        "mail": _s.list_mail_items(limit=100) if hasattr(_s, "list_mail_items") else {},
     }
+    # The failure doctor settings, under the same keys they use in config.json.
+    hud_dict.update(_doctor_settings(cfg_data))
     chat_ctx = _s.get_chat_context()
     if chat_ctx is not None:
         hud_dict["chat_context"] = chat_ctx
@@ -243,13 +253,42 @@ def get_hud_data(project: str = "") -> Dict[str, Any]:
             return {**cached, "settings": {**(cached.get("settings") or {}), **_fast_settings()}}
         except Exception:
             return cached
-    data = _s._compile_hud_data(project)  # First call for this project: build it outside the lock.
-    with _s._hud_cache_lock:
-        _s._hud_cache[project] = {"data": data, "at": data.get("fetched_at", time.time()), "stale": False, "busy": False}
-    return data
+    # First call for this project. Exactly one thread builds it; any other request that arrives
+    # meanwhile waits for that build instead of starting its own (concurrent builds starved the
+    # server: each is seconds of GIL-bound JSON parsing, so N waiting tabs meant N times the work).
+    with _FIRST_BUILD_LOCK:
+        ev = _FIRST_BUILDS.get(project)
+        builder = ev is None
+        if builder:
+            ev = _FIRST_BUILDS[project] = threading.Event()
+    if not builder:
+        ev.wait(60.0)
+        with _s._hud_cache_lock:
+            entry = _s._hud_cache.get(project)
+        if entry is not None:
+            return entry["data"]
+    try:
+        data = _s._compile_hud_data(project)  # Built outside the cache lock.
+        with _s._hud_cache_lock:
+            _s._hud_cache[project] = {"data": data, "at": data.get("fetched_at", time.time()), "stale": False, "busy": False}
+        return data
+    finally:
+        if builder:
+            with _FIRST_BUILD_LOCK:
+                _FIRST_BUILDS.pop(project, None)
+            ev.set()
+
+
+_FIRST_BUILD_LOCK = threading.Lock()
+_FIRST_BUILDS: Dict[str, threading.Event] = {}
 
 def t_hud_status(project: str = "") -> str:
     """Display an ASCII departures-board style dashboard of the Subway transit network."""
+    try:
+        from workers.spawn import retry_swarm_pending
+        retry_swarm_pending()
+    except Exception:
+        pass
     text = _t_hud_status_impl(project)
     # Strip the live clock and lease countdowns: cosmetic churn that isn't a real change.
     sig_text = re.sub(r"\[\d{4}-\d{2}-\d{2}T[\d:.-]+\]", "", text)
@@ -331,6 +370,43 @@ def _get_governor_settings() -> dict:
         }
 
 
+def _doctor_settings(cfg_data=None) -> dict:
+    """The failure doctor settings, read from config.json with the CONTRACT defaults."""
+    if cfg_data is None:
+        cfg_data = _s._load_json("config.json")
+    cfg_data = cfg_data if isinstance(cfg_data, dict) else {}
+    try:
+        from worker_supervision.doctor import (doctor_mode, doctor_budget_mode,
+                                               doctor_budget_tokens, doctor_budget_ceiling)
+    except Exception:
+        return {"doctor_mode": "auto", "doctor_budget_mode": "dynamic",
+                "doctor_budget_tokens": 150000, "doctor_budget_ceiling": 400000}
+    return {
+        "doctor_mode": doctor_mode(cfg_data),
+        "doctor_budget_mode": doctor_budget_mode(cfg_data),
+        "doctor_budget_tokens": doctor_budget_tokens(cfg_data),
+        "doctor_budget_ceiling": doctor_budget_ceiling(cfg_data),
+    }
+
+
+def _settings_flat(cfg_data) -> dict:
+    """Every global setting from the contract, flat, so the HUD reads one key per setting."""
+    try:
+        from . import settings_api
+        return settings_api.read_all(cfg_data if isinstance(cfg_data, dict) else None)
+    except Exception:
+        return {}
+
+
+LAND_MODES = ("merge", "preserve", "queue", "manual")
+
+
+def _norm_land_mode(raw) -> str:
+    """merge | preserve | queue | manual; anything else (missing, corrupt, wrong type) is merge."""
+    mode = str(raw if raw is not None else "merge").strip().lower()
+    return mode if mode in LAND_MODES else "merge"
+
+
 def _fast_settings(cfg_data=None) -> dict:
     """Settings a click changes: config reads and mode getters only, cheap enough for every /api/status.
     Slow parts (capacity, models, quotas, budgets, rows) stay in the cached snapshot."""
@@ -338,6 +414,7 @@ def _fast_settings(cfg_data=None) -> dict:
         cfg_data = _s._load_json("config.json")
     cfg_data = cfg_data if isinstance(cfg_data, dict) else {}
     return {
+        **_settings_flat(cfg_data),
         "permission_mode": _s.get_permission_mode(), "terminal_mode": _s.get_terminal_mode(),
         "protected_commands": _s.get_protected_commands(), "protected_exceptions": _s.get_protected_exceptions(),
         "compaction": _s.get_compaction(), "compact_at_tokens": _s.compact_at_tokens(),
@@ -349,7 +426,8 @@ def _fast_settings(cfg_data=None) -> dict:
         "wake": {"policy": cfg_data.get("wake_events", "all"), "choices": ["all", "outcomes", "failures", "off"]},
         "principal": {"guard_enabled": bool(cfg_data.get("principal_guard_enabled", True)),
                       "max_reads": max(0, int(cfg_data.get("principal_max_reads", 30) or 0)),
-                      "mcp_read_tools": guard.principal_mcp_read_tools(cfg_data)},
+                      "mcp_read_tools": guard.principal_mcp_read_tools(cfg_data),
+                      "small_edit_lines": max(0, int(cfg_data.get("principal_small_edit_lines", 0) or 0))},
         "hud_autostart": bool(cfg_data.get("hud_autostart", True)),
         "hud_open_in": str(cfg_data.get("hud_open_in") or "auto"),
         "hud_open_on_use": bool(cfg_data.get("hud_open_on_use", True)),
@@ -359,7 +437,15 @@ def _fast_settings(cfg_data=None) -> dict:
         "local_memory_guard": cfg_data.get("local_memory_guard", True) is not False and os.environ.get("SUBWAY_LOCAL_MEMORY_GUARD") != "0",
         "local_concurrency_limits": cfg_data.get("local_concurrency_limits", True) is not False,
         "max_local_workers": cfg_data.get("max_local_workers"),
+        "hub_concurrency_limits": cfg_data.get("hub_concurrency_limits", True) is not False,
+        "hub_max_local": cfg_data.get("hub_max_local"),
+        "hub_max_remote": cfg_data.get("hub_max_remote"),
+        "private_routing": (
+            cfg_data.get("private_routing")
+            if cfg_data.get("private_routing") in ("local_only", "auto", "off") else "auto"
+        ),
         "git_branch_mode": bool(cfg_data.get("git_branch_mode", False)),
+        "land_mode": _norm_land_mode(cfg_data.get("land_mode", "merge")),
         "reply_style": _get_reply_style_settings(),
         "token_controls": {
             "read_budget": (cfg_data.get("read_budget") or {"reset": "compaction", "scope": "all"}),
@@ -372,6 +458,7 @@ def _fast_settings(cfg_data=None) -> dict:
         "notification_webhook": cfg_data.get("notification_webhook", ""),
         "edge_endpoints": cfg_data.get("edge_endpoints", []),
         "caffeinate": cfg_data.get("caffeinate", "off"),
+        **_doctor_settings(cfg_data),
     }
 
 

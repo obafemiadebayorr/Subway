@@ -5,6 +5,9 @@ via AppleScript (osascript).
 """
 
 from typing import List, Optional, Tuple
+import os
+import shutil
+import sys
 import subprocess
 
 _TERMINAL_APP_NAME = "Terminal"
@@ -125,6 +128,8 @@ def _automation_error(app: str) -> str:
 
 def _osascript(script: str, args: Optional[List[str]] = None, timeout: int = 5) -> Tuple[bool, str]:
     """Execute an AppleScript via osascript with arguments passed through argv."""
+    if sys.platform == "win32":
+        return False, "osascript is not supported on Windows"
     cmd = ["osascript", "-e", script] + list(args or [])
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -140,6 +145,8 @@ def _osascript(script: str, args: Optional[List[str]] = None, timeout: int = 5) 
 
 def is_busy(app: str, tty: str) -> Optional[bool]:
     """Check if the given terminal tab or session is busy running a command."""
+    if sys.platform == "win32":
+        return None
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):
         script = _TERMINAL_BUSY_SCRIPT
@@ -163,6 +170,8 @@ def is_busy(app: str, tty: str) -> Optional[bool]:
 
 def type_command(app: str, tty: str, command: str) -> Tuple[bool, str]:
     """Send and execute a command in the target tab/session."""
+    if sys.platform == "win32":
+        return False, f"unsupported app '{app}' on Windows"
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):
         script = _TERMINAL_TYPE_SCRIPT
@@ -183,6 +192,8 @@ def type_command(app: str, tty: str, command: str) -> Tuple[bool, str]:
 
 def read_history(app: str, tty: str) -> str:
     """Read the full terminal scrollback/contents of the target tab/session."""
+    if sys.platform == "win32":
+        return ""
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):
         script = _TERMINAL_HISTORY_SCRIPT
@@ -198,6 +209,31 @@ def read_history(app: str, tty: str) -> str:
         return ""
     return out
 
+
+def open_windows_terminal(command: Optional[str] = None, working_dir: Optional[str] = None) -> Tuple[bool, str]:
+    """Launch a terminal session on Windows (wt.exe, powershell.exe, or cmd.exe)."""
+    if sys.platform != "win32" and not os.environ.get("SUBWAY_TEST_WINDOWS"):
+        return False, "open_windows_terminal is only available on Windows"
+    shell_candidates = ["wt.exe", "wt", "powershell.exe", "pwsh.exe", "cmd.exe"]
+    chosen = None
+    for cand in shell_candidates:
+        path = shutil.which(cand)
+        if path:
+            chosen = path
+            break
+    if not chosen:
+        chosen = "cmd.exe"
+    try:
+        args = [chosen]
+        if command:
+            if "powershell" in chosen.lower() or "pwsh" in chosen.lower():
+                args += ["-NoExit", "-Command", command]
+            else:
+                args += ["/K", command]
+        proc = subprocess.Popen(args, cwd=working_dir)
+        return True, str(proc.pid)
+    except Exception as e:
+        return False, str(e)
 
 def slice_output(history: str, command: str) -> str:
     """Extract output after the last line ending with command, minus the final prompt line."""

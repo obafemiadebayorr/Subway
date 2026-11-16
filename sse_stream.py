@@ -1,6 +1,53 @@
-import json, queue, threading, time, uuid
+import json, os as _os, queue, select, threading, time, uuid
 import subway_home
 from typing import Dict, Any, Optional, Set
+
+# --- Monotonic event ids -----------------------------------------------------
+# iOS suspends an app and drops its SSE socket, so a reconnecting phone must be able to say
+# "I already have up to 417" and receive only what it missed. Ids are therefore integers,
+# persisted, and never reused across a restart. The uuid form stays as a fallback for
+# callers that pass an explicit event_id.
+
+SEQ_REPLAY = 200
+
+
+def _seq_path() -> str:
+    base = subway_home.subway_dir()
+    return _os.path.join(base, "sse_seq")
+
+
+def _load_seq() -> int:
+    try:
+        with open(_seq_path(), "r", encoding="utf-8") as fh:
+            return max(0, int((fh.read() or "0").strip() or 0))
+    except (OSError, ValueError):
+        return 0
+
+
+_seq_lock = threading.Lock()
+_seq = _load_seq()
+
+
+def next_seq() -> int:
+    """Reserve the next event id. Persisted best-effort: a lost file costs a re-send, not a gap."""
+    global _seq
+    with _seq_lock:
+        _seq += 1
+        value = _seq
+        try:
+            path = _seq_path()
+            _os.makedirs(_os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(str(value))
+        except OSError:
+            pass
+        return value
+
+
+def last_seq() -> int:
+    with _seq_lock:
+        return _seq
+
 
 class SSEBroadcaster:
     """Thread-safe Server-Sent Events broadcaster supporting simultaneous events and multiple subscribers (Roadmap Item 38a2)."""
@@ -8,6 +55,7 @@ class SSEBroadcaster:
         self._lock = threading.Lock()
         self._subscribers: Set[queue.Queue] = set()
         self._max_queue = max_queue_size
+        self._recent: list = []  # [(seq, frame)] for replay, oldest first
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=self._max_queue)
@@ -25,9 +73,13 @@ class SSEBroadcaster:
 
     def broadcast(self, event_type: str, data: Dict[str, Any], event_id: Optional[str] = None) -> int:
         """Broadcast an event to all simultaneous subscribers without blocking."""
-        eid = event_id or uuid.uuid4().hex[:8]
+        seq = next_seq()
+        eid = event_id or str(seq)
         msg = f"id: {eid}\nevent: {event_type}\ndata: {json.dumps(data)}\n\n"
         with self._lock:
+            self._recent.append((seq, msg))
+            if len(self._recent) > SEQ_REPLAY:
+                del self._recent[: len(self._recent) - SEQ_REPLAY]
             subs = list(self._subscribers)
         delivered = 0
         for q in subs:
@@ -43,21 +95,40 @@ class SSEBroadcaster:
                     pass
         return delivered
 
+    def replay_since(self, since: int) -> list:
+        """Frames newer than `since`, oldest first. Empty when the client is up to date."""
+        with self._lock:
+            return [msg for seq, msg in self._recent if seq > since]
+
+    def last_seq(self) -> int:
+        with self._lock:
+            return self._recent[-1][0] if self._recent else last_seq()
+
+    def oldest_seq(self):
+        """Seq of the oldest frame still kept for replay, or None when nothing is kept."""
+        with self._lock:
+            return self._recent[0][0] if self._recent else None
+
+
 _broadcaster = SSEBroadcaster()
 
 def get_broadcaster() -> SSEBroadcaster:
     return _broadcaster
 
 def broadcast_event(event_type: str, data: Dict[str, Any]) -> int:
-    return _broadcaster.broadcast(event_type, data)
+    result = _broadcaster.broadcast(event_type, data)
+    try:
+        import push
+        push.on_event(event_type, data)
+    except Exception:
+        pass
+    return result
 
 # --- Cross-process delivery -------------------------------------------------
 # The broadcaster above is in-process, so an event produced by the MCP server (a
 # different process from the HUD) could never reach /api/events subscribers. Events are
 # therefore spooled to a file that the HUD tails. This is the same mechanism the rest of
 # Subway uses (wake spools, compact requests): files, watched.
-
-import os as _os
 
 def _spool_path() -> str:
     base = subway_home.subway_dir()
@@ -100,11 +171,63 @@ def _dispatch_line(rec: dict) -> None:
         except Exception:
             pass
     _broadcaster.broadcast(event_type, data)
+    try:
+        import push  # spooled events (MCP server, workers) push too, not only the HUD's own
+        push.on_event(event_type, data)
+    except Exception:
+        pass
 
+
+_tailer_lock = threading.Lock()
+_tailer: Dict[str, Any] = {"thread": None, "stop": None}
+
+
+def stop_spool_tailer(timeout: float = 2.0) -> None:
+    """Stop the spool tailer if one is running (tests, HUD shutdown)."""
+    with _tailer_lock:
+        t, stop = _tailer["thread"], _tailer["stop"]
+        _tailer["thread"] = _tailer["stop"] = None
+    if stop is not None:
+        stop.set()
+    if t is not None and t is not threading.current_thread():
+        t.join(timeout)
+
+
+def _wait_spool_or_stop(path: str, stop: threading.Event, interval: float) -> bool:
+    """Sleep up to `interval`, waking early when the spool file changes. Returns True if stop is set."""
+    if hasattr(select, "kqueue") and hasattr(select, "KQ_FILTER_VNODE") and _os.path.exists(path):
+        try:
+            fd = _os.open(path, _os.O_RDONLY)
+            kq = select.kqueue()
+            try:
+                kq.control(
+                    [select.kevent(
+                        fd,
+                        filter=select.KQ_FILTER_VNODE,
+                        flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                        fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_ATTRIB
+                        | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE,
+                    )],
+                    1,
+                    interval,
+                )
+            finally:
+                kq.close()
+                _os.close(fd)
+        except OSError:
+            return stop.wait(interval)
+        return stop.is_set()
+    return stop.wait(interval)
 
 def start_spool_tailer(interval: float = 0.5, max_bytes: int = 4 * 1024 * 1024) -> threading.Thread:
-    """Watch the spool in the HUD process and broadcast new lines to subscribers."""
-    state = {"offset": 0}
+    """Watch the spool in the HUD process and broadcast new lines to subscribers. Idempotent: returns the running tailer if there is one."""
+    # Start at the end: the backlog was delivered (or missed) before this process started, and
+    # replaying it would resend every old event to browsers and phones at each HUD restart.
+    try:
+        start = _os.path.getsize(_spool_path())
+    except OSError:
+        start = 0
+    state = {"offset": start}
 
     def _tick() -> None:
         path = _spool_path()
@@ -142,13 +265,20 @@ def start_spool_tailer(interval: float = 0.5, max_bytes: int = 4 * 1024 * 1024) 
                 pass
 
     def _loop() -> None:
-        while True:
-            time.sleep(interval)
+        while not stop.is_set():
+            if _wait_spool_or_stop(_spool_path(), stop, interval):
+                break
             try:
                 _tick()
             except Exception:
                 pass
 
-    t = threading.Thread(target=_loop, name="subway-sse-spool", daemon=True)
-    t.start()
+    with _tailer_lock:
+        running = _tailer["thread"]
+        if running is not None and running.is_alive():
+            return running  # one tailer per process: a second would broadcast every event twice
+        stop = threading.Event()
+        t = threading.Thread(target=_loop, name="subway-sse-spool", daemon=True)
+        _tailer["thread"], _tailer["stop"] = t, stop
+        t.start()
     return t

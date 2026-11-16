@@ -30,6 +30,12 @@ Writes:
 """
 from __future__ import annotations
 
+import sys as _relay_sys
+if __name__ == "__main__" and _relay_sys.argv[1:2] in ([], ["--stdio"]):
+    import mcp_relay as _mcp_relay  # stdlib-only; decides before any heavy import
+    if _mcp_relay.enabled():
+        _relay_sys.exit(_mcp_relay.main())
+
 import atexit
 import subway_home
 import base64
@@ -77,16 +83,33 @@ try:
 except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
     fcntl = None  # type: ignore[assignment]
 
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 if os.environ.get("_SUBWAY_SANDBOX_INITIALIZED") == "1":
     os.environ.pop("SUBWAY_HUD_NO_OPEN", None)
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.environ.get("SUBWAY_CLAUDE_DIR", os.path.join(HOME, ".claude"))
 CLAUDE_JSON = os.environ.get("SUBWAY_CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
 AGY_DIR = os.environ.get("SUBWAY_AGY_DIR", os.path.join(HOME, ".gemini", "antigravity"))
-OPENCODE_DIR = os.environ.get("SUBWAY_OPENCODE_DIR", os.path.join(HOME, ".local", "share", "opencode"))
-OPENCODE_AGENTS_DIR = os.environ.get("SUBWAY_OPENCODE_AGENTS_DIR",
-                                     os.path.join(HOME, ".config", "opencode", "agents"))
+def _default_opencode_dir() -> str:
+    posix_dir = os.path.join(HOME, ".local", "share", "opencode")
+    if os.name == "nt" and not os.path.exists(posix_dir):
+        localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if localappdata:
+            return os.path.join(localappdata, "opencode")
+    return posix_dir
+
+
+def _default_opencode_agents_dir() -> str:
+    posix_dir = os.path.join(HOME, ".config", "opencode", "agents")
+    if os.name == "nt" and not os.path.exists(posix_dir):
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return os.path.join(appdata, "opencode", "agents")
+    return posix_dir
+
+
+OPENCODE_DIR = os.environ.get("SUBWAY_OPENCODE_DIR", _default_opencode_dir())
+OPENCODE_AGENTS_DIR = os.environ.get("SUBWAY_OPENCODE_AGENTS_DIR", _default_opencode_agents_dir())
 COPILOT_DIR = os.environ.get("SUBWAY_COPILOT_DIR", os.path.join(HOME, ".copilot"))
 def _discover_pi_dir() -> str:
     """The agent dir the running pi actually uses.
@@ -237,7 +260,9 @@ from chat_readers import _file_may_contain
 
 
 from agent_chat import t_agent_chat
-from cli_tools import (t_search_chat, t_tag_chat, t_read_chat, t_send_note, t_check_notes, t_whoami)
+from cli_tools import (t_search_chat, t_tag_chat, t_read_chat, t_send_note, t_check_notes, t_whoami, t_reply_note, t_fastmail_status)
+from fastmail_broadcast import t_ask_room
+from postmail import (t_mail_post, t_mail_list, t_mail_cancel, t_mail_edit, t_post_mail, t_list_mail, t_edit_mail, t_cancel_mail, list_mail_items, evaluate_mail_items, recover_interrupted_mail)
 
 
 # --------------------------------------------------------------------------
@@ -272,8 +297,9 @@ from worker_supervision.code_items import _extract_code_item, outline
 # --------------------------------------------------------------------------
 
 WORKER_ID_RE = re.compile(r"^worker_[0-9a-f]{6}$")
-VALID_CAPABILITIES = {"files:read", "files:write", "terminal:safe", "terminal:full", "browser", "mcp", "subagents"}
-VALID_EFFORTS = ("low", "medium", "high", "max")
+VALID_CAPABILITIES = {"files:read", "files:write", "terminal:safe", "terminal:full", "browser", "mcp", "subagents", "desktop"}
+from local_models import LADDER, effort_levels, resolve_effort, _claude_efforts  # noqa: E402
+VALID_EFFORTS = LADDER
 ACTIVE_WORKER_STATES = ("pending_approval", "launching", "running", "stopping")
 DEFAULT_WORKER_TIMEOUT = 3600
 
@@ -353,6 +379,7 @@ from workers import (route_task, t_routing_weights)
 
 
 from cli_tools import t_estimate_complexity
+from skills import t_list_skills, t_borrow_skill
 
 
 from workers import (_safe_prompt, _worker_command)
@@ -401,9 +428,9 @@ from store import _file_sha256
 
 
 
-_TRIGGER_STEP_FIELDS = {"role", "prompt", "provider", "model", "when", "include", "other_provider", "max_tokens", "verdict", "then", "capabilities", "effort"}
+_TRIGGER_STEP_FIELDS = {"role", "prompt", "provider", "model", "when", "include", "other_provider", "max_tokens", "verdict", "then", "capabilities", "effort", "unit", "code"}
 _TRIGGER_WHEN = ("completed", "failed", "always", "approved", "rejected")
-_TRIGGER_EFFORTS = ("auto", "low", "medium", "high", "max")
+_TRIGGER_EFFORTS = ("auto",) + tuple(LADDER)
 _TRIGGER_INCLUDE = ("patch", "report", "both", "none")
 _REVIEW_PROMPT = ("Read-only review. Do not edit any file and use no tools. Reply with the first line APPROVE or REJECT: <reason>, "
                   "then at most 4 lines. Approve only if the patch does the TASK below, nothing else, and would not break "
@@ -429,6 +456,7 @@ from workers import (_lineage_parent, _inherit_from_parent)
 
 from threadlog import _THREAD_PARENT, WORKER_RAM  # noqa: E402 — thread recording (section 4/7)
 
+from hub_tools import t_hub_servers, t_hub_tools, t_hub_call  # noqa: E402
 from workers import (_thread_parent, _thread_record, _thread_finished, _thread_root, _thread_root_for_caller, _settings_snapshot, t_spin_worker)  # noqa: E402
 from concurrency import (run_concurrent, t_run_concurrent)
 
@@ -484,7 +512,11 @@ def await_permission(rid: str, wait: int = PERMISSION_WAIT, stop: Optional[Calla
                 rec = json.load(f)
             if rec.get("status") != "pending":
                 return str(rec.get("decision") or "deny")
-        time.sleep(1.0)
+        rem = min(1.0, max(0.05, deadline - time.time()))
+        try:
+            wait_for_activity(timeout=rem)
+        except Exception:
+            time.sleep(rem)
     _answer_permission(rid, "deny", "timeout")
     return "deny"
 
@@ -519,7 +551,7 @@ from worker_supervision import (_pump_plain, _pump_pi, _pump_claude, _pump_agy, 
 from chat_readers import parse_copilot_jsonl
 
 
-from worker_supervision import (_pump_copilot, _run_triggers, t_on_worker_done)
+from worker_supervision import (_pump_copilot, _run_triggers, t_on_worker_done, doctor_mode, doctor_budget_mode, doctor_budget_tokens, doctor_budget_ceiling, worker_doctor_mode, doctor_budget_for, should_doctor, pick_doctor_model, doctor_brief, queue_failure_doctor, maybe_queue_failure_doctor)
 
 from iteration import t_spin_iteration, t_stop_iteration
 
@@ -574,6 +606,8 @@ def run_permit_server(worker_id: str) -> int:
 
 from workers import (t_approve_worker, t_stop_worker, t_reject_worker, _track_only_workers, _worker_detail, worker_listing, archive_history, t_worker_archive, t_worker_unarchive, t_archive_settings, t_wake_settings)
 from workers.spawn import t_prune_branches
+from land_resolver import t_list_conflicts, t_resolve_conflict
+from chat_branches import t_chat_branch, t_land_chat
 
 
 from cli_tools import (t_worker_status, t_collect_reports, t_instruct_worker, t_await_worker)
@@ -781,6 +815,9 @@ _ONBOARDING_USE_WHEN = {
     "context_slice": "Build a token-capped context slice of files and threads for a prompt.",
     "thread_export": "Export a whole thread (ledger, workers, patches) as Markdown or JSON.",
     "send_note": "Leave a dispatch/mailbox note for another agent window.",
+    "reply_note": "Reply to a fast mail message; marks the original replied.",
+    "fastmail_status": "Show fast mail outbox/inbox states.",
+    "ask_room": "Ask the room: broadcast a question and collect replies.",
     "check_notes": "Read and clear dispatches left for this agent window.",
     "spin_worker": "Delegate an isolated task to a worker; keep scope small and spec exact.",
     "escalate_worker": "Escalate when a worker struggles, stalls, or needs a stronger model/route.",
@@ -791,6 +828,10 @@ _ONBOARDING_USE_WHEN = {
     "broadcast_track": "Share a decision on a track with files/decisions for the fleet.",
     "collect_reports": "Gather completed worker reports; wait=True to block for results.",
     "prune_branches": "List or delete finished worker branches and worktrees (dry run first).",
+    "list_conflicts": "Landing overlaps kept for a resolver (worker branch vs HEAD).",
+    "chat_branch": "Give this chat its own branch and worktree so other chats can't overwrite its edits.",
+    "land_chat": "Land this chat's branch (3-way merge; overlaps go to the Landing view).",
+    "resolve_conflict": "Queue an isolated resolver worker for one landing overlap.",
 }
 
 
@@ -868,6 +909,21 @@ def t_wake_status() -> str:
     return _wake.human_status(_wake.status())
 
 
+def t_station_files(station: str, path: str = "") -> str:
+    import peers
+    return peers.station_files(station, path)
+
+
+def t_fetch_file(station: str, path: str, to: str = "") -> str:
+    import peers
+    return peers.fetch_file(station, path, to)
+
+
+def t_send_file(station: str, path: str, to: str, overwrite: bool = False) -> str:
+    import peers
+    return peers.send_file(station, path, to, overwrite)
+
+
 TOOLS = {
     "subway": (t_subway, {
         "description": "Stable dispatcher to call any Subway tool (including newly reloaded tools) by name. tool='list' returns names, schemas, and use-when hints.",
@@ -898,6 +954,7 @@ TOOLS = {
             "segment": {"type": "string", "description": "'all' (default), 'latest', or a segment number, split at each compaction."},
             "limit": {"type": "integer", "default": 5},
             "include_subagents": {"type": "boolean", "default": True, "description": "Search across spun worker subagents as well."},
+            "peers_too": {"type": "boolean", "default": True, "description": "Search chats on linked stations too."},
         }},
     }),
     "tag_chat": (t_tag_chat, {
@@ -925,9 +982,10 @@ TOOLS = {
             "anchor_text": {"type": "string", "description": "Board from the exchange containing this exact quote."},
             "max_chars": {"type": "integer", "default": DEFAULT_MAX_CHARS},
             "include_tools": {"type": "boolean", "default": False},
-            "include_thoughts": {"type": "boolean", "default": True},
+            "include_thoughts": {"type": "boolean", "description": "Include agent thoughts. Omit to follow the thoughts_mode setting (include or exclude)."},
             "source": READ_SOURCE,
             "project": {"type": "string"},
+            "local_only": {"type": "boolean", "default": False, "description": "Read only local chats without forwarding to linked stations."},
         }},
     }),
     "send_note": (t_send_note, {
@@ -938,6 +996,35 @@ TOOLS = {
             "text": {"type": "string"},
             "from_chat": {"type": "string"},
             "share_chat": {"type": "string"},
+            "mode": {"type": "string", "enum": ["fast", "normal"]},
+            "reply_to": {"type": "string"},
+            "linked_sender": {"type": "boolean", "default": False, "description": "Internal flag for notes arriving over a station link."},
+        }},
+    }),
+    "reply_note": (t_reply_note, {
+        "description": "Reply to a fast mail message; sets reply_to/thread_id and marks the original replied.",
+        "inputSchema": {"type": "object", "required": ["msg_id", "text"], "properties": {
+            "msg_id": {"type": "string"},
+            "text": {"type": "string"},
+            "from_chat": {"type": "string"},
+        }},
+    }),
+    "ask_room": (t_ask_room, {
+        "description": "Ask the room: broadcast one question to the active chats in this project and collect replies.",
+        "inputSchema": {"type": "object", "required": ["text"], "properties": {
+            "text": {"type": "string"},
+            "project": {"type": "string", "default": ""},
+            "wait_seconds": {"type": "integer", "default": 0},
+            "mode": {"type": "string", "default": "normal"},
+            "track": {"type": "string", "default": "main"},
+        }},
+    }),
+    "fastmail_status": (t_fastmail_status, {
+        "description": "Show fast mail outbox/inbox states (or one message / one broadcast).",
+        "inputSchema": {"type": "object", "properties": {
+            "msg_id": {"type": "string"},
+            "broadcast_id": {"type": "string"},
+            "limit": {"type": "integer", "default": 20},
         }},
     }),
     "check_notes": (t_check_notes, {
@@ -993,6 +1080,20 @@ TOOLS = {
             "action": {"type": "string", "description": "'maintain' runs compression and deletion now."},
         }},
     }),
+    "list_skills": (t_list_skills, {
+        "description": "List skills this station can lend (Claude, Gemini/Antigravity, OpenCode and other providers), filtered by query or line.",
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Filter by name or description."},
+            "line": {"type": "string", "description": "Only this provider line, e.g. claude, agy, opencode; or @station for a linked station's skills."},
+        }},
+    }),
+    "borrow_skill": (t_borrow_skill, {
+        "description": "Return a skill's instructions and its local script paths, so this chat can follow it without installing it.",
+        "inputSchema": {"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string", "description": "Skill name, or name@station to borrow from a linked station (instructions only)."},
+            "line": {"type": "string", "description": "Pick this provider's copy when several have the name."},
+        }},
+    }),
     "wake_status": (t_wake_status, {
         "description": "Report whether this Mac can be woken for network access (pmset womp/powernap), with the exact commands to enable it.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -1012,6 +1113,35 @@ TOOLS = {
         "inputSchema": {"type": "object", "required": [], "properties": {
             "chat_id": {"type": "string", "description": "Optional chat ID to configure per-chat wake policy."},
             "policy": {"type": "string", "description": "Wake policy: all, outcomes, failures, or off (empty to read)."},
+        }},
+    }),
+    "chat_branch": (t_chat_branch, {
+        "description": "Give this chat its own branch and worktree (start), show it (status), or close it (drop). Edit in the worktree, commit there, then land_chat.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["start", "status", "drop"], "default": "start"},
+            "project_dir": {"type": "string", "description": "Repository to branch (default: current project)."},
+        }},
+    }),
+    "land_chat": (t_land_chat, {
+        "description": "Land this chat's branch into its repository: serialized, 3-way merge, overlaps recorded for a resolver.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }),
+    "list_conflicts": (t_list_conflicts, {
+        "description": "Landing overlaps: worker branches whose change overlapped HEAD and were kept for a resolver.",
+        "inputSchema": {"type": "object", "properties": {
+            "project_dir": {"type": "string", "description": "Only overlaps for this repository (default: all)."},
+            "include_closed": {"type": "boolean", "default": False, "description": "Also list resolved and dropped overlaps."},
+        }},
+    }),
+    "resolve_conflict": (t_resolve_conflict, {
+        "description": "Queue an isolated resolver worker that merges the kept branch into HEAD, keeps both sides working, and commits; its branch then lands normally. Needs your approval like any worker.",
+        "inputSchema": {"type": "object", "required": ["conflict_id"], "properties": {
+            "conflict_id": {"type": "string", "description": "An lc_ id from list_conflicts."},
+            "provider": {"type": "string", "default": "pi", "description": "Resolver provider (not auto)."},
+            "model": {"type": "string", "description": "Optional model."},
+            "max_tokens": {"type": "integer", "default": 200000},
+            "max_seconds": {"type": "integer", "default": 1200},
+            "max_tool_calls": {"type": "integer", "default": 30},
         }},
     }),
     "prune_branches": (t_prune_branches, {
@@ -1046,6 +1176,7 @@ TOOLS = {
             "baseline_commit": {"type": "string", "description": "Git commit hash to anchor against for Regression Shield."},
             "role": {"type": "string", "enum": ["implementer", "reviewer", "refactorer", "coordinator"], "default": "implementer"},
             "project_dir": {"type": "string", "description": "Base folder for a relative filepath."},
+            "peer_id": {"type": "string", "description": "Internal peer ID when claiming on behalf of a linked station."},
         }},
     }),
     "claim_symbol": (t_claim_symbol, {
@@ -1127,6 +1258,22 @@ TOOLS = {
         "description": "List all active workspace file leases and sign-offs across all agents.",
         "inputSchema": {"type": "object", "properties": {}},
     }),
+    "station_files": (t_station_files, {
+        "description": "List folders and files on a linked station (needs its files grant). No path lists the folders it shares.",
+        "inputSchema": {"type": "object", "required": ["station"], "properties": {
+            "station": {"type": "string"}, "path": {"type": "string"}}},
+    }),
+    "fetch_file": (t_fetch_file, {
+        "description": "Copy a file from a linked station to this one. to: local path or folder (default: current folder).",
+        "inputSchema": {"type": "object", "required": ["station", "path"], "properties": {
+            "station": {"type": "string"}, "path": {"type": "string"}, "to": {"type": "string"}}},
+    }),
+    "send_file": (t_send_file, {
+        "description": "Copy a local file to a linked station (needs files=send there). Refuses to overwrite unless overwrite=true.",
+        "inputSchema": {"type": "object", "required": ["station", "path", "to"], "properties": {
+            "station": {"type": "string"}, "path": {"type": "string"}, "to": {"type": "string"},
+            "overwrite": {"type": "boolean"}}},
+    }),
     "list_terminals": (t_list_terminals, {
         "description": "List terminals your user has opted in to sharing: name, folder, last command, failures.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -1157,6 +1304,9 @@ TOOLS = {
             "timeout_seconds": {"type": "integer", "default": 120},
         }},
     }),
+    "hub_servers": (t_hub_servers, {"description": "List every agent's MCP servers that Subway can lend (Claude, Antigravity, OpenCode, Claude Desktop, Gemini).", "inputSchema": {"type": "object", "properties": {"project": {"type": "string", "description": "Project dir for project-scoped servers."}}}}),
+    "hub_tools": (t_hub_tools, {"description": "List one shared MCP server's tools and input schemas.", "inputSchema": {"type": "object", "required": ["server"], "properties": {"server": {"type": "string"}, "project": {"type": "string"}}}}),
+    "hub_call": (t_hub_call, {"description": "Call a tool on another agent's MCP server through Subway. Workers need it granted with spin_worker(needs=[...]).", "inputSchema": {"type": "object", "required": ["server", "tool"], "properties": {"server": {"type": "string"}, "tool": {"type": "string"}, "arguments": {"type": "object"}, "project": {"type": "string"}}}}),
     "spin_worker": (t_spin_worker, {
         "description": "Queue an autonomous worker (Claude Code, OpenCode, or Antigravity) for your user's approval. "
                        "Before calling, ask your user whether they want a budget for it. Nothing runs until they approve. "
@@ -1174,12 +1324,16 @@ TOOLS = {
             "isolate": {"type": "boolean", "default": False, "description": "Work in a private git worktree, and return the change as a patch. Use it whenever workers share a repo."},
             "max_tokens": {"type": "integer", "description": "Stop the worker after this many tokens. Antigravity, OpenCode and DeepAI (pi) workers."},
             "max_seconds": {"type": "integer", "description": "Stop the worker after this many seconds. For providers that report no tokens, this is the cap."},
+            "max_tool_calls": {"type": "integer", "description": "Hard stop after this many tool calls in total (0 = off)."},
+            "station": {"type": "string", "description": "Run the worker on a linked station (its short name from list_chats / subway link list). That station's grants decide whether it waits for approval there. See its models with `subway link models <station>`; a refused model lists them."},
+            "swarm_station": {"type": "string", "description": "Mode C: work on a linked station's checkout with YOUR agents and quota. Its checkout is copied here; the result goes back as a patch its owner approves. The station must have granted swarm."},
             "route_reason": {"type": "string", "description": "Why this worker got this provider, shown in the HUD."},
             "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "default": "normal", "description": "Worker priority: urgent, normal, or low."},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
             "project_dir": {"type": "string", "description": "Working directory (default: current workspace)."},
             "timeout_seconds": {"type": "integer", "default": DEFAULT_WORKER_TIMEOUT, "description": "Stop the worker after this long. 0 means no limit."},
-            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high", "max"], "default": "auto"},
+            "effort": {"type": "string", "enum": ["auto"] + list(LADDER), "default": "auto",
+                       "description": "Effort level. Levels differ per model; Subway maps to the nearest the model offers (and sends none for models without levels)."},
             "mode": {"type": "string", "enum": ["standard", "god"], "default": "standard", "description": "'god' turns permission prompts off. Only with your user's explicit request."},
             "permission_mode": {"type": "string", "enum": ["ask", "auto_safe", "auto_approve"],
                                 "description": "Omit to use this chat's effective mode: its own per-chat override if your user set one, else their universal default. A per-chat override always wins over the universal default. 'ask' sends every request to this chat and the HUD. 'auto_safe' auto-approves a read-only list. 'auto_approve' never asks: use it only if your user said so."},
@@ -1188,10 +1342,24 @@ TOOLS = {
             "budget_weekly_pct": {"type": "number", "description": "Most of the weekly limit this worker may use, in points. Checked before it starts, and it's stopped when reached."},
             "max_budget_usd": {"type": "number", "description": "Hard USD spend cap. Enforced by Claude and Copilot workers."},
             "thread": {"type": "string", "description": "Continue an existing chat of that agent, by @alias or ID, instead of starting fresh."},
+            "needs": {"type": "array", "items": {"type": "string"}, "description": "MCP hub server keys/names this worker needs access to."},
+            "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to lend this worker (names from list_skills); their instructions are added to its brief. Max 4."},
             "then": {"type": "string", "description": "Optional JSON list of follow-up steps. Each step: role, prompt, provider, model, when, include, other_provider, max_tokens, verdict, capabilities, effort, then. The next worker starts when this one finishes."},
+            "units": {"type": "array", "items": {"type": "object", "required": ["title", "prompt"], "properties": {
+                "title": {"type": "string"}, "prompt": {"type": "string"},
+                "code": {"type": "array", "items": {"type": "string"}, "description": "Code packets for this unit only."},
+                "verify": {"type": "string", "description": "Shell command that must exit 0 for the unit to count as done."},
+                "after": {"type": "string", "enum": ["success", "any"],
+                          "description": "success (default): start only after the unit before landed. any: start even if it failed (independent tasks)."}}},
+                "description": "Unit chain: run each unit as a fresh short isolated worker, one after another, with the same provider, model, capabilities and caps. Each unit is merged into the main tree before the next starts. A manifest .subway-units.json in the project tracks [ ]/[x]; re-spinning with the same units resumes. Cannot combine with then or review. Mark a unit after=\"any\" when it does not depend on the one before."},
             "review": {"type": "string", "description": "Preset follow-up: '' (none), 'auto', or 'provider/model'. Appends a read-only Reviewer step that replies APPROVE or REJECT."},
             "wait": {"type": "boolean", "default": False, "description": "Block until the worker finishes and return its own final report. This is the native subagent shape: one call, one result. Leave false to spawn and move on."},
             "wait_timeout_seconds": {"type": "integer", "default": 0, "description": "How long to wait when wait=true. 0 uses the worker timeout."},
+            "doctor": {"type": "string", "enum": ["off", "on", "auto"],
+                       "description": "Failure doctor for THIS worker only: 'off' never, 'on' always, 'auto' for builders that edit or run tests. Overrides the doctor_mode setting."},
+            "doctor_budget": {"type": "integer",
+                              "description": "Token budget for this worker's failure doctor. Overrides the doctor budget setting."},
+            "from_link": {"type": "string", "description": "Internal linked-station origin identifier."},
         }},
     }),
     "spin_batch": (t_spin_batch, {
@@ -1265,11 +1433,11 @@ TOOLS = {
                                   "role": {"type": "string"},
                               }},
                               "description": "2-4 participants, each {provider, model?, effort?, role?}."},
-            "threshold": {"type": "number", "default": 0.85, "description": "Self-score and peer-mean score both need to clear this (0-1, or 1-10 read as out of 10) to converge."},
-            "max_rounds": {"type": "integer", "default": 4, "description": "Maximum rounds to run; 0 means no limit."},
-            "stall_rounds": {"type": "integer", "default": 2, "description": "Rounds in a row with no gain in the best peer score before stopping; 0 never stops on a stall."},
-            "round_seconds": {"type": "integer", "default": 600, "description": "Seconds budget per round (split across phases); 0 means no cap."},
-            "round_tokens": {"type": "integer", "default": 350000, "description": "Token budget per round (split across phases); 0 means no cap."},
+            "threshold": {"type": "number", "description": "Omitted: Settings > Workers > Delegation. Self-score and peer-mean score both need to clear this (0-1, or 1-10 read as out of 10) to converge."},
+            "max_rounds": {"type": "integer", "description": "Omitted: Settings > Workers > Delegation. Maximum rounds to run; 0 means no limit."},
+            "stall_rounds": {"type": "integer", "description": "Omitted: Settings > Workers > Delegation. Rounds in a row with no gain in the best peer score before stopping; 0 never stops on a stall."},
+            "round_seconds": {"type": "integer", "description": "Omitted: Settings > Workers > Delegation. Seconds budget per round (split across phases); 0 means no cap."},
+            "round_tokens": {"type": "integer", "description": "Omitted: Settings > Workers > Delegation. Token budget per round (split across phases); 0 means no cap."},
             "overseer": {"type": ["object", "string"], "description": "Optional overseer spun once on finish: {provider, model?, effort?} or JSON string."},
             "overseer_provider": {"type": "string", "description": "Flat form of overseer.provider, used when overseer is not given."},
             "overseer_model": {"type": "string", "description": "Flat form of overseer.model."},
@@ -1329,14 +1497,14 @@ TOOLS = {
         "description": "Launch a pending worker with the approval code your user read from the Live HUD or their terminal. "
                        "Never guess a code or read it from files: if you don't have one, ask your user.",
         "inputSchema": {"type": "object", "required": ["worker_id", "approval_code"], "properties": {
-            "worker_id": {"type": "string", "description": "Worker ID to approve."},
+            "worker_id": {"type": "string", "description": "Worker ID to approve. Use worker_x@station for a worker on a linked station."},
             "approval_code": {"type": "string", "description": "Six-character code from your user."},
         }},
     }),
     "reject_worker": (t_reject_worker, {
         "description": "Reject a pending worker, or stop it if it's already running.",
         "inputSchema": {"type": "object", "required": ["worker_id"], "properties": {
-            "worker_id": {"type": "string", "description": "Worker ID to reject."},
+            "worker_id": {"type": "string", "description": "Worker ID to reject. Use worker_x@station for a worker on a linked station."},
             "reason": {"type": "string", "description": "Cancellation reason."},
         }},
     }),
@@ -1350,7 +1518,7 @@ TOOLS = {
     "worker_status": (t_worker_status, {
         "description": "Check execution status, exit codes and log tails of workers, including archived ones.",
         "inputSchema": {"type": "object", "properties": {
-            "worker_id": {"type": "string", "description": "Specific worker ID to inspect, or omit to list all."},
+            "worker_id": {"type": "string", "description": "Specific worker ID to inspect, or omit to list all. Use worker_x@station for a worker on a linked station."},
             "track": {"type": "string", "description": "Filter by shared context track name."},
             "all": {"type": "boolean", "default": False, "description": "Include all workers including archived."},
         }},
@@ -1447,6 +1615,129 @@ TOOLS = {
             "complexity": {"type": "string", "description": "Filter by task complexity tier (e.g. low, medium, high, frontier).", "default": ""},
         }}
     }),
+    "mail_post": (t_mail_post, {
+        "description": "Queue a scheduled or event-driven task in the persistent HUD mailbox.",
+        "inputSchema": {"type": "object", "required": ["role", "prompt", "condition_type", "condition"], "properties": {
+            "role": {"type": "string", "description": "Short worker role title (2-5 words)."},
+            "prompt": {"type": "string", "description": "Full self-contained instructions for the worker when fired."},
+            "provider": {"type": "string", "default": "auto", "description": "Target provider ('auto', 'claude', 'antigravity', 'opencode', 'copilot', 'local', or custom id)."},
+            "model": {"type": "string", "default": "", "description": "Optional specific model identifier."},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"], "description": "Event or schedule condition that triggers the task."},
+            "condition": {"type": "object", "description": "Condition parameters."},
+            "track": {"type": "string", "default": "main"},
+            "project_dir": {"type": "string", "default": ""},
+            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"], "default": "auto"},
+            "isolate": {"type": "boolean", "default": True},
+            "private": {"type": "boolean", "default": False},
+            "permission_mode": {"type": "string", "enum": ["", "ask", "auto_safe", "auto_approve"], "default": ""},
+            "capabilities": {"type": "array", "items": {"type": "string"}},
+            "max_tokens": {"type": "integer", "default": 0},
+            "max_seconds": {"type": "integer", "default": 0},
+            "max_tool_calls": {"type": "integer", "default": 0},
+            "budget_session_pct": {"type": "number"},
+            "budget_weekly_pct": {"type": "number"},
+            "max_budget_usd": {"type": "number"},
+            "review": {"type": "string", "default": ""},
+            "then": {"type": "string", "default": ""}
+        }}
+    }),
+    "post_mail": (t_post_mail, {
+        "description": "Queue a scheduled or event-driven task in the persistent HUD mailbox.",
+        "inputSchema": {"type": "object", "required": ["role", "prompt", "condition_type", "condition"], "properties": {
+            "role": {"type": "string", "description": "Short worker role title (2-5 words)."},
+            "prompt": {"type": "string", "description": "Full self-contained instructions for the worker when fired."},
+            "provider": {"type": "string", "default": "auto", "description": "Target provider ('auto', 'claude', 'antigravity', 'opencode', 'copilot', 'local', or custom id)."},
+            "model": {"type": "string", "default": "", "description": "Optional specific model identifier."},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"], "description": "Event or schedule condition that triggers the task."},
+            "condition": {"type": "object", "description": "Condition parameters."},
+            "track": {"type": "string", "default": "main"},
+            "project_dir": {"type": "string", "default": ""},
+            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"], "default": "auto"},
+            "isolate": {"type": "boolean", "default": True},
+            "private": {"type": "boolean", "default": False},
+            "permission_mode": {"type": "string", "enum": ["", "ask", "auto_safe", "auto_approve"], "default": ""},
+            "capabilities": {"type": "array", "items": {"type": "string"}},
+            "max_tokens": {"type": "integer", "default": 0},
+            "max_seconds": {"type": "integer", "default": 0},
+            "max_tool_calls": {"type": "integer", "default": 0},
+            "budget_session_pct": {"type": "number"},
+            "budget_weekly_pct": {"type": "number"},
+            "max_budget_usd": {"type": "number"},
+            "review": {"type": "string", "default": ""},
+            "then": {"type": "string", "default": ""}
+        }}
+    }),
+    "mail_list": (t_mail_list, {
+        "description": "List mailbox items with state, waiting reason, and next check time.",
+        "inputSchema": {"type": "object", "properties": {
+            "state": {"type": "string", "enum": ["all", "active", "queued", "waiting", "running", "done", "dropped", "cancelled"], "default": "all"},
+            "track": {"type": "string", "default": ""},
+            "limit": {"type": "integer", "default": 50}
+        }}
+    }),
+    "list_mail": (t_list_mail, {
+        "description": "List mailbox items with state, waiting reason, and next check time.",
+        "inputSchema": {"type": "object", "properties": {
+            "state": {"type": "string", "enum": ["all", "active", "queued", "waiting", "running", "done", "dropped", "cancelled"], "default": "all"},
+            "track": {"type": "string", "default": ""},
+            "limit": {"type": "integer", "default": 50}
+        }}
+    }),
+    "mail_cancel": (t_mail_cancel, {
+        "description": "Cancel a queued or waiting mailbox item so it never runs.",
+        "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
+            "mail_id": {"type": "string", "description": "Mailbox item ID (e.g. 'mail_a1b2c3d4')."},
+            "reason": {"type": "string", "default": "Cancelled by user/agent"}
+        }}
+    }),
+    "cancel_mail": (t_cancel_mail, {
+        "description": "Cancel a queued or waiting mailbox item so it never runs.",
+        "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
+            "mail_id": {"type": "string", "description": "Mailbox item ID (e.g. 'mail_a1b2c3d4')."},
+            "reason": {"type": "string", "default": "Cancelled by user/agent"}
+        }}
+    }),
+    "mail_edit": (t_mail_edit, {
+        "description": "Edit task parameters, target provider/model, or condition of a queued or waiting mailbox item.",
+        "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
+            "mail_id": {"type": "string", "description": "Mailbox item ID to update."},
+            "role": {"type": "string"},
+            "prompt": {"type": "string"},
+            "provider": {"type": "string"},
+            "model": {"type": "string"},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"]},
+            "condition": {"type": "object"},
+            "track": {"type": "string"},
+            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
+            "isolate": {"type": "boolean"},
+            "private": {"type": "boolean"},
+            "permission_mode": {"type": "string", "enum": ["", "ask", "auto_safe", "auto_approve"]},
+            "max_tokens": {"type": "integer"},
+            "max_seconds": {"type": "integer"},
+            "max_tool_calls": {"type": "integer"}
+        }}
+    }),
+    "edit_mail": (t_edit_mail, {
+        "description": "Edit task parameters, target provider/model, or condition of a queued or waiting mailbox item.",
+        "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
+            "mail_id": {"type": "string", "description": "Mailbox item ID to update."},
+            "role": {"type": "string"},
+            "prompt": {"type": "string"},
+            "provider": {"type": "string"},
+            "model": {"type": "string"},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"]},
+            "condition": {"type": "object"},
+            "track": {"type": "string"},
+            "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
+            "isolate": {"type": "boolean"},
+            "private": {"type": "boolean"},
+            "permission_mode": {"type": "string", "enum": ["", "ask", "auto_safe", "auto_approve"]},
+            "max_tokens": {"type": "integer"},
+            "max_seconds": {"type": "integer"},
+            "max_tool_calls": {"type": "integer"}
+        }}
+    }),
+
 }
 
 
@@ -1554,6 +1845,26 @@ _SUBWAY_ONBOARDING_INSTRUCTIONS = (
     " Principals: lead with the answer, at most 8 lines unless asked, no recaps; think as long as needed."
 )
 
+# Tool calls that change shared state are recorded in the audit log (roadmap 53, layer 2).
+AUDITED_TOOLS = frozenset({
+    "spin_worker", "spin_batch", "spin_swarm", "run_concurrent", "approve_worker",
+    "reject_worker", "stop_worker", "instruct_worker", "answer_permission",
+    "send_note", "reply_note", "post_mail", "broadcast_track", "claim_file",
+    "release_file", "signoff_file", "land_chat", "resolve_conflict", "set_quota",
+    "restart_hud",
+})
+
+
+def _alias_for(station: str) -> str:
+    """The chat's pinned @alias for a station id, or the station id itself."""
+    try:
+        for alias, cid in load_aliases().items():
+            if cid == station:
+                return "@" + str(alias)
+    except Exception:
+        pass
+    return station
+
 
 def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if isinstance(req, dict) and req.get("method") == "tools/call":
@@ -1574,7 +1885,10 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         if station.startswith(p):
                             provider = p
                             break
-                r = governor.check(provider, station, tool_name, args)
+                # Clients with their own governor hook (claude, antigravity, opencode, pi) are counted
+                # there, per user turn; checking again here double-counts and never resets.
+                r = (governor.check(provider, station, tool_name, args, "", idle_reset_seconds=90)
+                     if provider == "mcp" else {"allow": True})
                 if isinstance(r, dict) and not r.get("allow", True):
                     return {
                         "jsonrpc": "2.0",
@@ -1587,6 +1901,25 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
     res = _base_handle(req)
+    try:
+        if isinstance(req, dict) and req.get("method") == "tools/call":
+            _p = req.get("params") or {}
+            _tool = _p.get("name") or ""
+            if _tool in AUDITED_TOOLS:
+                import audit
+                _wid = os.environ.get("SUBWAY_WORKER_ID") or ""
+                _who = _wid if (os.environ.get("SUBWAY_WORKER") == "1" or _wid) else (locals().get("station") or "agent")
+                _r = res.get("result") if isinstance(res, dict) else None
+                _err = bool((_r.get("isError") if isinstance(_r, dict) else False)
+                            or (isinstance(res, dict) and res.get("error")))
+                _tgt = audit.target_of(_p.get("arguments") or {})
+                if _tool in audit.SPAWN_ACTIONS and "worker_id" not in _tgt:
+                    _new = audit.worker_id_in(_r)
+                    if _new:
+                        _tgt["worker_id"] = _new
+                audit.record({"kind": "agent", "id": _who, "name": _alias_for(_who)}, _tool, _tgt, ok=not _err)
+    except Exception:
+        pass
     if isinstance(req, dict) and req.get("method") == "initialize" and isinstance(res, dict):
         result = res.get("result")
         if isinstance(result, dict):
@@ -1657,7 +1990,7 @@ from permissions import run_hook_guard
 
 from usage import hook_prompt
 
-from cli_tools import (_track_for_session, hook_precompact, run_hook_precompact)
+from cli_tools import (_track_for_session, hook_precompact, run_hook_precompact, run_hook_session)
 
 
 from usage import run_hook_prompt

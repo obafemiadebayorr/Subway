@@ -16,12 +16,13 @@ except ImportError:
 DEFAULT_LIMIT = 6
 
 ALWAYS_ALLOWED = {  # bare tool names (strip any "mcp__<server>__" prefix first)
-    "spin_worker", "spin_batch", "spin_swarm", "spin_iteration", "run_concurrent",
+    "spin_worker", "spin_batch", "spin_swarm", "spin_iteration", "run_concurrent", "resolve_conflict", "list_conflicts", "chat_branch", "land_chat",
     "approve_worker", "reject_worker", "stop_worker", "worker_status", "await_worker",
     "collect_reports", "on_worker_done", "instruct_worker", "escalate_worker",
     "hud_status", "check_notes", "send_note", "broadcast_track", "join_track",
     "read_track", "answer_permission", "permission_requests", "watch_workers",
     "whoami", "quota_status", "list_locks",
+    "reply_note", "fastmail_status", "ask_room", "list_mail", "mail_list",
     "AskUserQuestion", "TodoWrite", "ToolSearch", "Skill", "ExitPlanMode", "EnterPlanMode",
 }
 
@@ -44,12 +45,23 @@ def _subway_dir() -> str:
     )
 
 
+_SERVERS = ("subway", "subway-context", "subway_context")
+
+
 def bare(tool_name) -> str:
     name = str(tool_name or "")
     if name.startswith("mcp__"):
         parts = name.split("__", 2)
         if len(parts) == 3:
             return parts[2]
+    for srv in _SERVERS:
+        p = f"mcp_{srv}_"
+        if name.startswith(p):
+            return name[len(p):]
+        for sep in ("/", ".", ":"):
+            p = f"{srv}{sep}"
+            if name.startswith(p):
+                return name[len(p):]
     return name
 
 
@@ -188,12 +200,17 @@ def turn(provider, session_id, turn_key="") -> None:
                 "turn_key": str(turn_key or ""),
                 "at": time.time(),
             }
+            if session_id:
+                for other_key, other in list(sessions.items()):
+                    if other_key != key and other_key.endswith(f":{session_id}") and isinstance(other, dict):
+                        other["used"] = 0
+                        other["at"] = time.time()
             _write_state(st)
     except Exception:
         pass
 
 
-def check(provider, session_id, tool_name, tool_input=None, turn_key="") -> dict:
+def check(provider, session_id, tool_name, tool_input=None, turn_key="", idle_reset_seconds=0) -> dict:
     """Check if tool call is allowed for this provider turn."""
     cfg = settings()
     limit = cfg.get("probe_calls_per_turn", DEFAULT_LIMIT)
@@ -217,11 +234,18 @@ def check(provider, session_id, tool_name, tool_input=None, turn_key="") -> dict
 
             stored_turn = sess.get("turn_key", "")
             used = int(sess.get("used", 0))
+            at = float(sess.get("at", 0) or 0)
+
+            # idle gap reset
+            if idle_reset_seconds and at and (time.time() - at) > idle_reset_seconds:
+                used = 0
+                sess["turn_key"] = str(turn_key or "")
 
             # turn_key given and different from stored -> reset
             if turn_key and turn_key != stored_turn:
                 used = 0
                 sess["turn_key"] = str(turn_key)
+            sess["at"] = time.time()
 
             if not probe:
                 sess["at"] = time.time()

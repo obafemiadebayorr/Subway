@@ -57,7 +57,11 @@ _TERMINAL_TOOLS = frozenset({
 def _cache_weight() -> float:
     """Share of cache-read tokens that counts toward a worker's token cap (config cap_cache_weight)."""
     with contextlib.suppress(Exception):
-        return max(0.0, float((_s._load_json("config.json") or {}).get("cap_cache_weight", 0.25)))
+        cfg = _s._load_json("config.json") or {}
+        from hud_server import settings_api as _settings_api
+        if "cap_cache_weight_pct" not in cfg and "cap_cache_weight" in cfg:
+            return max(0.0, float(cfg["cap_cache_weight"]))
+        return max(0.0, float(_settings_api.value("cap_cache_weight_pct", cfg) or 0) / 100.0)
     return 0.25
 
 
@@ -76,6 +80,32 @@ def _shell_write_counts_as_edit(tool_name: str, params: Any) -> bool:
 
 _CLAUDE_EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "edit", "write", "multiedit", "notebookedit", "replace"})
 _PI_EDIT_TOOLS = frozenset({"edit", "write", "Edit", "Write", "replace"})
+
+
+def _lent_mcp_inner_tool(tool_name, params):
+    """The MCP tool a call really runs, or "" when it is not an MCP call.
+    Lent MCP work that changes something counts as progress, like a file edit."""
+    import json as _json
+    name = str(tool_name or "")
+    p = params if isinstance(params, dict) else {}
+    if name == "call_mcp_tool":
+        inner = str(p.get("ToolName") or "")
+        if inner != "hub_call":
+            return inner
+        args = p.get("Arguments")
+        if isinstance(args, str):
+            try:
+                args = _json.loads(args)
+            except ValueError:
+                args = {}
+        return str(args.get("tool") or "") if isinstance(args, dict) else ""
+    if name.startswith("mcp__"):
+        return name.split("__", 2)[-1]
+    if name == "hub_call" or name.endswith("_hub_call"):
+        return str(p.get("tool") or "")
+    if "_" in name and "-" in name.split("_", 1)[1]:
+        return name.split("_", 1)[1]  # OpenCode native, e.g. notion_notion-create-pages
+    return ""
 
 DEFAULT_COORDINATION_TOOLS = [
     "spin_worker", "spin_batch", "run_concurrent", "await_worker",
@@ -126,7 +156,7 @@ def _role_kind(role: Any = "", caps: Any = None) -> str:
     r = str(role or "").lower()
     if bool(re.search(r"orchestrat|lead|coordinator", r)):
         return "orchestrator"
-    if bool(re.search(r"research|measure|investigat|analys|audit", r)):
+    if bool(re.search(r"plan|planner|investigat|triage|diagnos|research|survey|measure|analys|audit", r)):
         return "research"
     if bool(re.search(r"review|verif", r)):
         return "reviewer"
@@ -220,6 +250,10 @@ def _progress_guard_note_tool(
     run["tool_calls"] = run.get("tool_calls", 0) + 1
 
     counts_as_edit = k == "edit"
+    if not counts_as_edit:
+        _inner = _lent_mcp_inner_tool(tool_name, params)
+        if _inner and classify_mcp_tool(_inner) in ("write", "publish_delete"):
+            counts_as_edit = True
     tn = re.sub(r"[\s_-]+", "", str(tool_name or "").lower())
     is_term = _is_terminal_tool(tool_name) or k in ("execute", "terminal", "bash", "shell", "command") or tn in {
         "bash", "shell", "terminal", "runterminal", "exec", "execute", "command", "runcommand",
@@ -259,6 +293,18 @@ def _progress_guard_note_tool(
     if run.get("orchestrating"):
         kind_name = "orchestrator"
 
+    # Hard total tool-call cap (max_tool_calls): warn near it, stop exactly once at it.
+    cap = int(run.get("max_tool_calls") or 0)
+    if cap and run["tool_calls"] >= cap and not run.get("call_cap_stopped"):
+        run["call_cap_stopped"] = True
+        write(f"[call cap] {run['tool_calls']} tool calls")
+        if run.get("on_cap"):
+            run["on_cap"](f"Stopped at its tool-call cap of {cap}.")
+        return
+    elif cap and run["tool_calls"] >= cap - 3 and not run.get("call_cap_warned"):
+        run["call_cap_warned"] = True
+        write("3 tool calls left before your cap: commit what you have now and report.")
+
     # EXEMPT research and orchestrator kinds from the nudge AND from the hard stop.
     if kind_name in ("research", "orchestrator"):
         return
@@ -268,8 +314,9 @@ def _progress_guard_note_tool(
     # every other non-exempt worker: at 7 calls with no edit, the same message with 7.
     if not run.get("edits"):
         cfg = _s._load_json("config.json") or {}
-        b = int(cfg.get("nudge_builder_calls", 5) or 5)
-        o = int(cfg.get("nudge_default_calls", 7) or 7)
+        from hud_server import settings_api as _settings_api
+        b = int(_settings_api.value("nudge_builder_calls", cfg) or 5)
+        o = int(_settings_api.value("nudge_other_calls", cfg) or 7)
         if kind_name == "builder":
             if run["tool_calls"] >= b and not run.get("no_edit_nudge"):
                 run["no_edit_nudge"] = True
@@ -604,7 +651,10 @@ def classify_mcp_tool(tool_name: str) -> str:
         "publish", "delete", "destroy", "drop", "terminate", "truncate",
         "purge", "rm", "unlink", "deploy", "release", "kill_all"
     )
-    if any(kw in norm for kw in publish_delete_kws):
+    # Match whole words, so "rm" in "fill_form" or "drop" in "dropdown" is not a delete.
+    # Keywords of 5+ letters also match inside a word ("unpublish", "redeploy", "deletePage").
+    toks = [t for t in re.split(r"[^a-z0-9]+", norm) if t]
+    if "kill_all" in norm or any(t == kw or (len(kw) >= 5 and kw in t) for t in toks for kw in publish_delete_kws):
         return "publish_delete"
     read_kws = ("read", "get", "list", "search", "find", "grep", "cat", "view", "show", "describe", "status")
     if any(norm.startswith(kw) or f"_{kw}" in norm or f"{kw}_" in norm for kw in read_kws):

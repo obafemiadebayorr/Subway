@@ -44,6 +44,23 @@ except ImportError:  # Windows: state stays atomic per write, but not serialized
     fcntl = None
 import server as _s
 
+_LITERAL_EDIT_RE = re.compile(r"(?m)^\s*(EDIT \d|old:)")
+
+
+def no_edit_limit(meta: dict, cfg: dict) -> int:
+    """Tool calls a writing worker may make before its first edit (0 = no stop).
+
+    The tighter literal limit applies only when the brief spells out the edit itself
+    (EDIT n / old: blocks). Code packets alone don't count: they are mandatory and
+    often only context, so they would stop workers that still have to work out the edit.
+    """
+    if "files:write" not in (meta.get("capabilities") or []):
+        return 0
+    limit = int(cfg.get("no_edit_tool_calls", 12) or 0)
+    if limit and _LITERAL_EDIT_RE.search(str(meta.get("prompt") or "")):
+        limit = min(limit, int(cfg.get("no_edit_tool_calls_literal", 10) or 10))
+    return limit
+
 
 def supervise_worker(worker_id: str) -> int:
     """Own one worker: enforce its timeout, relay permission requests, and record how it really ended."""
@@ -341,12 +358,11 @@ def supervise_worker(worker_id: str) -> int:
                 if is_agy or is_claude or is_acp or is_copilot or is_pi:
                     run["spent"] = max(run.get("spent", 0), sum(meta.get("usage", {}).get(k, 0) for k in ("input", "output")))
                     run["cap"], run["on_cap"] = turn_cap or int(budget.get("max_tokens") or 0), budget_stop
+                    run["max_tool_calls"] = int(budget.get("max_tool_calls") or 0)
                     run["soft"] = run["cap"] * 2 // 3 if (not wrapped_up and _s._resume_reuses_cache(meta)) else 0
                     caps_now = meta.get("capabilities") or []
                     cfg = _s._load_json("config.json") or {}
-                    run["no_edit_limit"] = int(cfg.get("no_edit_tool_calls", 12) or 0) if "files:write" in caps_now else 0
-                    if run["no_edit_limit"] and (meta.get("code_ranges") or re.search(r"(?m)^\s*(EDIT \d|old:)", str(meta.get("prompt") or ""))):
-                        run["no_edit_limit"] = min(run["no_edit_limit"], int(cfg.get("no_edit_tool_calls_literal", 6) or 6))
+                    run["no_edit_limit"] = no_edit_limit(meta, cfg)
                     run["stale_edit_limit"] = int(cfg.get("calls_since_edit", 25) or 0) if "files:write" in caps_now else 0
                     run["meta"] = meta
                     run["worker_id"] = worker_id
@@ -438,7 +454,12 @@ def supervise_worker(worker_id: str) -> int:
                     if stopped.get("quota_handled"):
                         result = stopped.get("quota_result") or {"status": "failed", "exit_code": code, "reason": reason}
                     else:
-                        result = _s._handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
+                        latest = _s._load_worker(worker_id) or meta
+                        if latest.get("stop_reason"):
+                            # Stopped by the user or initiator: never reroute it.
+                            result = {"status": "stopped", "exit_code": code, "reason": str(latest.get("stop_reason"))}
+                        else:
+                            result = _s._handle_worker_exhaustion_or_stall(worker_id, meta, reason, is_stall=bool(stopped.get("stall")))
                     break
 
                 if stopped["flag"]:
@@ -624,6 +645,8 @@ def supervise_worker(worker_id: str) -> int:
                         result = {"status": "stopped", "exit_code": code, "reason": stop_r}
                     else:
                         result = {"status": "failed", "exit_code": code}
+                elif is_acp and run.get("guard_denied") and not run.get("response"):
+                    result = {"status": "stopped", "exit_code": 0, "reason": "Subway's read guard refused a read the worker needed, so it stopped."}
                 elif is_acp and run.get("user_denied") and not run.get("response"):
                     result = {"status": "stopped", "exit_code": 0, "reason": "You denied its request, so it stopped."}
                 elif (is_agy or is_acp or is_copilot) and not run.get("response"):
@@ -665,6 +688,8 @@ def supervise_worker(worker_id: str) -> int:
     wt_note = ""
     if fresh.get("worktree"):
         try:
+            if not fresh.get("report") and (run.get("response") or run.get("last_text")):
+                fresh["report"] = str(run.get("response") or run.get("last_text") or "")
             wt_note = _s._collect_worktree(fresh, partial=result.get("status") != "completed")
             result["reason"] = f"{result.get('reason') or ''} {wt_note}".strip()
             if "Partial patch kept" in wt_note:
@@ -724,14 +749,18 @@ def supervise_worker(worker_id: str) -> int:
                         except OSError:
                             cur_m = None
                         if rel_p not in pre_main_dirty or cur_m != pre_main_dirty.get(rel_p):
-                            main_changed.append(rel_p)
-        if main_changed:
+                            main_changed.append((rel_p, cur_m))
+        # Only files whose mtime is later than the worker's start count as writes by the worker;
+        # a file merely mentioned (or touched before launch) is not evidence of a main-tree write.
+        real_changed = [rel_p for rel_p, cur_m in main_changed
+                        if cur_m is not None and cur_m > worker_started_at]
+        if real_changed:
             inspect_text = raw_out or ""
             if not inspect_text and fresh.get("log_file") and os.path.exists(fresh["log_file"]):
                 with contextlib.suppress(Exception):
                     with open(fresh["log_file"], "r", encoding="utf-8", errors="replace") as f:
                         inspect_text = f.read()
-            mentioned_files = [p for p in main_changed if p in inspect_text or os.path.basename(p) in inspect_text]
+            mentioned_files = [p for p in real_changed if p in inspect_text or os.path.basename(p) in inspect_text]
             if mentioned_files:
                 no_changes = False
                 result["status"] = "completed"
@@ -765,6 +794,7 @@ def supervise_worker(worker_id: str) -> int:
         except Exception:
             pass
         fresh["stats"] = _st
+        fresh["tool_calls"] = _tc
         _s._save_worker(fresh)
     if (result.get("status") == "completed" and not fresh.get("isolate")
             and any(step.get("verdict") for step in fresh.get("then") or [])):

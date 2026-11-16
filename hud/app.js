@@ -7,7 +7,11 @@ import { mountTetherSheet, openTetherSheet } from "./tether-sheet.js";
 import { startPairingCard } from "./pairing.js";
 import { themeSwitch } from "./switch-button.js";
 import { hasModelEdits, ledger, ledgerPage, leasesPage, modelsPage, openLogs, overview, renderLedgerEntries, terminalsPage, terminalsState, terrainState, threads, threadsPage, usagePage, workersPage } from "./views.js";
+import { devicesPage } from "./devices.js";
+import { startAuditStream } from "./activity.js";
+import { collabPage } from "./collab.js";
 import { statsPage } from "./stats.js";
+import { landingPage } from "./landing.js";
 import { diagnosticsPage } from "./diagnostics.js";
 import { helpPage } from "./help.js";
 import { pageSwap } from "./motion.js";
@@ -18,13 +22,14 @@ const PAGES = {
   overview: { label: "Overview", sub: "What needs you, and what's running" },
   threads: { label: "Threads", sub: "Chats that used Subway, and everything they started" },
   terminals: { label: "Terminals", sub: "Commands run in terminals your user has shared" },
-  usage: { label: "Usage", sub: "Limits and tokens, as reported by each tool" },
-  stats: { label: "Stats", sub: "Tokens, time, speed and work across every worker" },
-  diagnostics: { label: "Diagnostics", sub: "System health and collector diagnostics" },
+  usage: { label: "Usage", sub: "Limits and tokens from each tool, time, speed and work across every worker, then system diagnostics" },
   workers: { label: "Workers", sub: "Delegated agents and their permissions" },
   models: { label: "Models", sub: "How each model is ranked, and where that came from" },
   leases: { label: "Leases", sub: "Who holds which file" },
+  landing: { label: "Landing", sub: "Worker branches waiting to land, and overlaps to resolve" },
+  devices: { label: "Devices", sub: "This station, your paired phones and Macs, and new pairings" },
   ledger: { label: "Ledger", sub: "Shared decisions across agents" },
+  collab: { label: "Collaboration", sub: "Work with other people's stations" },
   help: { label: "Help", sub: "Guides, terms, and commands for Subway" },
 };
 
@@ -39,6 +44,7 @@ const pageBody = h("div", { style: "display:flex;flex-direction:column;gap:inher
 
 function currentPage() {
   const name = location.hash.slice(1);
+  if (name === "stats" || name === "diagnostics") return "usage"; // Stats and Diagnostics live on the Usage page now; old links still land.
   return PAGES[name] ? name : "overview";
 }
 
@@ -155,12 +161,14 @@ function render() {
   if (focusInside()) return; // Never wipe out what someone is typing.
   const open = [...pageBody.querySelectorAll("details[open] summary")].map((x) => x.closest(".card")?.querySelector(".provider-name")?.textContent);
   const views = {
-    overview: () => overview(d), usage: () => usagePage(d),
-    stats: () => statsPage(d), diagnostics: () => diagnosticsPage(d), workers: () => workersPage(d),
+    overview: () => overview(d), usage: () => [...usagePage(d), statsPage(d), diagnosticsPage(d)],
+    workers: () => workersPage(d),
     threads: () => threadsPage(d, threads.chats, () => loadThreads(true), threads.error),
     terminals: () => terminalsPage(d, terminalsState.rows, () => loadTerminals(true), terminalsState.error, terminalsState.loading, terminalsState.loadedAt > 0 && !terminalsState.error && (Date.now() - terminalsState.loadedAt > 20000), terminalsState.sharing),
     models: () => modelsPage(d),
-    leases: () => leasesPage(d), ledger: () => ledgerPage(d, switchTrack),
+    leases: () => leasesPage(d), landing: () => landingPage(d), ledger: () => ledgerPage(d, switchTrack),
+    devices: () => devicesPage(d),
+    collab: () => collabPage(d),
     help: () => helpPage(),
   };
   const pageTop = window.scrollY;
@@ -199,6 +207,10 @@ async function loadThreads(force = false) {
     const scope = threads.scope || "subway";
     const data = await api(`/api/threads?scope=${encodeURIComponent(scope)}&limit=200`);
     threads.chats = data.threads || data.chats || [];
+    try {
+      const linked = await api("/api/peers/chats?limit=20");
+      threads.linked = (linked && linked.stations) || [];
+    } catch (_) { threads.linked = []; }
     threads.meta = {};
     for (const t of threads.chats) {
       if (t && t.id) threads.meta[t.id] = t.meta || {};
@@ -345,7 +357,7 @@ export function pingBudgets(data) {
 
 async function statusLoop() {
   if (!document.hidden) await refresh();
-  setTimeout(statusLoop, POLL_MS);
+  setTimeout(statusLoop, !document.hidden && (!window.SubwayPush || !window.SubwayPush.connected) ? POLL_MS : 15000);
 }
 async function feedLoop() {
   if (!document.hidden && currentPage() === "ledger") await loadFeed();
@@ -488,3 +500,4 @@ render();
 statusLoop();
 feedLoop();
 listen(refresh);
+startAuditStream();

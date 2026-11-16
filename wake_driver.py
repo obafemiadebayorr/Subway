@@ -3,16 +3,15 @@
 Spools and delivers wakeup events across AI coding clients (OpenCode, Claude Code, Antigravity).
 """
 import os
+import subprocess as _subprocess_for_guard
+_REAL_POPEN = _subprocess_for_guard.Popen
 import json
 import re
 import time
 import sqlite3
 import threading
 import contextlib
-try:
-    import fcntl
-except ImportError:
-    fcntl = None  # type: ignore[assignment]
+import win_lock
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, Optional, List
 import server as _s
@@ -40,11 +39,9 @@ def wake_spool_enqueue(chat_id: str, event: WakeEvent) -> bool:
     payload["timestamp"] = payload.get("timestamp") or time.time()
     try:
         with open(spool_file, "a", encoding="utf-8") as f:
-            if fcntl:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            win_lock.lock(f.fileno())
             f.write(json.dumps(payload) + "\n")
-            if fcntl:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            win_lock.unlock(f.fileno())
         return True
     except Exception:
         return False
@@ -59,8 +56,7 @@ def wake_spool_drain(chat_id: str) -> List[Dict[str, Any]]:
     events = []
     try:
         with open(spool_file, "r+", encoding="utf-8") as f:
-            if fcntl:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            win_lock.lock(f.fileno())
             for line in f:
                 line = line.strip()
                 if line:
@@ -70,11 +66,74 @@ def wake_spool_drain(chat_id: str) -> List[Dict[str, Any]]:
                         pass
             f.seek(0)
             f.truncate(0)
-            if fcntl:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            win_lock.unlock(f.fileno())
     except Exception:
         pass
     return events
+
+def _push_file(chat_id: str) -> str:
+    safe_id = "".join(c for c in chat_id if c.isalnum() or c in ("-", "_", "@", "."))
+    return os.path.join(get_spool_dir(), f"{safe_id}.push.jsonl")
+
+
+PUSH_MAX_BYTES = 256 * 1024
+
+
+def wake_push_enqueue(chat_id: str, text: str, kind: str = "", worker_id: str = "") -> bool:
+    """Events the user's wake rules say should wake this chat now. Read by the chat's own MCP server."""
+    if not chat_id or not text:
+        return False
+    path = _push_file(chat_id)
+    line = json.dumps({"ts": time.time(), "kind": kind, "worker_id": worker_id, "text": text}) + "\n"
+    try:
+        with open(path, "a+", encoding="utf-8") as f:
+            win_lock.lock(f.fileno())
+            f.seek(0, os.SEEK_END)
+            if f.tell() > PUSH_MAX_BYTES:
+                f.seek(0)
+                keep = f.readlines()[-100:]
+                f.seek(0)
+                f.truncate(0)
+                f.writelines(keep)
+            f.write(line)
+            win_lock.unlock(f.fileno())
+        return True
+    except Exception:
+        return False
+
+
+def wake_push_tail(chat_id: str, offset: int):
+    """New push events after byte offset: (events, new_offset). Never consumes. Restarts at 0 if the file shrank."""
+    path = _push_file(chat_id)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], 0
+    if offset > size:
+        offset = 0
+    events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                if not line.endswith("\n"):
+                    break
+                offset += len(line.encode("utf-8"))
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        return [], offset
+    return events, offset
+
+
+def wake_push_end(chat_id: str) -> int:
+    try:
+        return os.path.getsize(_push_file(chat_id))
+    except OSError:
+        return 0
+
 
 def wake_spool_depth(chat_id: str) -> int:
     if not chat_id:
@@ -104,10 +163,14 @@ _recent_wakes_lock = threading.Lock()
 
 def _wake_dedupe_key(chat_id: str, event: WakeEvent) -> Optional[tuple]:
     """Identity of the underlying event, not of the message that describes it."""
+    data = getattr(event, "data", None) or {}
     wid = str(getattr(event, "worker_id", "") or "")
+    if not wid and isinstance(data, dict):
+        # Some callers only stamp the worker id into the payload.
+        wid = str(data.get("worker_id") or "")
     if not wid:
         return None
-    status = str((getattr(event, "data", None) or {}).get("status") or "")
+    status = str(data.get("status") or "") if isinstance(data, dict) else ""
     if not status:
         kind = str(getattr(event, "kind", "") or "")
         status = kind[len("worker_"):] if kind.startswith("worker_") else kind
@@ -299,6 +362,12 @@ def antigravity_resume(message: str, chat_id: str, project_dir: str = "") -> boo
         return False
     if not agy:
         return False
+    import subprocess as _sp
+    if (os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("_SUBWAY_SANDBOX_INITIALIZED")) and _sp.Popen is _REAL_POPEN:
+        # Under pytest/unittest sandbox this would start a real, paid Antigravity turn (or spawn
+        # the sandbox stub_agent.sh and drain the spool). Tests that exercise this path mock
+        # subprocess.Popen; anything else is refused.
+        return False
     cmd = [agy, "--print", message, "--output-format", "json", "--print-timeout", "0"]
     # A chat id that already IS a conversation id needs no guessing at all.
     cid = chat_id.strip().lstrip("@") if agy_conversation_known(chat_id) else ""
@@ -421,6 +490,111 @@ def antigravity_connectrpc_wake(
     return False
 
 
+def devin_cli_resume(sid: str, text: str) -> bool:
+    """Resume a Devin session with prompt text: devin -r <sid> -p <text>."""
+    clean_sid = str(sid or "").strip()
+    clean_text = str(text or "").strip()
+    if not clean_sid or not clean_text:
+        return False
+    try:
+        import binary_discovery
+        devin_bin = None
+        for attr in ("find_devin_binary", "find_devin", "devin_binary"):
+            fn = getattr(binary_discovery, attr, None)
+            if callable(fn):
+                devin_bin = fn()
+                if devin_bin:
+                    break
+        if not devin_bin:
+            import shutil
+            devin_bin = shutil.which("devin")
+    except Exception:
+        return False
+    if not devin_bin:
+        return False
+    cmd = [devin_bin, "-r", clean_sid, "-p", clean_text]
+    try:
+        import subprocess
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def devin_gui_wake(chat_id: str, text: str) -> bool:
+    """Spool prompt text for Devin GUI: ~/.subway/devin_wake/<pid>-events.jsonl."""
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return False
+    m = re.search(r"(\d+)", str(chat_id or "").strip())
+    if not m:
+        return False
+    pid = int(m.group(1))
+    try:
+        subway_dir = getattr(_s, "SUBWAY_DIR", None) or os.path.expanduser("~/.subway")
+        directory = os.path.join(subway_dir, "devin_wake")
+        os.makedirs(directory, exist_ok=True)
+        path_ = os.path.join(directory, f"{pid}-events.jsonl")
+        with open(path_, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"text": clean_text, "at": time.time()}) + "\n")
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def cursor_deeplink_wake(text: str) -> bool:
+    """Open Cursor prompt deeplink: open cursor://anysphere.cursor-deeplink/prompt?text=..."""
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return False
+    try:
+        import urllib.parse
+        import shutil
+        import subprocess
+        encoded = urllib.parse.quote(clean_text)
+        uri = f"cursor://anysphere.cursor-deeplink/prompt?text={encoded}"
+        open_bin = shutil.which("open") or shutil.which("xdg-open")
+        if not open_bin:
+            return False
+        subprocess.Popen(
+            [open_bin, uri],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def cursor_gui_wake(chat_id: str, text: str) -> bool:
+    """Spool prompt text for Cursor GUI: ~/.subway/cursor_wake/<pid>-events.jsonl."""
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return False
+    m = re.search(r"(\d+)", str(chat_id or "").strip())
+    if not m:
+        return False
+    pid = int(m.group(1))
+    try:
+        subway_dir = getattr(_s, "SUBWAY_DIR", None) or os.path.expanduser("~/.subway")
+        directory = os.path.join(subway_dir, "cursor_wake")
+        os.makedirs(directory, exist_ok=True)
+        path_ = os.path.join(directory, f"{pid}-events.jsonl")
+        with open(path_, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"text": clean_text, "at": time.time()}) + "\n")
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 # Event categorization mapping
 WAKE_EVENT_KINDS = {
     "iteration_done": "success",
@@ -533,10 +707,22 @@ def resolve_wake_rule(kind: str, status: str = "", provider: str = "",
     return rule
 
 
+_WAKE_OUTCOME_KINDS = {
+    "worker_completed": "success",
+    "worker_ended": "success",
+    "worker_failed": "failure",
+    "worker_stopped": "failure",
+    "worker_timed_out": "failure",
+    "worker_budget_stopped": "failure",
+}
+
+
 def classify_wake_event(kind: str) -> str:
     k = str(kind or "").strip().lower()
     if "permission" in k:
         return "permission"
+    if k in _WAKE_OUTCOME_KINDS:
+        return _WAKE_OUTCOME_KINDS[k]
     return WAKE_EVENT_KINDS.get(k, "progress")
 
 
@@ -601,8 +787,8 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
     rule = resolve_wake_rule(getattr(event, "kind", ""), getattr(event, "status", ""),
                              getattr(event, "provider", ""), chat_id, config=config)
 
-    # Anything queued by an earlier throttled wake is still here; nothing drains the spool,
-    # so tell the woken turn how many it is standing in for.
+    # An earlier throttled wake may have left events spooled; the pending count is
+    # read before this event is enqueued so the suffix reports only earlier events.
     pending_before = wake_spool_depth(chat_id)
     spooled = wake_spool_enqueue(chat_id, event)
     if not rule["wake"]:
@@ -629,6 +815,8 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
     event_dict["actions"] = list(rule["actions"])
     event_dict["rule_source"] = rule["source"]
 
+    wake_push_enqueue(chat_id, message, kind=getattr(event, "kind", ""), worker_id=getattr(event, "worker_id", ""))
+
     dispatch_res: Dict[str, bool] = {}
     try:
         from notify_driver import dispatch_notification
@@ -651,18 +839,10 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
     if chat_id:
         target = chat_id.strip()
         if target.startswith("@claude") or "claude" in target.lower():
-            claude_bin = getattr(_s, "find_claude_binary", lambda: None)()
-            if claude_bin:
-                try:
-                    import subprocess
-                    wake_prompt = f"[SUBWAY EVENT] {message}"
-                    subprocess.Popen([claude_bin, "-p", wake_prompt],
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
-                    delivered = True
-                    method = "claude_resume"
-                except Exception:
-                    pass
+            # Never spawn `claude -p`: it starts a separate headless session that does not reach this
+            # chat and spends the user's Claude budget. The event is spooled and notified above; the
+            # chat sees it through its hook or session monitor (a channel push replaces this later).
+            method = "claude_spooled"
         elif agy_window_pid(target) and gui_woken:
             # A GUI window: the extension delivers it to the agent panel. Do not also run
             # `agy --print --conversation` — that writes to the CLI store, and a GUI
@@ -682,6 +862,13 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
                 # No agy binary, or the spawn failed. Say so instead of leaving it looking
                 # like a plain notification, so a broken path is visible rather than silent.
                 method = "antigravity_failed"
+
+    # The wake is out (push enqueued and/or dispatched); it stands in for everything
+    # in the spool, so drain it. Quiet events returned earlier and stay spooled, and so do
+    # events whose Antigravity wake was throttled or failed: they were never delivered, and
+    # the next wake reports them as "(+N earlier event(s) queued ...)".
+    if method not in ("antigravity_throttled", "antigravity_failed"):
+        wake_spool_drain(chat_id)
 
     return {
         "chat_id": chat_id,

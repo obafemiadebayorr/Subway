@@ -43,10 +43,7 @@ import terminals
 import native_terminals
 import threads
 
-try:
-    import fcntl
-except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
-    fcntl = None  # type: ignore[assignment]
+import win_lock
 
 import server as _s
 
@@ -130,6 +127,7 @@ def _ensure_subway_dir() -> None:
     os.makedirs(_s.WORKERS_DIR, exist_ok=True)
     os.makedirs(_s.TRACKS_DIR, exist_ok=True)
     os.makedirs(_s._terminals_dir(), exist_ok=True)
+    os.makedirs(os.path.join(_s.SUBWAY_DIR, "mail"), exist_ok=True)
     with contextlib.suppress(OSError):  # Holds prompts, worker logs and the HUD token.
         os.chmod(_s.SUBWAY_DIR, 0o700)
 
@@ -146,22 +144,21 @@ def _state_lock(name: str, timeout: float = 10.0) -> Iterator[None]:
     acquired = False
     deadline = time.time() + max(0.1, timeout)
     try:
-        if fcntl is not None:
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
+        while True:
+            try:
+                win_lock.lock(fd, nonblock=True)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.time() >= deadline:
+                    _s.log(f"Timeout ({timeout}s) acquiring lock .{name}.lock; proceeding to avoid fleet deadlock")
                     break
-                except (BlockingIOError, OSError):
-                    if time.time() >= deadline:
-                        _s.log(f"Timeout ({timeout}s) acquiring lock .{name}.lock; proceeding to avoid fleet deadlock")
-                        break
-                    time.sleep(0.05)
+                time.sleep(0.05)
         yield
     finally:
-        if acquired and fcntl is not None:
+        if acquired:
             with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                win_lock.unlock(fd)
         os.close(fd)
 
 

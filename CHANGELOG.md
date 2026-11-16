@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.3.8 - 2026-11-15
+
+### Added / Changed
+- **`hud_next` default HUD & `/classic`**: `hud_next` is now the default HUD served at `/` (with the classic dashboard kept at `/classic`), featuring no inline scripts (strict CSP), notifications from `/`, dropping dev live-reload, and porting the dedicated Permissions panel to workers.
+- **Multi-provider pill strip & iframe CSP**: multi-provider pill strip styling and provider pill indicators in `hud_next`, along with iframe CSP handling.
+- **`Load:` filter & `/api/home_prefs`**: home panel chat filtering by load status (`Load:` filter in `homepanel.js`) backed by persistent server-side preferences via `/api/home_prefs` and `/api/chats` filter support.
+- **Tab options menu & `hoverEl` fixes**: panel tabs options menu (`...`), view scoping, and resolved stuck `hoverEl` card dismissal issues in `homepanel.js`.
+- **Chat and mail as separate channels**: direct chat continuation (`/api/chat`) and Fast mail (`send_note`, `reply_note`, `fastmail_status`, `ask_room`) operate as distinct channels; Fast mail supports direct delivery into online chats, threaded replies, room broadcasts, offline resume with HUD approval, spam/loop guards, `mail.*` settings, and a dedicated Fast mail panel in the HUD.
+- **Background continue for OpenCode and Claude chats**: OpenCode and Claude sessions can be continued in the background / headless without blocking or requiring an interactive terminal window.
+- **Multi-provider PreToolUse guard**: `guard.py` and `install.py` install and enforce PreToolUse hooks and workspace guards across multiple agent providers.
+- **Documentation & cross-platform readiness**: updated documentation across API endpoints, README, changelog, and Claude doc runs; performed Windows readiness audit.
+- Unit chains run each unit in an isolated worktree and land it by merge; skeleton packets are focus skeletons (nested focus, full signatures, folded constants).
+- **Provider swap in one conversation**: Swap a conversation's provider like swapping a model so the conversation stays in one HUD tab; the new provider gets a read-back of recent exchanges (with a full read-back option in settings), with thinking and tool ids stripped.
+- **Live token streaming**: Chat replies stream token by token into the HUD panel instead of appearing only after the turn finishes.
+- **New chat button**: The new-chat (+) button opens a fresh chat for the selected provider.
+- **Antigravity MCP tools in headless turns**: Antigravity headless turns may call Subway's MCP tools through a narrow per-session allow rule instead of being auto-denied.
+- **Low-power mode**: Settings → Appearance → Display (Auto/On/Off) uses a static map and background with no idle animation; Auto turns on for 4-core / 4 GB machines and the map pauses when the tab is hidden or idle.
+- **Lightweight chat connections (`mcp_relay`)**: `subway settings set mcp_relay true` turns each chat's MCP process into a lightweight relay to the running HUD instead of a full server (off by default).
+- **Principal small edits**: Settings → Principal → "Small edits allowed" lets the principal make edits up to a configurable changed-line limit while the edit block is on.
+- **Diagnostics streaming**: The Diagnostics panel streams samples as they are taken, updates in place, and shows when the last sample was taken.
+- **Provider transplant learning**: HUD Settings → Providers shows shipped, learned, unmapped, and drifted adapters with last probe status and can draft a mapping brief for unmapped providers.
+- **Dynamic model menus and principal picker**: The composer offers dynamic model and effort choices with a live principal picker and backend-backed principal/initiator commands.
+- **HUD landing and diff views**: `hud_next` adds a Landing page and inline or side-by-side patch diff rendering for worker changes.
+- **Principal handoff digest**: Principal handoff carries an outgoing chat digest to the new principal with recent context and handoff details.
+- **Chat send headless continue**: Sending to an OpenCode or Claude chat continues it headless when no window is open.
+- **Station links and peer collaboration**: Linked stations can share chats, coordination, files, media, and remote worker status across peers where grants allow.
+- **Screen sharing grants**: "See my screen" supports off, snapshot, and live sharing with per-session approval, a viewing banner, quality presets, and audit entries.
+- **Terminals and phone pairing**: The HUD exposes shared terminal controls and device pairing flows, including tunnel-based pairing and push-capable mobile connections.
+- **Unmerged worker branches**: The Landing page hides worker branches that were deleted or merged outside the HUD, so the list shows only branches still awaiting review.
+
+### Fixed
+- **HUD CPU**: The usage sampler no longer rescans every worker and rebuilds status each second, reducing idle HUD CPU use.
+- **Memory**: Listing chats no longer loads whole pi transcripts, pi session summaries are cached on disk and shared across chats, and later chat loads use much less memory.
+- **Worker notices**: Worker notices reach chats through OS file-change events instead of a once-a-second poll and are no longer re-sent every second.
+- **Provider swap replies**: Switching a conversation back to a provider now shows its reply, and a moved conversation keeps late native replies.
+- **Chats list stability**: The HUD chats list no longer crashes when a debug endpoint shadows a module name.
+- **Principal edit block scope**: The principal edit block now applies to projects under the temp folder.
+- **Panel send behavior**: The panel stays on the open tab after a plain send and switches only on a real handoff.
+- **Wallpaper upload path**: An uploaded wallpaper image is served from the state directory instead of the HUD directory.
+- **Watchdog for literal edits**: Literal-edit briefs allow more calls before the no-edit stop so workers have time to locate anchors.
+- **Progress guard counting**: Code packets alone no longer cut the no-edit stop threshold.
+- **HUD settings validation**: Saving HUD settings with out-of-range values is rejected with an error instead of being saved.
+
 ## 1.3.7 - 2026-11-10
 
 ### Added / Changed

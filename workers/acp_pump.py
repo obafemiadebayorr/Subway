@@ -133,6 +133,84 @@ def handle_acp_tool_call(
             )
 
 
+def _hub_mcp_for(meta: Dict[str, Any], workdir: str) -> list:
+    """MCP servers lent to this worker through spin_worker(needs=...), launched natively by OpenCode.
+    Shared servers are left out; the worker reaches those through hub_call."""
+    try:
+        needs = (meta or {}).get("needs") or []
+        if not needs:
+            return []
+        import mcp_hub
+        ttl = int((meta or {}).get("timeout_seconds") or 3600) + 300
+        return mcp_hub.acp_mcp_servers(mcp_hub.native_specs(needs, workdir or "", worker_id=str((meta or {}).get("id") or ""), ttl=ttl))
+    except Exception:
+        return []
+
+
+def _qualify_model(val: str, config_options: Any) -> str:
+    """Return qualified model id from OpenCode configOptions if val is a bare id."""
+    if not val or "/" in val or not config_options:
+        return val
+    if not isinstance(config_options, list):
+        return val
+
+    model_opt = None
+    for opt in config_options:
+        if isinstance(opt, dict) and opt.get("id") == "model":
+            model_opt = opt
+            break
+    if not model_opt or "options" not in model_opt:
+        return val
+
+    def _flatten(opts: Any) -> List[str]:
+        res: List[str] = []
+        if not isinstance(opts, list):
+            return res
+        for item in opts:
+            if isinstance(item, dict):
+                if "value" in item and item["value"] is not None:
+                    res.append(str(item["value"]))
+                if "options" in item:
+                    res.extend(_flatten(item.get("options")))
+        return res
+
+    candidates = _flatten(model_opt.get("options"))
+    matches = [v for v in candidates if "/" in v and v.split("/", 1)[1] == val]
+    if not matches:
+        return val
+    for v in matches:
+        if v.startswith("opencode/"):
+            return v
+    return matches[0]
+
+
+def _live_permission_mode(meta, worker_id) -> str:
+    launch = meta.get("permission_mode") or "ask"
+    aliases = {"standard": "ask", "dangerously_skip": "auto_approve"}
+    launch = aliases.get(launch, launch)
+    try:
+        import permissions
+
+        rank = {"ask": 0, "auto_safe": 1, "auto_approve": 2}
+        candidates = [launch]
+        if worker_id:
+            candidates.append(permissions.get_permission_mode(str(worker_id)))
+        parent_id = meta.get("parent_id")
+        if parent_id:
+            candidates.append(permissions.get_permission_mode(str(parent_id)))
+        best = launch
+        best_rank = rank.get(launch, 0)
+        for cand in candidates:
+            cand = aliases.get(str(cand or ""), str(cand or ""))
+            r = rank.get(cand, 0)
+            if r < best_rank:
+                best = cand if cand in rank else "ask"
+                best_rank = r
+        return best
+    except Exception:
+        return launch
+
+
 def _pump_opencode(
     proc: subprocess.Popen, out: Any, run: Dict[str, Any], meta: Dict[str, Any], stopped: Dict[str, Any],
     quota_handler: Optional[Callable[[str, str], None]] = None,
@@ -179,6 +257,7 @@ def _pump_opencode(
         config_ops.append(("effort", str(effort)))
 
     curr_config_id = None
+    curr_config_op: Optional[Tuple[str, str]] = None
     response_chunks: List[str] = []
     stop_monitor = threading.Event()
     monitor_threads: List[threading.Thread] = []
@@ -230,8 +309,11 @@ def _pump_opencode(
                 run["usage"] = toks
                 spent = toks.get("input_tokens", 0) + toks.get("output_tokens", 0) + toks.get("thinking_tokens", 0)
                 run["spent"] = spent
+                early = int(run.get("tool_calls") or 0) == 0 and run.get("cap") and spent < 2 * run["cap"]
                 soft = run["cap"] * 2 // 3 if run.get("cap") else 0
-                if soft and spent >= soft and spent < run["cap"] and not run.get("wrapping"):
+                if early:
+                    pass
+                elif soft and spent >= soft and spent < run["cap"] and not run.get("wrapping"):
                     run["wrapping"] = "asked"  # The cancelled turn's reply sends the wrap-up prompt.
                     send_cancel()
                 elif run.get("cap") and spent >= run["cap"] and run.get("on_cap"):
@@ -272,7 +354,7 @@ def _pump_opencode(
                 msg_counter += 1
                 session_new_id = msg_counter
                 send_rpc({"jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
-                          "params": {"cwd": workdir, "mcpServers": []}})
+                          "params": {"cwd": workdir, "mcpServers": _hub_mcp_for(meta, workdir)}})
                 continue
 
             if is_reply and msg_id is not None and msg_id == session_new_id:
@@ -292,8 +374,15 @@ def _pump_opencode(
                     monitor_threads.append(monitor_thread)
                     monitor_thread.start()
 
+                if is_opencode:
+                    config_ops = [
+                        (k, _qualify_model(v, res.get("configOptions")) if k == "model" else v)
+                        for k, v in config_ops
+                    ]
+
                 if config_ops:
                     cfg_id, cfg_val = config_ops.pop(0)
+                    curr_config_op = (cfg_id, cfg_val)
                     msg_counter += 1
                     curr_config_id = msg_counter
                     send_rpc({"jsonrpc": "2.0", "id": curr_config_id, "method": "session/set_config_option",
@@ -306,14 +395,29 @@ def _pump_opencode(
                 continue
 
             if is_reply and msg_id == curr_config_id and curr_config_id is not None:
+                if msg.get("error"):
+                    cfg_id, cfg_val = curr_config_op if curr_config_op else ("config", "")
+                    err = msg.get("error")
+                    err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                    err_text = f"[error] OpenCode refused {cfg_id}={cfg_val}: {err_msg}"
+                    write(err_text)
+                    stopped["quota_error"] = err_text
+                    if session_id:
+                        send_cancel()
+                    run["finished"] = True
+                    proc.terminate()
+                    return
+
                 if config_ops:
                     cfg_id, cfg_val = config_ops.pop(0)
+                    curr_config_op = (cfg_id, cfg_val)
                     msg_counter += 1
                     curr_config_id = msg_counter
                     send_rpc({"jsonrpc": "2.0", "id": curr_config_id, "method": "session/set_config_option",
                               "params": {"sessionId": session_id, "configId": cfg_id, "value": cfg_val}})
                 else:
                     curr_config_id = None
+                    curr_config_op = None
                     msg_counter += 1
                     prompt_id = msg_counter
                     send_rpc({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
@@ -481,10 +585,12 @@ def _pump_opencode(
                 places = [str(p.get("path") or "") for p in tool_call.get("locations") or [] if isinstance(p, dict)]
                 root = os.path.join(os.path.realpath(workdir), "")
                 inside = all(os.path.join(os.path.realpath(os.path.join(workdir, p)), "").startswith(root) for p in places if p)
-                auto_approve = meta.get("permission_mode") == "auto_approve" or meta.get("skip_permissions")
-                auto_safe = (meta.get("permission_mode") == "auto_safe" and kind in ("read", "search", "edit")
+                worker_id = str(meta.get("id") or run.get("id") or "")
+                mode = _live_permission_mode(meta, worker_id)
+                auto_approve = mode == "auto_approve"
+                auto_safe = (mode == "auto_safe" and kind in ("read", "search", "edit")
                              and inside and (places or kind != "edit"))
-                if not auto_safe and meta.get("permission_mode") == "auto_safe":
+                if not auto_safe and mode == "auto_safe":
                     # A shell tool arrives as kind "execute", never as "read", so auto_safe used
                     # to ask for plainly read-only commands like `git grep`. Headless, that ask
                     # became a denial, and workers retried it two to four times, burning budget.
@@ -502,16 +608,16 @@ def _pump_opencode(
                 if auto_approve or auto_safe:
                     denial = _packet_reread_denial(meta, str(title), raw, kind=str(kind or ""), locations=places) or _large_file_read_denial(meta, str(title), raw, kind=str(kind or ""), locations=places)
                     if denial:
-                        write(f"[read guard] {denial}")
-                        decision = "deny"
-                    else:
-                        decision = "allow"
+                        # OpenCode ends the whole turn on any refused tool call, so the guard only advises here.
+                        write(f"[read guard, not enforced] {denial}")
+                    decision = "allow"
                 else:
                     rid = _s.request_permission(meta, str(title), detail, raw_input=raw)
                     decision = _s.await_permission(rid, stop=lambda: stopped["flag"])
 
                 if decision not in ("allow", "allow_always"):
-                    run["user_denied"] = True
+                    if not run.get("guard_denied"):
+                        run["user_denied"] = True
                 wanted_kind = "allow_once" if decision == "allow" else "allow_always" if decision == "allow_always" else "reject_once"
                 selected_opt = next((o for o in options if o.get("kind") == wanted_kind), None)
                 if selected_opt is None:

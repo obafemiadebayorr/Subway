@@ -1,0 +1,24 @@
+{
+  "id": "opencode",
+  "hook": "opencode_store",
+  "store": {
+    "kind": "sqlite",
+    "path": ["{xdg_data}/opencode/opencode.db"],
+    "fingerprint": {
+      "sqlite_tables": ["session_v2", "session_message", "event_sequence", "project_directory"]
+    }
+  },
+  "detect": {
+    "binary": ["opencode"],
+    "version_cmd": ["{bin}", "--version"]
+  },
+  "resume": {
+    "argv": ["{bin}", "run", "--session", "{session_id}", "{text}"],
+    "model_flag": ["--model", "{model}"],
+    "effort_flag": []
+  },
+  "context_tokens": {"default": 128000},
+  "write": {"session_id": "prefix:ses_"},
+  "probe": {"ask": "Reply with only the exact text of my previous message, nothing else."},
+  "notes": "Measured 2026-11-15 on v2.3.0. One SQLite DB ({xdg_data}/opencode/opencode.db) shared with a background service. A session is one session_v2 row (project_id NOT NULL, slug two words, directory, version, model JSON {id, providerID, variant}, ms times) plus session_message rows (id, session_id, type, seq unique per session, ms times, data JSON) and exactly one event_sequence row (aggregate_id = session id, seq = highest message seq, owner_id NULL; 1144/1144 sessions have one). session_part and event are empty on this machine: message content is inline. user data {time:{created}, text, files:[]}; assistant data {time:{created,completed}, agent:'build', model:{id,providerID}, content:[{type:'text',text}], finish:'stop', rawFinish, cost, tokens}. Message types seen: user, assistant, model-switched, system, synthetic, agent-switched, compaction, idle. Ids: prefix + 12 hex of (ms*4096+counter) mod 2^48 (bit-inverted for ses_) + 14 base62. project_id comes from project_directory.directory == cwd (fallback project.worktree); the hook never creates projects. Writes are one BEGIN IMMEDIATE transaction with a 1s busy timeout, INSERT only."
+}

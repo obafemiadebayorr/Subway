@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import concurrent.futures
 import contextlib
@@ -83,37 +84,48 @@ def pi_files(include_subagents: bool = False) -> List[str]:
                      if os.path.isfile(p))
     return sorted(set(files))
 
-def _pi_entries(path: str) -> List[Dict[str, Any]]:
-    """Parse a pi transcript file into entry dicts; corrupt lines are skipped."""
+_B64_RE = re.compile(r'"data":"[A-Za-z0-9+/=]{512,}"')
+
+
+def _pi_entries(path: str, slim: bool = False) -> List[Dict[str, Any]]:
+    """Parse a pi transcript file into entry dicts; corrupt lines are skipped.
+
+    JSONL is read line by line so a large file never sits in memory whole. slim=True blanks
+    inline base64 image data (pasted screenshots) for metadata scans, which never show it;
+    the transcript on disk is untouched and full reads still return the images."""
     entries: List[Dict[str, Any]] = []
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
+        f = open(path, "r", encoding="utf-8", errors="replace")
     except OSError:
         return entries
-    if not raw.strip():
-        return entries
-    # Single-JSON documents (a list of entries, or one entry object).
-    stripped = raw.lstrip()
-    if stripped[:1] == "[":
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return [e for e in data if isinstance(e, dict)]
-        except ValueError:
-            pass
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(entry, dict):
-            entries.append(entry)
-        elif isinstance(entry, list):
-            entries.extend(e for e in entry if isinstance(e, dict))
+    with f:
+        head = f.read(4096)
+        if head.lstrip()[:1] == "[":
+            raw = head + f.read()
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return [e for e in data if isinstance(e, dict)]
+            except ValueError:
+                pass
+            lines: Any = raw.splitlines()
+        else:
+            f.seek(0)
+            lines = f
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if slim and len(line) > 4096:
+                line = _B64_RE.sub('"data":""', line)
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+            elif isinstance(entry, list):
+                entries.extend(e for e in entry if isinstance(e, dict))
     return entries
 
 
@@ -222,9 +234,97 @@ def pi_read_segments(chat: Dict[str, Any], mode: str = "full") -> Tuple[List[Lis
     return (segs if segs else [[]]), has_markers
 
 
+# path -> (st_mtime_ns, st_size, meta). Entries are replaced per path, so growth only
+# comes from files that have since been deleted; those are pruned on insert.
+_PI_META_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_PI_META_LOCK = threading.Lock()
+_PI_META_LIVE = 0
+_PI_META_DISK = os.path.join(_s.SUBWAY_DIR, "cache", "pi_meta.json")
+_PI_META_LOADED = False
+_PI_META_SAVED_AT = 0.0
+
+
+def _pi_meta_disk_load() -> None:
+    """Load the shared on-disk cache once per process (caller holds _PI_META_LOCK)."""
+    global _PI_META_LOADED
+    if _PI_META_LOADED:
+        return
+    _PI_META_LOADED = True
+    try:
+        with open(_PI_META_DISK, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for p, v in (data or {}).items():
+            if isinstance(v, list) and len(v) == 3 and isinstance(v[2], dict):
+                _PI_META_CACHE.setdefault(p, (int(v[0]), int(v[1]), v[2]))
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _pi_meta_disk_save(force: bool = False) -> None:
+    global _PI_META_SAVED_AT
+    now = time.time()
+    if not force and now - _PI_META_SAVED_AT < 2.0:
+        return
+    _PI_META_SAVED_AT = now
+    try:
+        with _PI_META_LOCK:
+            snap = {p: [m, s, meta] for p, (m, s, meta) in _PI_META_CACHE.items()}
+        # Never let an empty snapshot wipe a shared cache; merge with on-disk entries.
+        if not snap and not force:
+            return
+        os.makedirs(os.path.dirname(_PI_META_DISK), exist_ok=True)
+        disk: Dict[str, Any] = {}
+        try:
+            with open(_PI_META_DISK, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                disk = data
+        except (OSError, ValueError, TypeError):
+            pass
+        disk.update(snap)
+        # Drop paths that no longer exist to keep the cache bounded.
+        for p in list(disk.keys()):
+            try:
+                if not os.path.exists(p):
+                    del disk[p]
+            except OSError:
+                pass
+        if not disk and not force:
+            return
+        _s._write_json_atomic(_PI_META_DISK, disk)
+    except Exception:
+        pass
+
+
+atexit.register(lambda: _pi_meta_disk_save(force=True))
+
+
 def pi_meta(path: str) -> Dict[str, Any]:
+    """Cached pi_meta: re-parses only when the file's mtime or size changes."""
+    global _PI_META_LIVE
     st = os.stat(path)
-    entries = _pi_entries(path)
+    with _PI_META_LOCK:
+        _pi_meta_disk_load()
+        hit = _PI_META_CACHE.get(path)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return dict(hit[2])
+    result = _pi_meta_compute(path)
+    with _PI_META_LOCK:
+        _PI_META_CACHE[path] = (st.st_mtime_ns, st.st_size, dict(result))
+        if len(_PI_META_CACHE) > 2 * max(_PI_META_LIVE, 1):
+            for stale in [p for p in _PI_META_CACHE if not os.path.exists(p)]:
+                del _PI_META_CACHE[stale]
+            _PI_META_LIVE = len(_PI_META_CACHE)
+    _pi_meta_disk_save()
+    return dict(result)
+
+
+def _pi_meta_compute(path: str) -> Dict[str, Any]:
+    st = os.stat(path)
+    try:
+        entries = _pi_entries(path, slim=True)
+    except TypeError:
+        entries = _pi_entries(path)
     sid = ""
     project = ""
     title = ""
@@ -291,4 +391,7 @@ def pi_list(include_subagents: bool = False) -> List[Dict[str, Any]]:
         if meta.get("subagent") and not include_subagents:
             continue
         out.append(meta)
+    # Ensure entries populated by this scan are persisted even if per-call
+    # saves were rate-limited and to outlive short-lived processes.
+    _pi_meta_disk_save(force=True)
     return out

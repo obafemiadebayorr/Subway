@@ -112,7 +112,14 @@ def chat_tokens_used(session_id: Optional[str] = None) -> Optional[int]:
         except Exception:
             return None
     if source in ("opencode", "opencode2"):
-        db_path = os.path.expanduser("~/.local/share/opencode/opencode.db")
+        opencode_dir = getattr(_s, "OPENCODE_DIR", "") or os.path.expanduser("~/.local/share/opencode")
+        db_path = os.path.join(opencode_dir, "opencode.db")
+        if os.name == "nt" and not os.path.exists(db_path):
+            localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+            if localappdata:
+                win_db = os.path.join(localappdata, "opencode", "opencode.db")
+                if os.path.exists(win_db):
+                    db_path = win_db
         if not os.path.exists(db_path):
             return None
         try:
@@ -325,13 +332,23 @@ def _source(name: str, max_age: Optional[float] = None) -> Dict[str, Any]:
     return rec or {}
 
 
+_sampler_wake = threading.Event()
+
+
+def wake_sampler() -> None:
+    _sampler_wake.set()
+
+
 def _sampler_loop() -> None:
     """HUD background poller. Each source runs at its own pace, and /usage only while someone's watching."""
     last_slow = 0.0
     while True:
         now = time.time()
+        workers = []
         with contextlib.suppress(Exception):
-            _s.enforce_budgets()
+            workers = _s._all_workers() or []
+        with contextlib.suppress(Exception):
+            _s.enforce_budgets(workers=workers)
         for name, (_fn, ttl) in _s._SOURCES.items():
             if name == "claude_live" and now - _s._viewer_seen > 30:
                 continue
@@ -346,7 +363,9 @@ def _sampler_loop() -> None:
                 _s.refresh_benchmarks()
             with contextlib.suppress(Exception):
                 _s.sync_caffeinate()
-        time.sleep(1.0)
+        active = any(str(w.get("status") or "") in ("running", "stopping", "pending_approval") for w in workers)
+        _sampler_wake.wait(timeout=5.0 if active else 30.0)
+        _sampler_wake.clear()
 
 
 def load_quotas(refresh: bool = True) -> Dict[str, Any]:

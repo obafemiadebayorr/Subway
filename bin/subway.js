@@ -38,8 +38,21 @@ function resolvePython() {
   return candidates[0];
 }
 
-const { bin: pythonBin, prefixArgs } = resolvePython();
 const args = process.argv.slice(2);
+
+// `subway tunnel [--url wss://…] [--port N] [--identity]`: run the Subway Tunnel station connector.
+if (args[0] === 'tunnel') {
+  const tunnel = spawn(process.execPath, [path.join(__dirname, 'subway-tunnel.mjs'), ...args.slice(1)], {
+    stdio: 'inherit',
+    env: process.env,
+  });
+  process.on('SIGINT', () => tunnel.kill('SIGINT'));
+  process.on('SIGTERM', () => tunnel.kill('SIGTERM'));
+  tunnel.on('exit', (code) => process.exit(code === null ? 1 : code));
+  return;
+}
+
+const { bin: pythonBin, prefixArgs } = resolvePython();
 const child = spawn(pythonBin, [...prefixArgs, serverPy, ...args], {
   stdio: 'inherit',
   env: process.env,

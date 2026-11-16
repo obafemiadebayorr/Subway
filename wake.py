@@ -65,7 +65,6 @@ def status(runner: Runner = _run) -> Dict[str, Any]:
     settings = parse_pmset(runner(["pmset", "-g"]))
     womp = bool(settings.get("womp"))
     powernap = bool(settings.get("powernap"))
-    awake = {"womp": womp, "powernap": powernap}
     return {
         "supported": True,
         "settings": settings,

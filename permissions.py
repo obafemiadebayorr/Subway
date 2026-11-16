@@ -425,6 +425,18 @@ def _readonly_terminal_denial(meta: Dict[str, Any], tool: str, detail: Any, kind
     return None
 
 
+_PACKET_READS: Dict[str, set] = {}
+
+
+def _first_packet_read(meta: Dict[str, Any], resolved: str, s: int, e: int) -> bool:
+    """Agents refuse to edit a file they have not read, so each packet range may be read once per worker."""
+    seen = _PACKET_READS.setdefault(str(meta.get("id") or ""), set())
+    if (resolved, s, e) in seen:
+        return False
+    seen.add((resolved, s, e))
+    return True
+
+
 def _packet_reread_denial(meta: Dict[str, Any], tool: str, detail: Any, kind: str = "",
                           locations: Optional[List[str]] = None) -> Optional[str]:
     """Block re-reading code already provided in the worker's brief code packet."""
@@ -465,6 +477,8 @@ def _packet_reread_denial(meta: Dict[str, Any], tool: str, detail: Any, kind: st
 
     if start is None and end is None:
         s, e = ranges[0][0], ranges[0][1]
+        if _first_packet_read(meta, resolved, s, e):
+            return None
         return f'Denied: lines {s}-{e} of {rel} are already in your brief under "=== CODE ===". Use that copy; do not re-read it.'
 
     req_start = start if start is not None else 1
@@ -478,6 +492,8 @@ def _packet_reread_denial(meta: Dict[str, Any], tool: str, detail: Any, kind: st
         overlap = max(0, min(req_end, pkt_e) - max(req_start, pkt_s) + 1)
         if overlap >= 0.8 * req_len:
             s, e = pkt_s, pkt_e
+            if _first_packet_read(meta, resolved, s, e):
+                return None
             return f'Denied: lines {s}-{e} of {rel} are already in your brief under "=== CODE ===". Use that copy; do not re-read it.'
 
     return None
@@ -567,6 +583,20 @@ def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason:
         "request_id": rid, "decision": decision, "answered_by": answered_by})
     _s._broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {_s.one_line(rec['detail'], 160)} "
                               f"(by {answered_by})", track="main", station_id="guard")
+    if rec.get("kind") == "fastmail_offline":
+        try:
+            import fastmail_offline
+            import fastmail
+            msg_id = rec.get("message_id") or rec.get("worker_id")
+            msg = fastmail.load_message(msg_id) if msg_id else None
+            if decision in ("allow", "allow_always"):
+                if msg:
+                    fastmail_offline._spawn(msg)
+            else:
+                if msg:
+                    fastmail.set_state(msg["id"], "queued", "resume declined")
+        except Exception as e:
+            _s.log(f"fastmail_offline approval handling failed for {rid}: {e}")
     return f"[{decision.upper()}] `{rid}`: {rec['tool']}: {_s.one_line(rec['detail'], 160)}"
 
 
@@ -574,8 +604,13 @@ def permission_text(requests: List[Dict[str, Any]]) -> str:
     lines = [f"[PERMISSION NEEDED] {len(requests)} request(s) from your workers. Show each to your user and ask them. "
              f"Then call answer_permission(request_id, decision) with allow, allow_always, or deny. Don't decide for them."]
     for r in requests:
-        lines.append(f"- `{r['id']}` worker `{r['worker_id']}` ({r.get('role')}, {str(r.get('provider')).upper()}) "
-                     f"wants {r['tool']}: {r['detail']}")
+        if r.get("kind") == "fastmail_offline":
+            lines.append(f"- `{r['id']}` [fastmail_offline] peer `{r.get('peer') or r.get('provider')}` "
+                         f"wants to resume offline chat to answer fast mail `{r.get('message_id') or r.get('worker_id')}`: "
+                         f"{r.get('preview') or r.get('detail')} (budget: {r.get('budget_tokens', '?')} tokens)")
+        else:
+            lines.append(f"- `{r['id']}` worker `{r['worker_id']}` ({r.get('role')}, {str(r.get('provider')).upper()}) "
+                         f"wants {r['tool']}: {r['detail']}")
     return "\n".join(lines)
 
 

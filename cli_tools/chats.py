@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Union
 import threads
 
 import server as _s
-def t_list_chats(source: str = "all", project: str = "", query: str = "", limit: int = 15,
-                 include_subagents: bool = False) -> str:
+def _t_list_chats_local(source: str = "all", project: str = "", query: str = "", limit: int = 15,
+                        include_subagents: bool = False) -> str:
     chats = _s.all_chats(source, include_subagents)
     aliases = _s.load_aliases()
     id_to_aliases: Dict[str, List[str]] = {}
@@ -68,8 +68,29 @@ def t_list_chats(source: str = "all", project: str = "", query: str = "", limit:
     return tbl + "\n\nTip: Board any chat by ID, prefix, @pinned-alias, dynamic workspace head (e.g. @agy-dziner), or topic slug (e.g. @agy-subway)."
 
 
-def t_search_chat(quote: str = "", query: str = "", source: str = "all", project: str = "", limit: int = 5,
-                  include_subagents: bool = True, segment: Union[str, int] = "all") -> str:
+def t_list_chats(source: str = "all", project: str = "", query: str = "", limit: int = 15,
+                 include_subagents: bool = False) -> str:
+    out = _t_list_chats_local(source, project, query, limit, include_subagents)
+    import peers as _peers
+    if not _peers.list_peers():
+        return out
+    from tables import table
+    rows = []
+    for r in _peers.remote_chats(query, limit):
+        if r.get("offline"):
+            rows.append([r["station"], "-", "not granted" if r.get("denied") else "offline", "-"])
+        else:
+            rows.append([r["station"], f"{r['alias'] or r['id'][:12]}@{r['station']}", r["title"][:60], r["source"]])
+    if not rows:
+        return out
+    linked = table(f"linked stations {len(rows)}", ["Station", "ID", "Title", "Source"], rows)
+    if out.startswith("No chats found"):
+        out = ""
+    return (out + "\n\n" if out else "") + linked + "\n\nRead a chat on a linked station with read_chat('@alias@station')."
+
+
+def _t_search_chat_local(quote: str = "", query: str = "", source: str = "all", project: str = "", limit: int = 5,
+                         include_subagents: bool = True, segment: Union[str, int] = "all") -> str:
     target = (quote or query or "").strip()
     if not target:
         return "Please provide a quote or snippet to search for."
@@ -126,6 +147,26 @@ def t_search_chat(quote: str = "", query: str = "", source: str = "all", project
     return "\n".join(lines)
 
 
+def t_search_chat(quote: str = "", query: str = "", source: str = "all", project: str = "", limit: int = 5,
+                  include_subagents: bool = True, segment: Union[str, int] = "all", peers_too: bool = True) -> str:
+    out = _t_search_chat_local(quote, query, source, project, limit, include_subagents, segment)
+    target = (quote or query or "").strip()
+    if peers_too and target:
+        import peers as _peers
+        extra = []
+        for p in _peers.list_peers():
+            peer = _peers.get(p["peer_id"])
+            if not peer:
+                continue
+            res = _peers.remote_get(peer, "/api/peer/search_chat", {"quote": target, "limit": limit})
+            if res.get("status") == 200:
+                st = _peers.slug(peer)
+                extra.append(f"--- on {st} (ids end with @{st}) ---\n" + str((res.get("data") or {}).get("text") or ""))
+        if extra:
+            out = out + "\n\nLinked stations\n" + "\n\n".join(extra)
+    return out
+
+
 def t_tag_chat(alias: str, chat_id: str = "") -> str:
     """Assign a memorable sticky alias to a chat. If chat_id is omitted, tags the current active session."""
     det = _s._detected_chat()
@@ -144,13 +185,38 @@ def t_tag_chat(alias: str, chat_id: str = "") -> str:
     return f"Station alias '@{alias.lower().lstrip('@')}' now points to {c['source'].upper()} `{c['id'][:8]}` ({c.get('title')})."
 
 
+def resolve_include_thoughts(arg: Optional[bool] = None) -> bool:
+    """An explicit include_thoughts wins; otherwise the thoughts_mode setting decides (default: include)."""
+    if arg is not None:
+        return bool(arg)
+    try:
+        from hud_server import settings_api
+        return settings_api.value("thoughts_mode") != "exclude"
+    except Exception:
+        return True
+
+
 def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optional[int] = None,
                 since: str = "", anchor_text: str = "",
                 max_chars: int = _s.DEFAULT_MAX_CHARS, include_tools: bool = False,
-                include_thoughts: bool = True, source: str = "all", project: str = "",
-                segment: Union[str, int] = "all") -> str:
+                include_thoughts: Optional[bool] = None, source: str = "all", project: str = "",
+                segment: Union[str, int] = "all", local_only: bool = False) -> str:
+    if not local_only:
+        import peers as _peers
+        r = _peers.split_remote(chat_id)
+        if r:
+            head, peer = r
+            st = _peers.slug(peer)
+            res = _peers.call(peer["peer_id"], "GET", "/api/peer/read_chat?" + __import__("urllib.parse").parse.urlencode(
+                {"chat_id": head, "mode": mode, "turns": turns, "since": since or "", "anchor_text": anchor_text or ""}))
+            if res.get("status") == 200:
+                return f"[on {st}] " + str((res.get("data") or {}).get("text") or "")
+            if res.get("status") == 403:
+                return f"{st} has not granted reading chats to this station."
+            return f"{st} is offline."
     if mode not in ("recent", "outline", "full", "decisions"):
         raise ValueError("mode must be 'recent', 'outline', 'full', or 'decisions'")
+    include_thoughts = resolve_include_thoughts(include_thoughts)
     since_spec = (since or "").strip().lower()
     bridge = re.fullmatch(r"bridge\s*-\s*(\d+)", since_spec)
     if since_spec and since_spec != "last" and not bridge:
@@ -228,3 +294,83 @@ def t_read_chat(chat_id: str, mode: str = "recent", turns: int = 6, start: Optio
     if advance and last is not None:
         _s.record_checkpoint(my_id, target_id, 0, int(last) + 1)
     return text
+
+
+def _chat_exchanges(chat_id: str, source: str) -> tuple:
+    """Resolve a chat (honouring exclusions) and return (chat dict, exchanges)."""
+    c = _s.resolve(chat_id, source, "")
+    if threads.is_chat_excluded(c, base_dir=_s.SUBWAY_DIR):
+        raise ValueError(f"Chat {chat_id} is excluded by app/project exclusion rules")
+    info = _s.chat_segments_info(c, "all")
+    return c, _s.to_exchanges(info[0])
+
+
+def chat_turns(chat_id: str, source: str = "all", turns: int = 20, max_chars: int = 4000) -> dict:
+    """Recent user/assistant turns for the HUD: user text plus the assistant's final text only."""
+    c, ex = _chat_exchanges(chat_id, source)
+    limit = max(1, int(turns))
+    limit_chars = max(0, int(max_chars))
+    out: List[Dict[str, Any]] = []
+    for e in ex[-limit:]:
+        ts = e.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            ts = float(ts)
+        elif isinstance(ts, str) and ts:
+            # Claude transcripts carry ISO timestamps; without them a moved conversation sorts these turns first.
+            try:
+                from transplant.ir import norm_ts
+                ts = norm_ts(ts)
+            except Exception:
+                ts = None
+        else:
+            ts = None
+        user_text = str(e.get("user") or "").strip()
+        if user_text:
+            out.append({"role": "user", "text": user_text[:limit_chars], "ts": ts})
+        final = str(e["assistant"][-1]) if e.get("assistant") else ""
+        if final.strip():
+            out.append({"role": "assistant", "text": final[:limit_chars], "ts": ts})
+    return {
+        "id": c.get("id", chat_id),
+        "source": c.get("source", source),
+        "title": str(c.get("title") or ""),
+        "turns": out,
+        "total": len(ex),
+    }
+
+
+def _tool_line(t: Any) -> str:
+    """One short line describing a tool step: 'Name: arg' (<=120 chars)."""
+    if isinstance(t, dict):
+        name = str(t.get("name") or t.get("tool") or "tool")
+        inp = t.get("input") if isinstance(t.get("input"), dict) else {}
+        arg = ""
+        for k in ("command", "file_path", "path", "pattern", "url", "query", "description"):
+            v = inp.get(k) or t.get(k)
+            if v:
+                arg = str(v)
+                break
+        s = f"{name}: {arg}" if arg else name
+    else:
+        s = str(t)
+    return " ".join(s.split())[:120]
+
+
+def chat_live(chat_id: str, source: str = "all", turns: int = 8, max_chars: int = 6000) -> dict:
+    """chat_turns plus the in-progress tail: what the agent is doing right now."""
+    out = chat_turns(chat_id, source, turns=turns, max_chars=max_chars)
+    c, ex = _chat_exchanges(chat_id, source)
+    last = ex[-1] if ex else {}
+    user = str(last.get("user") or "").strip()
+    assistant = [str(a) for a in (last.get("assistant") or [])]
+    tools = list(last.get("tools") or [])
+    limit_chars = max(0, int(max_chars))
+    latest = next((a for a in reversed(assistant) if a.strip()), "")
+    out["live"] = {
+        "working": bool(user) and not any(a.strip() for a in assistant),
+        "activity": [_tool_line(t) for t in tools[-5:]],
+        "text": latest[-limit_chars:] if limit_chars else "",
+        "user": user[:300],
+    }
+    out["path"] = str(c.get("path") or "")
+    return out

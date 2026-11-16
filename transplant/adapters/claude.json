@@ -1,0 +1,120 @@
+{
+  "id": "claude",
+  "store": {
+    "kind": "jsonl",
+    "path": [
+      "{home}/.claude/projects/{project_slug}/{session_id}.jsonl"
+    ],
+    "slug": {
+      "pattern": "[^A-Za-z0-9]",
+      "repl": "-"
+    },
+    "fingerprint": {
+      "sample_keys": [
+        "type",
+        "sessionId",
+        "message.role"
+      ]
+    }
+  },
+  "detect": {
+    "binary": [
+      "claude"
+    ],
+    "version_cmd": [
+      "{bin}",
+      "--version"
+    ]
+  },
+  "resume": {
+    "argv": [
+      "{bin}",
+      "-p",
+      "--resume",
+      "{session_id}",
+      "{text}"
+    ],
+    "model_flag": [
+      "--model",
+      "{model}"
+    ],
+    "effort_flag": [
+      "--effort",
+      "{effort}"
+    ]
+  },
+  "context_tokens": 200000,
+  "write": {
+    "session_id": "uuid4",
+    "dir_mode": 448,
+    "header": [
+      {
+        "type": "ai-title",
+        "aiTitle": "{title}",
+        "sessionId": "{session_id}"
+      }
+    ],
+    "turn": {
+      "user": {
+        "type": "user",
+        "parentUuid": "{parent_uuid}",
+        "isSidechain": false,
+        "message": {
+          "role": "user",
+          "content": "{text}"
+        },
+        "uuid": "{uuid}",
+        "timestamp": "{ts_iso}",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "{cwd}",
+        "sessionId": "{session_id}",
+        "version": "{version}",
+        "gitBranch": "{git_branch}"
+      },
+      "assistant": {
+        "type": "assistant",
+        "parentUuid": "{parent_uuid}",
+        "isSidechain": false,
+        "message": {
+          "model": "{model}",
+          "id": "msg_{uuid}",
+          "type": "message",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "{text}"
+            }
+          ],
+          "stop_reason": "end_turn",
+          "stop_sequence": null,
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0
+          }
+        },
+        "uuid": "{uuid}",
+        "timestamp": "{ts_iso}",
+        "userType": "external",
+        "entrypoint": "cli",
+        "cwd": "{cwd}",
+        "sessionId": "{session_id}",
+        "version": "{version}",
+        "gitBranch": "{git_branch}"
+      }
+    },
+    "footer": [
+      {
+        "type": "last-prompt",
+        "lastPrompt": "",
+        "leafUuid": "{leaf_uuid}",
+        "sessionId": "{session_id}"
+      }
+    ]
+  },
+  "probe": {
+    "ask": "Reply with only the exact text of my previous message, nothing else."
+  },
+  "notes": "Confirmed against two real sessions in ~/.claude/projects/-Users-obafemi-Documents-dev-subway-context/ on 2026-11-15 (sessions 076d32c6-1a19-4a3c-bc2a-8f334c7491cd and 0c1994ec-74d5-4d94-99f6-820002a4b570): JSONL lives at {home}/.claude/projects/{cwd-with-every-non-[A-Za-z0-9]-char-replaced-by-'-'}/{session_id}.jsonl; file starts with an {ai-title} record carrying aiTitle+sessionId; user records carry parentUuid (null first), isSidechain:false, message:{role:'user',content:<str>}, uuid, ISO-ms-Z timestamp, userType:'external', cwd, sessionId, version, gitBranch (entrypoint is 'cli' for interactive runs; these headless runs used 'sdk-cli' plus extra fields promptId/promptSource/permissionMode, which our writer omits harmlessly); assistant records wrap message:{model,id:'msg_'+-suffixed id,type:'message',role:'assistant',content:[{type:'text',text}],stop_reason,stop_sequence,usage} with real usage token counts (we write zeros); files end with a {last-prompt} footer record with lastPrompt, leafUuid set to the last record uuid, and sessionId. Timestamps are UTC ISO with milliseconds and a trailing Z."
+}

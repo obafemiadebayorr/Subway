@@ -229,13 +229,24 @@ def detect_clients() -> Dict[str, Dict[str, Any]]:
         out["copilot"].update({"installed": True, "evidence": ["VS Code data only, no extension or CLI found"]})
 
     cur_b = _s.find_cursor_binary()
+    cur_agent_fn = getattr(_s, "find_cursor_agent", None)
+    if cur_agent_fn is None:
+        try:
+            from binary_discovery import find_cursor_agent as cur_agent_fn
+        except ImportError:
+            cur_agent_fn = lambda: None
+    cur_agent_b = cur_agent_fn()
     cur_app = _s._app_installed("Cursor.app")
     cur_ev = ([f"CLI: {cur_b}"] if cur_b else []) + ([f"app: {cur_app}"] if cur_app else [])
+    if cur_agent_b:
+        cur_ev.append(f"agent CLI: {cur_agent_b}")
     cur_dir = os.environ.get("CURSOR_STORAGE_DIR") or _s._home("Library", "Application Support", "Cursor", "User")
     if os.path.isdir(cur_dir):
         cur_ev.append(f"data: {cur_dir}")
     cur_reg = _s._config_has_subway(_s._home(".cursor", "mcp.json"), "mcpServers")
     add("cursor", cur_ev, cli=None, registered=cur_reg)
+    if cur_agent_b:
+        out["cursor"]["agent_cli"] = cur_agent_b
 
     dev_b = _s.find_devin_binary()
     dev_app = _s._app_installed("Devin.app")
@@ -243,8 +254,18 @@ def detect_clients() -> Dict[str, Dict[str, Any]]:
     dev_dir = os.environ.get("DEVIN_STORAGE_DIR") or _s._home("Library", "Application Support", "Devin", "User")
     if os.path.isdir(dev_dir):
         dev_ev.append(f"data: {dev_dir}")
-    dev_reg = _s._config_has_subway(_s._home(".codeium", "windsurf", "mcp_config.json"), "mcpServers")
-    add("devin", dev_ev, cli=None, registered=dev_reg)
+    dev_reg = (
+        _s._config_has_subway(_s._home(".config", "devin", "mcp_config.json"), "mcpServers")
+        or _s._config_has_subway(_s._home(".codeium", "windsurf", "mcp_config.json"), "mcpServers")
+    )
+    dev_cli = (
+        dev_b
+        if (dev_b and "desktop" not in os.path.basename(dev_b).lower() and os.path.basename(dev_b) not in ("Devin", "Devin.exe"))
+        else None
+    )
+    add("devin", dev_ev, cli=dev_cli, registered=dev_reg)
+    if dev_cli:
+        out["devin"]["cli"] = dev_cli
 
     for cp in _s.load_custom_providers():
         cid = cp["id"]

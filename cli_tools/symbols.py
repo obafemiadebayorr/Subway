@@ -107,6 +107,11 @@ def t_read_symbol(file: str, symbol: str, include_callers: bool = False, project
 
     if len(out) > 20000:
         out = out[:20000]
+    try:
+        import token_savings as _ts
+        _ts.record("read_symbol", _ts.file_chars([abs_path]), len(out))
+    except Exception:
+        pass
     return out
 
 
@@ -126,7 +131,13 @@ def t_read_outline(file: str, project_dir: str = "") -> str:
         outline = getattr(_s, "outline", None)
     if outline is None:
         return "Error: outline helper not available."
-    return outline(abs_path)
+    text = outline(abs_path)
+    try:
+        import token_savings as _ts
+        _ts.record("read_outline", _ts.file_chars([abs_path]), len(text or ""))
+    except Exception:
+        pass
+    return text
 
 
 def t_claim_symbol(filepath: str, symbol: str, holder: str = "", duration_seconds: int = 300,

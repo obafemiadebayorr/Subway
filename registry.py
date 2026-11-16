@@ -9,6 +9,8 @@ import hmac
 import json
 import os
 import re
+import threading
+import time
 import urllib.parse
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -29,7 +31,26 @@ _SELF_TTL = 20.0
 _orig_self_id = _self_id
 
 
+# Worker session ids change slowly; a 5s TTL avoids re-reading every worker file per call.
+_WORKER_IDS_TTL = 5.0
+_WORKER_IDS_CACHE: Optional[Tuple[float, Set[str]]] = None
+_WORKER_IDS_LOCK = threading.Lock()
+
+
 def _worker_chat_session_ids() -> Set[str]:
+    global _WORKER_IDS_CACHE
+    now = time.monotonic()
+    with _WORKER_IDS_LOCK:
+        cached = _WORKER_IDS_CACHE
+    if cached is not None and now - cached[0] < _WORKER_IDS_TTL:
+        return set(cached[1])
+    ids = _worker_chat_session_ids_uncached()
+    with _WORKER_IDS_LOCK:
+        _WORKER_IDS_CACHE = (time.monotonic(), set(ids))
+    return ids
+
+
+def _worker_chat_session_ids_uncached() -> Set[str]:
     import server
     from workers import _archive_dir
     ids: Set[str] = set()
@@ -45,8 +66,33 @@ def _worker_chat_session_ids() -> Set[str]:
             continue
         for field in ("session_id", "copilot_session_id", "conversation", "thread"):
             session_id = worker.get(field)
-            if session_id:
+            if session_id and str(session_id) not in ("", "None", "null"):
                 ids.add(str(session_id))
+        log_file = worker.get("log_file")
+        if isinstance(log_file, str) and log_file and os.path.isfile(log_file):
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                    first = lf.read(1024).split("\n", 1)[0]
+                rec = json.loads(first)
+                if isinstance(rec, dict) and rec.get("type") == "session" and isinstance(rec.get("id"), str):
+                    ids.add(rec["id"])
+            except Exception:
+                pass
+    launched_path = os.path.join(server.SUBWAY_DIR, "launched_sessions.json")
+    if os.path.isfile(launched_path):
+        try:
+            with open(launched_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for item in data:
+                    if item is not None:
+                        ids.add(str(item))
+            elif isinstance(data, dict):
+                for key in data.keys():
+                    if key is not None:
+                        ids.add(str(key))
+        except Exception:
+            pass
     return ids
 
 

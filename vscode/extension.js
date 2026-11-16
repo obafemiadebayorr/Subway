@@ -631,7 +631,7 @@ function subwayHomeFile() {
   if (process.env.SUBWAY_DIR) return process.env.SUBWAY_DIR;
   const fresh = path.join(os.homedir(), ".subway");
   const legacy = path.join(os.homedir(), ".subway-context");
-  try { if (!fs.existsSync(fresh) && fs.lstatSync(legacy).isDirectory()) return legacy; } catch (_) {}
+  try { if (fs.lstatSync(legacy).isDirectory()) return legacy; } catch (_) {}
   return fresh;
 }
 

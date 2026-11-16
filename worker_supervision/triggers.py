@@ -123,6 +123,17 @@ def _parse_trigger_steps(raw: Any, label: str = "then") -> List[Dict[str, Any]]:
             step_dict["capabilities"] = list(step["capabilities"])
         if "effort" in step:
             step_dict["effort"] = step["effort"].lower()
+        if "unit" in step:
+            unit = step["unit"]
+            if (not isinstance(unit, dict) or isinstance(unit.get("index"), bool)
+                    or not isinstance(unit.get("index"), int) or not isinstance(unit.get("cwd"), str) or not unit["cwd"]):
+                raise ValueError(f"{label}[{i}].unit must be an object with an integer index and a cwd.")
+            step_dict["unit"] = {k: unit[k] for k in ("index", "cwd", "title", "verify", "total", "after") if k in unit}
+        if "code" in step:
+            code_list = step["code"]
+            if not isinstance(code_list, list) or any(not isinstance(c, str) for c in code_list):
+                raise ValueError(f"{label}[{i}].code must be a list of strings.")
+            step_dict["code"] = list(code_list)
         out.append(step_dict)
     return out
 
@@ -169,6 +180,31 @@ def _resolve_review_step(step: Dict[str, Any], meta: Dict[str, Any], child_promp
     return provider, model
 
 
+def _mark_unit_spawn_failed(unit_step: Dict[str, Any], error: str) -> None:
+    from workers import units as _units
+    note = ("next unit could not start: " + str(error))[:200]
+    try:
+        _units._mark(str(unit_step["cwd"]), int(unit_step["index"]), _units.FAILED, note=note)
+    except Exception:
+        pass
+    try:
+        _s.log(f"unit {int(unit_step['index']) + 1} in {unit_step['cwd']} could not start: {error}")
+    except Exception:
+        pass
+
+
+def _note_step_failed(worker_id: str, meta: Dict[str, Any], step: Dict[str, Any], err: str) -> None:
+    """A follow-up step could not start: record it on the parent and tell the track, never fail silently."""
+    with contextlib.suppress(Exception):
+        with _s._state_lock("workers"):
+            parent = _s._load_worker(worker_id) or meta
+            parent.setdefault("trigger_errors", []).append({"role": str(step.get("role") or ""), "error": str(err)[:300]})
+            _s._save_worker(parent)
+    with contextlib.suppress(Exception):
+        _s._broadcast_track_internal(f"{worker_id} finished, but follow-up '{step.get('role')}' could not start: {str(err)[:200]}",
+                                     track=meta.get("track", "main"), station_id=worker_id)
+
+
 def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
     """Start a worker's follow-up steps from its own record, so no orchestrator has to be watching."""
     meta = _s._load_worker(worker_id)
@@ -195,6 +231,13 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             current["verdict_model"] = reviewer_model
         _s._save_worker(current)
     meta = current
+    if meta.get("unit"):
+        # Unit chain: only a completed, committed, verified unit lets the next one start.
+        try:
+            from workers import units as _units
+            steps = _units.continue_steps(steps, _units.on_unit_done(worker_id, meta, status))
+        except Exception:
+            steps = []
     parent_id = meta.get("triggered_by") or ""
     if is_reviewer and parent_id:
         with _s._state_lock("workers"):
@@ -255,11 +298,22 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
             task_text = _s._reviewer_task_text(meta.get("prompt") or "")
             if task_text:
                 child_prompt += f"\n\nTASK:\n{task_text}"
-        child_prompt += f"\n\nPREVIOUS WORKER {worker_id} ({meta.get('role') or 'worker'}, {status}):\n{included}"
-        provider, model = _s._resolve_review_step(step, meta, child_prompt)
-        step_max_tokens = int(step.get("max_tokens") or 0)
-        if not step_max_tokens:
-            step_max_tokens = 160000 if provider == "claude" else 80000
+        unit_step = step.get("unit") if isinstance(step.get("unit"), dict) else None
+        sa = meta.get("spin_args") or {}
+        if unit_step:
+            from workers import units as _units
+            try:
+                child_prompt = _units.unit_prompt(str(unit_step["cwd"]), int(unit_step["index"]))
+            except (ValueError, KeyError):
+                continue
+            provider, model = str(meta.get("provider") or "auto"), str(meta.get("model") or "")
+            step_max_tokens = int(sa.get("max_tokens") or 0)
+        else:
+            child_prompt += f"\n\nPREVIOUS WORKER {worker_id} ({meta.get('role') or 'worker'}, {status}):\n{included}"
+            provider, model = _s._resolve_review_step(step, meta, child_prompt)
+            step_max_tokens = int(step.get("max_tokens") or 0)
+            if not step_max_tokens:
+                step_max_tokens = 160000 if provider == "claude" else 80000
         try:
             with _s._thread_parent(worker_id, "followed", {"role": step.get("role"), "verdict": bool(step.get("verdict"))}):
                 spin_kwargs = dict(
@@ -273,14 +327,42 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
                     isolate=True,
                     then=json.dumps(step.get("then") or []),
                 )
+                if unit_step:
+                    # Same provider/model/caps/budgets as the unit before; isolated; each unit lands by merge before the next starts.
+                    spin_kwargs["isolate"] = True
+                    try:
+                        from hud_server import settings_api as _settings_api
+                        _cfg = _s._load_json("config.json") or {}
+                        if str(_settings_api.value("units_budget", _cfg) or "pool") == "pool":
+                            _man = _units.load_manifest(str(unit_step["cwd"])) or {}
+                            _pool = int(_man.get("call_pool") or 0)
+                            if _pool > 0:
+                                spin_kwargs["max_tool_calls"] = _units.call_pool_remaining(_man)
+                    except Exception:
+                        pass
+                    spin_kwargs["code"] = list(step.get("code") or []) or None
+                    spin_kwargs["_unit_step"] = True
+                    spin_kwargs["capabilities"] = list(sa.get("capabilities") or [])
+                    for key in ("max_seconds", "max_tool_calls", "effort", "permission_mode", "budget_session_pct",
+                                "budget_weekly_pct", "max_budget_usd", "private", "timeout_seconds", "doctor"):
+                        if sa.get(key) not in (None, ""):
+                            spin_kwargs[key] = sa[key]
                 if step.get("capabilities") is not None:
                     spin_kwargs["capabilities"] = step["capabilities"]
                 if step.get("effort") is not None:
                     spin_kwargs["effort"] = step["effort"]
+                if not unit_step and step.get("code"):
+                    spin_kwargs["code"] = list(step["code"])
                 res = _s.t_spin_worker(**spin_kwargs)
-        except Exception:
+        except Exception as exc:
+            if unit_step:
+                _mark_unit_spawn_failed(unit_step, f"{type(exc).__name__}: {exc}")
+            _note_step_failed(worker_id, meta, step, f"{type(exc).__name__}: {exc}")
             continue
-        if res.startswith("Error:"):
+        if isinstance(res, str) and res.startswith("Error:"):
+            if unit_step:
+                _mark_unit_spawn_failed(unit_step, res)
+            _note_step_failed(worker_id, meta, step, res)
             continue
         child_match = re.search(r"worker_[0-9a-f]{6}", res)
         if not child_match:
@@ -289,9 +371,14 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         child = _s._load_worker(child_id)
         if child:
             child["triggered_by"] = worker_id
+            if step.get("unit"):
+                child["unit"] = step["unit"]
             child["verdict"] = bool(step.get("verdict"))
             child["is_reviewer"] = bool(step.get("verdict"))
             _s._save_worker(child)
+            import thread_edges
+            thread_edges.edge("reviewed" if step.get("verdict") else "handed_off", worker_id, child_id,
+                              {"role": step.get("role"), "when": step.get("when") or "completed"})
         with _s._state_lock("workers"):
             parent = _s._load_worker(worker_id) or meta
             parent.setdefault("triggered", []).append(child_id)
@@ -304,6 +391,9 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
 
 def t_on_worker_done(worker_id: str, then: str = "") -> str:
     """Attach follow-up steps to a worker already running, or fire them now if it has finished."""
+    from hud_server import settings_api as _shapes
+    if str(then or "").strip() not in ("", "[]") and not _shapes.shape_enabled("pipeline"):
+        return "Error: then= chains (pipeline shape) are turned off in Settings > Workers > Delegation."
     meta = _s._load_worker(worker_id)
     if not meta:
         return f"Error: worker `{worker_id}` not found."

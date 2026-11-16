@@ -177,9 +177,35 @@ def _copilot_session_usage(path: str) -> Optional[Dict[str, Any]]:
     return latest
 
 
-def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
-                      worker_index: Dict[str, Dict[str, Any]],
-                      open_sessions: Set[str]) -> Dict[str, Any]:
+# path -> (st_mtime_ns, st_size, file-derived scan). Only the file-derived part is cached;
+# index/worker/open_sessions fields are applied by _copilot_cli_meta on every call.
+_COPILOT_META_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_COPILOT_META_LOCK = threading.Lock()
+_COPILOT_META_LIVE = 0
+
+
+def _copilot_scan(path: str) -> Dict[str, Any]:
+    """Memoized _copilot_scan_uncached keyed on (path, mtime_ns, size)."""
+    global _COPILOT_META_LIVE
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _copilot_scan_uncached(path)
+    with _COPILOT_META_LOCK:
+        hit = _COPILOT_META_CACHE.get(path)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return dict(hit[2])
+    result = _copilot_scan_uncached(path)
+    with _COPILOT_META_LOCK:
+        _COPILOT_META_CACHE[path] = (st.st_mtime_ns, st.st_size, dict(result))
+        if len(_COPILOT_META_CACHE) > 2 * max(_COPILOT_META_LIVE, 1):
+            for stale in [p for p in _COPILOT_META_CACHE if not os.path.exists(p)]:
+                del _COPILOT_META_CACHE[stale]
+            _COPILOT_META_LIVE = len(_COPILOT_META_CACHE)
+    return dict(result)
+
+
+def _copilot_scan_uncached(path: str) -> Dict[str, Any]:
     folder_id = os.path.basename(os.path.dirname(path))
     sid = folder_id
     first_prompt = last_prompt = model = ""
@@ -223,16 +249,32 @@ def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
     except OSError:
         pass
 
-    indexed = index.get(sid) or index.get(folder_id) or {}
-    project = indexed.get("cwd") or project or indexed.get("repository") or ""
     if updated is None:
         try:
             updated = os.path.getmtime(path)
         except OSError:
             updated = None
-    worker = worker_index.get(sid) or worker_index.get(folder_id)
     if usage and usage.get("model"):
         model = usage["model"]
+    return {"folder_id": folder_id, "sid": sid, "first_prompt": first_prompt,
+            "last_prompt": last_prompt, "project": project or "", "updated": updated,
+            "model": model, "usage": usage}
+
+
+def _copilot_cli_meta(path: str, index: Dict[str, Dict[str, Any]],
+                      worker_index: Dict[str, Dict[str, Any]],
+                      open_sessions: Set[str]) -> Dict[str, Any]:
+    scan = _copilot_scan(path)
+    folder_id = scan["folder_id"]
+    sid = scan["sid"]
+    first_prompt = scan["first_prompt"]
+    last_prompt = scan["last_prompt"]
+    model = scan["model"]
+    updated = scan["updated"]
+    usage = dict(scan["usage"]) if scan["usage"] is not None else None
+    indexed = index.get(sid) or index.get(folder_id) or {}
+    project = indexed.get("cwd") or scan["project"] or indexed.get("repository") or ""
+    worker = worker_index.get(sid) or worker_index.get(folder_id)
     return {
         "source": "copilot", "id": sid, "path": path, "format": "copilot-cli",
         "title": _s.one_line(first_prompt, 80) if first_prompt else "(Copilot CLI session)",

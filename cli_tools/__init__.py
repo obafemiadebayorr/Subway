@@ -8,6 +8,8 @@ import contextlib
 import json
 import os
 import sys
+import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -21,7 +23,7 @@ import mcp_tasks
 import server as _s
 sys.modules.setdefault("server", sys.modules[__name__])  # one module object when run as a script
 from .chats import (t_list_chats, t_search_chat, t_tag_chat, t_read_chat)
-from .notes import (t_send_note, t_check_notes, _deliver_pending_worker_notes, t_instruct_worker, t_whoami, _ping_launcher)
+from .notes import (t_send_note, t_check_notes, _deliver_pending_worker_notes, t_instruct_worker, t_whoami, _ping_launcher, t_reply_note, t_fastmail_status)
 from .locks import (_canon_path, _file_sha, _git_head, _clean_locks, load_locks, save_locks, t_claim_file, t_signoff_file, t_release_file, t_list_locks)
 from .tracks import (_clean_track, _track_file, t_join_track, _broadcast_track_internal, t_broadcast_track, read_track_entries, t_read_track)
 from .permissions_cli import (t_estimate_complexity, t_answer_permission, t_permission_requests)
@@ -41,7 +43,12 @@ def _t_collect_reports_impl(track: str = "main", wait: bool = False) -> str:
     if wait:
         deadline = time.time() + 15
         while time.time() < deadline and any(m.get("status") in ("running", "stopping") for m in on_track()):
-            time.sleep(1.0)
+            rem = min(1.0, max(0.05, deadline - time.time()))
+            try:
+                import permissions as _perm
+                _perm.wait_for_activity(timeout=rem)
+            except Exception:
+                time.sleep(rem)
 
     records = on_track()
     if not records:
@@ -304,7 +311,8 @@ def handle(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pv = (req.get("params") or {}).get("protocolVersion") or "2025-06-18"
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": pv,
-            "capabilities": {"tools": {"listChanged": True}, "tasks": {}},
+            "capabilities": {"tools": {"listChanged": True}, "tasks": {},
+                             "experimental": {"claude/channel": {}}},
             "serverInfo": {"name": "subway", "version": _s.VERSION},
             "instructions": "Subway: Multi-window transit for coding agents. "
                             "Board chats with search_chat, tag_chat, and read_chat(since='last', mode='decisions'). "
@@ -485,6 +493,26 @@ def run_hook_precompact() -> int:
     return 0
 
 
+def run_hook_session() -> int:
+    """Claude Code SessionStart hook: after a reload, tell the chat to re-arm its worker monitor. Fails open."""
+    try:
+        raw = sys.stdin.read()
+        event = json.loads(raw) if raw.strip() else {}
+        sid = str(event.get("session_id") or "")
+        if not sid:
+            return 0
+        active = ("running", "launching", "stopping", "pending_approval", "awaiting_approval")
+        n = sum(1 for w in _s._all_workers() if w.get("launched_by") == sid and w.get("status") in active)
+        if n:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": (
+                f"Subway: {n} worker(s) launched by this chat are still active. Start a background Monitor running "
+                "`subway watch --stream` now so their completion, failure and permission events reach you.")}}))
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            _s.log("hook session error:", e)
+    return 0
+
+
 def run_cli(argv: List[str]) -> int:
     arg = argv[0]
     rest = argv[1:]
@@ -541,6 +569,16 @@ def run_cli(argv: List[str]) -> int:
         port = _s.HUD_PORT
         install = "--install" in rest
         if install:
+            if sys.platform == "win32":
+                py = shutil.which("pythonw.exe") or sys.executable
+                tr = f'"{py}" "{os.path.abspath(sys.argv[0])}" daemon'
+                cmd = ["schtasks", "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", "Subway\\Daemon", "/TR", tr]
+                _r = subprocess.run(cmd, capture_output=True, text=True)
+                if _r.returncode != 0:
+                    print(f"[SUBWAY] Could not register Windows scheduled task Subway\\Daemon: {(_r.stderr or '').strip()[:160]}", file=sys.stderr)
+                    return 1
+                print("[SUBWAY] Registered Windows scheduled task Subway\\Daemon.")
+                return 0
             plist = os.path.expanduser("~/Library/LaunchAgents/com.subway.daemon.plist")
             old_plist = os.path.expanduser("~/Library/LaunchAgents/com.subway-context.daemon.plist")
             if os.path.exists(old_plist):
@@ -614,6 +652,94 @@ def run_cli(argv: List[str]) -> int:
         res = _s.verify_worker(rest[0])
         print(res.get("line") if isinstance(res, dict) else str(res))
         return 0 if (isinstance(res, dict) and res.get("status") == "PASS") else 1
+    if arg == "land":
+        import landing_queue
+        if "--list" in rest:
+            for e in landing_queue.list_queue():
+                print(f"{e.get('branch')}\t{e.get('repo')}\t{e.get('role') or 'worker'}\t{e.get('worker_id') or ''}")
+            return 0
+        if not rest:
+            repos: List[str] = []
+            for e in landing_queue.list_queue():
+                repo = e.get("repo")
+                if repo and repo not in repos:
+                    repos.append(repo)
+            if not repos:
+                print("No queued branches to land.")
+                return 0
+            rc = 0
+            for repo in repos:
+                res = landing_queue.drain(repo)
+                print(res["note"])
+                if res.get("blocked"):
+                    rc = 1
+            return rc
+        branch = rest[0]
+        try:
+            repo = _s._git(os.getcwd(), "rev-parse", "--show-toplevel")
+            base = _s._git(repo, "merge-base", "HEAD", branch)
+        except Exception as e:
+            print(f"Error: could not land '{branch}': {_s.one_line(str(e), 160)}")
+            return 2
+        entry = next((e for e in landing_queue.list_queue(repo) if e.get("branch") == branch), None)
+        from workers.spawn import _merge_worker_branch
+        ok, note = _merge_worker_branch(repo, branch, base.strip(), (entry or {}).get("role") or "worker", (entry or {}).get("worker_id") or "")
+        if ok:
+            landing_queue.remove(branch)
+        print(note)
+        return 0 if ok else 1
+    if arg == "mcp":
+        import mcp_hub
+        verb = rest[0] if rest else ""
+        if verb in ("connect", "disconnect", "status", "client"):
+            import oauth_cli
+            return oauth_cli.run(rest)
+        if verb == "list":
+            project = rest[rest.index("--project") + 1] if "--project" in rest and rest.index("--project") + 1 < len(rest) else ""
+            print("\n".join(mcp_hub.cli_list(project)))
+            return 0
+        if verb == "media":
+            print("\n".join(mcp_hub.cli_media(rest[1] if len(rest) > 1 else "")))
+            return 0
+        if verb == "log":
+            n = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 20
+            print("\n".join(mcp_hub.cli_log(n)))
+            return 0
+        print("Usage: subway mcp list [--project DIR]   (servers that can be lent, and who borrows them)\n"
+              "       subway mcp log [N]                (the last N lent MCP calls)\n"
+              "       subway mcp media [WORKER]          (screenshots and images workers got back)\n"
+              "       subway mcp connect <server>        (sign Subway in to an HTTP MCP server)\n"
+              "       subway mcp disconnect <server>     (sign out and revoke)\n"
+              "       subway mcp status [server]         (which token each server uses)")
+        return 2
+    if arg == "claude":
+        verb = rest[0] if rest else ""
+        sub = rest[1] if len(rest) > 1 else ""
+        if verb == "hooks" and sub in ("install", "remove", "status"):
+            import claude_hooks
+            if sub == "install":
+                res = claude_hooks.install()
+                if res.get("ok", res.get("installed")):
+                    print("Native wake on: Claude chats will be woken by Subway events. Restart open Claude chats once.")
+                    return 0
+                print(f"Error: {res.get('error', 'could not install hooks')}")
+                return 1
+            if sub == "remove":
+                res = claude_hooks.remove()
+                if res.get("ok", True):
+                    print("Native wake off: Claude hooks removed.")
+                    return 0
+                print(f"Error: {res.get('error', 'could not remove hooks')}")
+                return 1
+            res = claude_hooks.status()
+            path = res.get("path", "")
+            if res.get("installed"):
+                print(f"Native wake: on ({path})")
+            else:
+                print(f"Native wake: off ({path})")
+            return 0
+        print("Usage: subway claude hooks install|remove|status")
+        return 2
     if arg in ("approve", "--approve"):
         if not rest:
             print("Usage: subway approve <worker_id>")
@@ -672,9 +798,15 @@ def run_cli(argv: List[str]) -> int:
             return 2
         print(_s.t_worker_status(worker_id=rest[0]))
         return 0
+    if arg in ("settings", "--settings"):
+        from .settings_cli import run as _settings_run
+        return _settings_run(rest)
     if arg in ("locks", "--locks"):
         print(_s.t_list_locks())
         return 0
+    if arg in ("cleanup", "--cleanup"):
+        import worktree_cleanup
+        return worktree_cleanup.run_cli(rest)
     if arg in ("track", "--track"):
         print(_s.t_read_track(track=rest[0] if rest else "main"))
         return 0
@@ -713,7 +845,6 @@ def run_cli(argv: List[str]) -> int:
                         print(f"  code {r['code']}  ·  {r['request_id']}", flush=True)
                         print(f"  approve: subway pair approve {r['request_id']}", flush=True)
                         if dlg:
-                            import subprocess
                             subprocess.Popen([sys.executable, "-m", "pairing_prompt", r["request_id"], r["code"]])
                     time.sleep(1.5)
             except KeyboardInterrupt:
@@ -738,6 +869,9 @@ def run_cli(argv: List[str]) -> int:
         print("Usage: subway pair [list] | pair watch [--dialog] | pair approve <request_id> | "
               "pair deny <request_id> | pair revoke <device_id>")
         return 2
+    if arg in ("link", "--link"):
+        import peers as _peers
+        return _peers.link_cli(rest)
     if arg in ("wake", "--wake"):
         import wake as _wake
         info = _wake.status()
@@ -859,6 +993,7 @@ def run_cli(argv: List[str]) -> int:
             provider = ""
             session_id = ""
             turn_key = ""
+            idle_reset = 0.0
             i = 0
             while i < len(tail):
                 if tail[i] == "--provider" and i + 1 < len(tail):
@@ -869,6 +1004,12 @@ def run_cli(argv: List[str]) -> int:
                     i += 2
                 elif tail[i] == "--turn-key" and i + 1 < len(tail):
                     turn_key = tail[i + 1]
+                    i += 2
+                elif tail[i] == "--idle-reset" and i + 1 < len(tail):
+                    try:
+                        idle_reset = float(tail[i + 1])
+                    except Exception:
+                        idle_reset = 0.0
                     i += 2
                 else:
                     i += 1
@@ -881,7 +1022,7 @@ def run_cli(argv: List[str]) -> int:
                 payload = {}
             tool_name = payload.get("tool") or ""
             tool_input = payload.get("input")
-            res = _gov.check(provider, session_id, tool_name, tool_input, turn_key)
+            res = _gov.check(provider, session_id, tool_name, tool_input, turn_key, idle_reset_seconds=idle_reset)
             print(json.dumps(res))
             return 0 if res.get("allow") else 2
 
@@ -1007,6 +1148,8 @@ def main() -> None:
         sys.exit(_s.run_hook_prompt())
     if argv and argv[0] == "hook-precompact":
         sys.exit(_s.run_hook_precompact())
+    if argv and argv[0] == "hook-session":
+        sys.exit(_s.run_hook_session())
     if argv and argv[0] != "--stdio":
         sys.exit(_s.run_cli(argv))
 
@@ -1070,6 +1213,8 @@ __all__ = [
     "_deliver_pending_worker_notes",
     "t_instruct_worker",
     "t_whoami",
+    "t_reply_note",
+    "t_fastmail_status",
     "_ping_launcher",
     "_canon_path",
     "_file_sha",

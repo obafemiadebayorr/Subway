@@ -69,6 +69,8 @@ from .render import (
     render_chat,
 )
 
+from .dispatch import DETECTED_CHAT_SOURCES
+
 from .aliases import (
     load_aliases,
     _sync_opencode_agent_stubs,

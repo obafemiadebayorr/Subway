@@ -10,15 +10,15 @@ OLD_NAME = ".subway-context"
 
 
 def subway_dir(home=None):
-    """SUBWAY_DIR when set; otherwise ~/.subway, or ~/.subway-context while only that real folder exists."""
+    """SUBWAY_DIR when set; otherwise ~/.subway-context while it is a real folder (not moved yet), else ~/.subway."""
     if home is None:
         env = os.environ.get("SUBWAY_DIR")
         if env:
             return env
         home = os.path.expanduser("~")
     new, old = os.path.join(home, NEW_NAME), os.path.join(home, OLD_NAME)
-    if not os.path.lexists(new) and os.path.isdir(old) and not os.path.islink(old):
-        return old
+    if os.path.isdir(old) and not os.path.islink(old):
+        return old  # not moved yet; an unrelated ~/.subway must not split the state in two
     return new
 
 

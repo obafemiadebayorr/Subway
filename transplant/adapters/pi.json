@@ -1,0 +1,118 @@
+{
+  "id": "pi",
+  "store": {
+    "kind": "jsonl",
+    "path": [
+      "{home}/.deepai-code/userdata/deepai/pi/deepai/sessions/-{project_slug}--/{ts_file}_{session_id}.jsonl"
+    ],
+    "slug": {
+      "pattern": "/",
+      "repl": "-"
+    },
+    "fingerprint": {
+      "sample_keys": [
+        "type",
+        "id",
+        "parentId",
+        "message.role"
+      ]
+    }
+  },
+  "detect": {
+    "binary": [
+      "pi-deep",
+      "pi"
+    ],
+    "version_cmd": [
+      "{bin}",
+      "--version"
+    ]
+  },
+  "resume": {
+    "argv": [
+      "{bin}",
+      "--session",
+      "{session_id}",
+      "-p",
+      "{text}"
+    ],
+    "model_flag": [
+      "--model",
+      "{model}"
+    ],
+    "effort_flag": [],
+    "ref": "path"
+  },
+  "context_tokens": {
+    "default": 128000
+  },
+  "write": {
+    "session_id": "uuid7",
+    "record_id": "hex8",
+    "header": [
+      {
+        "type": "session",
+        "version": 3,
+        "id": "{session_id}",
+        "timestamp": "{ts_iso}",
+        "cwd": "{cwd}"
+      }
+    ],
+    "turn": {
+      "user": {
+        "type": "message",
+        "id": "{uuid}",
+        "parentId": "{parent_uuid}",
+        "timestamp": "{ts_iso}",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "{text}"
+            }
+          ],
+          "timestamp": "{ts_ms}"
+        }
+      },
+      "assistant": {
+        "type": "message",
+        "id": "{uuid}",
+        "parentId": "{parent_uuid}",
+        "timestamp": "{ts_iso}",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "{text}"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "deepai",
+          "model": "{model}",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": "{ts_ms}"
+        }
+      }
+    }
+  },
+  "probe": {
+    "ask": "Reply with only the exact text of my previous message, nothing else."
+  },
+  "notes": "Measured 2026-11-15 on DeepAI Code pi sessions. Store: one JSONL per session at ~/.deepai-code/userdata/deepai/pi/deepai/sessions/--<cwd with / as ->--/<ts>_<session id>.jsonl, where <ts> is the session timestamp with ':' and '.' as '-' (e.g. 2026-11-06T12-05-46-865Z_01a1b0c0-2cf0-7746-a017-eb84d2179580.jsonl). Line 1 is {type:session, version:3, id:<uuid7>, timestamp:ISO ms Z, cwd}. Real sessions follow with model_change / thinking_level_change records (omitted here: the IR model belongs to the source provider). Messages are {type:message, id:<8 hex>, parentId:<previous record id or null>, timestamp:ISO, message:{role, content:[{type:text,text}], timestamp:<ms int>}}; assistant messages also carry api, provider, model, usage, stopReason. Real tool calls are content items {type:toolCall} with separate role toolResult records; transplants render actions as text instead. pi resumes with --session <path|id> -p <text>. The data dir moves (app running: ~/.deepai-code/userdata/...; app closed: pi-deep uses ~/.subway-context/pi), so resume opens the written file by path (resume.ref=path), which pi accepts in either case."
+}

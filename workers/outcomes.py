@@ -58,6 +58,8 @@ def _headless_permission_denial(log_text: str) -> Optional[str]:
 def _settle_worker_result(result: Dict[str, Any], meta: Dict[str, Any], no_changes: bool, reply: str) -> None:
     if result.get("status") != "completed" or not no_changes:
         return
+    if meta.get("needs"):
+        return  # lent MCP servers: its work lives in the service (Notion, Paper), not in the repo
     # The reply is the report (result["response"]); reason only says how the run ended.
     note = str(result.get("reason") or "").strip()
     worker_id = meta.get("id")
@@ -398,19 +400,113 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception as e:
                     print(f"[wake] {status} for {target_chat} failed: {e!r}", file=sys.stderr)
         _s._record_worker_stat(current, result)
+        # Failure doctor (roadmap 51): a failed worker may get one cheap doctor
+        # that diagnoses the failure and rebriefs one fix worker. Never auto-approved.
+        if str(current.get("status") or "") in ("failed", "timed_out", "budget_stopped"):
+            with contextlib.suppress(Exception):
+                from worker_supervision import doctor as _doctor
+                _doctor.fresh().maybe_queue_failure_doctor(wid, result)
+        # Fastmail offline resume: a responder worker posts its report back as a threaded reply.
+        if (current.get("fastmail_reply_to") or meta.get("fastmail_reply_to")) and str(current.get("status") or "") == "completed":
+            try:
+                import fastmail_offline
+                fastmail_offline.capture_reply(wid)
+            except Exception:
+                pass
     return current
 
-def _all_workers(include_archive: bool = False) -> List[Dict[str, Any]]:
-    _s._ensure_subway_dir()
-    paths = glob.glob(os.path.join(_s.WORKERS_DIR, "worker_*.json"))
-    if include_archive:
-        paths += glob.glob(os.path.join(_s._archive_dir(), "worker_*.json"))
-    records = []
-    for fp in paths:
+# Parsed worker records keyed by path, reused while the file's (mtime_ns, size) is unchanged.
+# A HUD snapshot used to scan ~1,000 records (23 MB of JSON) about 29 times; now each call
+# is one listdir + one stat per file, and only changed files are parsed again.
+_RECORD_CACHE: Dict[str, Any] = {}
+_RECORD_CACHE_LOCK = threading.Lock()
+
+
+def _read_worker_record(fp: str) -> Optional[Dict[str, Any]]:
+    try:
+        st = os.stat(fp)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    with _RECORD_CACHE_LOCK:
+        hit = _RECORD_CACHE.get(fp)
+    if hit is not None and hit[0] == key:
+        meta = hit[1]
+    else:
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 meta = json.load(f)
         except (ValueError, OSError):
+            return None
+        with _RECORD_CACHE_LOCK:
+            _RECORD_CACHE[fp] = (key, meta)
+    # Callers may change the dict they get: hand out a copy (nested values stay shared, read-only by convention).
+    return dict(meta) if isinstance(meta, dict) else None
+
+
+def _worker_paths(folder: str) -> List[str]:
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names if n.startswith("worker_") and n.endswith(".json")]
+
+
+_ALL_WORKERS_CACHE: Dict[Any, Any] = {}
+_ALL_WORKERS_CACHE_LOCK = threading.Lock()
+_TERMINAL_WORKER_STATUSES = {"completed", "failed", "budget_stopped", "rejected", "stopped", "cancelled", "error"}
+
+
+def _all_workers_cache_key(include_archive: bool, paths: List[str]):
+    try:
+        dir_mtime = os.stat(_s.WORKERS_DIR).st_mtime_ns
+    except OSError:
+        dir_mtime = None
+    arch_mtime = None
+    if include_archive:
+        try:
+            arch_mtime = os.stat(_s._archive_dir()).st_mtime_ns
+        except OSError:
+            arch_mtime = None
+    return (bool(include_archive), dir_mtime, arch_mtime)
+
+
+def _all_workers(include_archive: bool = False) -> List[Dict[str, Any]]:
+    _s._ensure_subway_dir()
+    try:
+        dir_mtime = os.stat(_s.WORKERS_DIR).st_mtime_ns
+    except OSError:
+        dir_mtime = None
+    arch_mtime = None
+    if include_archive:
+        try:
+            arch_mtime = os.stat(_s._archive_dir()).st_mtime_ns
+        except OSError:
+            arch_mtime = None
+    key = (bool(include_archive), dir_mtime, arch_mtime)
+    with _ALL_WORKERS_CACHE_LOCK:
+        cached = _ALL_WORKERS_CACHE.get(key)
+    if cached is not None:
+        out = []
+        for meta in cached:
+            item = dict(meta)
+            if str(item.get("status") or "") not in _TERMINAL_WORKER_STATUSES:
+                item = _s._update_worker_status(item)
+                item = _s._normalise_copilot_worker_record(item)
+                item["archived"] = bool(item.get("archived"))
+            out.append(item)
+        return out
+    paths = _worker_paths(_s.WORKERS_DIR)
+    if include_archive:
+        paths += _worker_paths(_s._archive_dir())
+    live = set(paths)
+    with _RECORD_CACHE_LOCK:
+        for fp in [p for p in _RECORD_CACHE if p not in live and os.path.dirname(p) == _s.WORKERS_DIR]:
+            _RECORD_CACHE.pop(fp, None)
+    records = []
+    for fp in paths:
+        meta = _read_worker_record(fp)
+        if meta is None:
             continue
         if isinstance(meta, dict) and _s.WORKER_ID_RE.match(str(meta.get("id", ""))):
             meta = _s._update_worker_status(meta)
@@ -418,7 +514,10 @@ def _all_workers(include_archive: bool = False) -> List[Dict[str, Any]]:
             meta["archived"] = os.path.dirname(fp) != _s.WORKERS_DIR
             records.append(meta)
     records.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
-    return records
+    with _ALL_WORKERS_CACHE_LOCK:
+        _ALL_WORKERS_CACHE.clear()
+        _ALL_WORKERS_CACHE[key] = [dict(r) for r in records]
+    return [dict(r) for r in records]
 
 
 TERMINAL_WORKER_STATUSES = ("completed", "failed", "stopped", "timed_out", "budget_stopped", "cancelled", "rejected")
@@ -449,4 +548,9 @@ def wait_for_worker(worker_id: str, timeout_seconds: float = 600.0, poll_seconds
             out = dict(meta)
             out["wait_timed_out"] = True
             return out
-        time.sleep(poll_seconds)
+        rem = min(float(poll_seconds or 1.0), max(0.05, deadline - time.time()))
+        try:
+            import permissions as _perm
+            _perm.wait_for_activity(timeout=rem)
+        except Exception:
+            time.sleep(rem)

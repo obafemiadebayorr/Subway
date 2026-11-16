@@ -416,7 +416,8 @@ def _local_view(client: Dict[str, Any], refresh: bool) -> Dict[str, Any]:
     running = bool(data.get("running"))
     client["dispatchable"] = client["dispatchable"] and running
     room = max(0, _s.local_room(data)) if data.get("memory") else 0
-    models = [dict(m, fits=_s.local_fit(m["name"], data)[0]) for m in data.get("models") or []]
+    _ws = _s._all_workers() if data.get("models") else []
+    models = [dict(m, fits=_s.local_fit(m["name"], data, workers=_ws)[0]) for m in data.get("models") or []]
     note = "No session or weekly limit. Memory is the limit." if running else "Start Ollama to use local models."
     state = "loading" if is_loading else ("stale" if is_stale else ("live" if running else "unavailable"))
     return {"plan": (data.get("profile") or {}).get("tier", ""), "state": state,
@@ -538,6 +539,9 @@ def discover_connected_providers(refresh: bool = True) -> List[Dict[str, Any]]:
     for cid in custom_ids:
         if cid not in keys:
             keys.append(cid)
+    for pid in list(names):
+        if pid not in keys:
+            keys.append(pid)
 
     def _build_provider_view(key: str) -> Optional[Dict[str, Any]]:
         client = clients.get(key)

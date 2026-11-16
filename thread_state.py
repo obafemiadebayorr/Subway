@@ -14,12 +14,10 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-try:
-    import fcntl
-except ImportError:  # Windows: atomic replace still protects readers; the lock is best-effort.
-    fcntl = None  # type: ignore[assignment]
+import win_lock
 
 ACTIONS = {"pin", "settle", "snooze", "archive", "rename", "tag", "delete", "principal", "set_principal", "auto_handoff"}
+_LIVE_WORKER_STATES = {"pending_approval", "queued", "starting", "running", "waiting", "paused", "blocked"}
 _META_KEYS = (
     "pinned",
     "settled",
@@ -62,14 +60,12 @@ def _locked(base_dir: str):
     os.makedirs(base_dir, exist_ok=True)
     fd = os.open(_lock_path(base_dir), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        if fcntl is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_EX)
+        with contextlib.suppress(OSError):  # best-effort lock, as before
+            win_lock.lock(fd, nonblock=True)
         yield
     finally:
-        if fcntl is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            win_lock.unlock(fd)
         os.close(fd)
 
 
@@ -201,7 +197,7 @@ def _rebind_thread_wake_spools(base_dir: str, thread_id: str, old_principal: str
                         wdata = json.load(f)
                     if isinstance(wdata, dict):
                         w_thread = str(wdata.get("thread_root") or wdata.get("thread") or "")
-                        if w_thread == thread_id or fname[:-5] == thread_id:
+                        if (w_thread == thread_id or fname[:-5] == thread_id) and str(wdata.get("status") or "") in _LIVE_WORKER_STATES:
                             wdata["launched_by"] = new_principal
                             wdata["principal_id"] = new_principal
                             tmp = f"{fpath}.{os.getpid()}.{time.time_ns()}.tmp"
@@ -360,8 +356,9 @@ def _send_principal_delta_briefing(
     workers: Optional[List[str]] = None,
     leases: Optional[List[str]] = None,
     permissions: Optional[List[str]] = None,
+    since: float = 0.0,
 ) -> bool:
-    """Move 4: Deliver a concise handoff briefing note (≤ 400 tokens / 1600 chars) via t_send_note."""
+    """Move 4: Deliver a concise handoff briefing note (≤ 400 tokens / 2400 chars) via t_send_note."""
     if not new_principal:
         return False
     w_list = workers or []
@@ -379,11 +376,95 @@ def _send_principal_delta_briefing(
     if p_list:
         brief_lines.append(f"Pending Permissions ({len(p_list)}): {', '.join(p_list[:5])}")
 
-    briefing = "\n".join(brief_lines)[:1600]
+    # a) Outgoing chat digest
+    if old_principal:
+        try:
+            from cli_tools import chats as _chats
+            dig = _chats.t_read_chat(old_principal, mode="decisions", turns=6, max_chars=900)
+            if isinstance(dig, str) and dig and not dig.startswith("Error") and not dig.startswith("[ERROR]"):
+                brief_lines.append(f"What {old_principal} did:\n{dig.strip()[:900]}")
+        except Exception:
+            pass
+
+    # b) Finished workers in the window
+    try:
+        from datetime import datetime, timezone
+        wdir = os.path.join(base_dir, "workers")
+        finished = []
+        for wpath in glob.glob(os.path.join(wdir, "*.json")):
+            try:
+                with open(wpath, "r", encoding="utf-8") as wf:
+                    wrec = json.load(wf)
+            except Exception:
+                continue
+            if not isinstance(wrec, dict):
+                continue
+            troot = str(wrec.get("thread_root") or wrec.get("thread") or "")
+            if troot != thread_id:
+                continue
+            if str(wrec.get("status") or "") not in ("completed", "failed", "stopped"):
+                continue
+            ca = wrec.get("completed_at")
+            if ca is None:
+                continue
+            ts = None
+            if isinstance(ca, (int, float)):
+                ts = float(ca)
+            elif isinstance(ca, str):
+                try:
+                    ts = datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    ts = None
+                if ts is None:
+                    try:
+                        ts = datetime.strptime(ca.rstrip("Z"), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+                    except Exception:
+                        ts = None
+            if ts is None or ts < since - 1.0:
+                continue
+            finished.append((ts, wrec))
+        finished.sort(key=lambda x: x[0], reverse=True)
+        if finished:
+            lines = ["Workers finished meanwhile:"]
+            for _, wrec in finished:
+                wid = str(wrec.get("id") or "?")
+                role = str(wrec.get("role") or "")
+                status = str(wrec.get("status") or "")
+                detail = str(wrec.get("report") or wrec.get("reason") or "").splitlines()[0][:140]
+                if detail:
+                    lines.append(f"- {wid} {role}: {status} · {detail}")
+                else:
+                    lines.append(f"- {wid} {role}: {status}")
+            full_workers_block = "\n".join(lines)
+            if len("\n".join(brief_lines)) + 1 + len(full_workers_block) > 6000:
+                compact = ["Workers finished meanwhile:"]
+                shown = 0
+                for _, wrec in finished:
+                    wid = str(wrec.get("id") or "?")
+                    status = str(wrec.get("status") or "")
+                    entry = f"- {wid}: {status}"
+                    if len("\n".join(brief_lines + compact + [entry])) > 5800:
+                        break
+                    compact.append(entry)
+                    shown += 1
+                rem = len(finished) - shown
+                if rem > 0:
+                    compact.append(f"+{rem} more")
+                brief_lines.append("\n".join(compact))
+            else:
+                brief_lines.append(full_workers_block)
+    except Exception:
+        pass
+
+    cap = min(6000, max(2400, 2400 + 200 * len(w_list)))
+    briefing = "\n".join(brief_lines)[:cap]
 
     try:
         import server as _s
-        _s.t_send_note(to=new_principal, text=briefing)
+        try:
+            _s.t_send_note(to=new_principal, text=briefing, _wake_offline=False)
+        except TypeError:
+            _s.t_send_note(to=new_principal, text=briefing)
         return True
     except Exception:
         # Fallback to direct inbox file write if server tool dispatch isn't available
@@ -410,8 +491,12 @@ def set_principal(
     note: str = "",
     auto_handoff: Optional[bool] = None,
     base_dir: Optional[str] = None,
+    brief: Any = True,
 ) -> Dict[str, Any]:
-    """Transfer principal baton to principal_id for thread_id, executing the Four Moves."""
+    """Transfer principal baton to principal_id for thread_id, executing the Four Moves.
+
+    brief="auto" sends the Move 4 briefing only when workers, leases or permissions actually moved
+    (a provider swap carries the conversation itself; a bare note would derail the new session)."""
     tid = str(thread_id or "").strip()
     pid = str(principal_id or "").strip()
     if not tid:
@@ -430,6 +515,7 @@ def set_principal(
             entry["auto_handoff"] = bool(auto_handoff)
 
         history = list(entry.get("principal_history") or [])
+        since = float(history[-1]["at"]) if history else 0.0
         history.append({
             "from_principal": old_principal,
             "to_principal": pid,
@@ -452,9 +538,11 @@ def set_principal(
     migrated_leases = _migrate_thread_file_leases(bdir, tid, old_principal, pid)
 
     # Move 4: Deliver delta briefing
-    briefing_sent = _send_principal_delta_briefing(
+    moved_any = bool(rebound_workers or migrated_leases or rerouted_perms)
+    briefing_sent = False if (brief is False or (brief == "auto" and not moved_any)) else _send_principal_delta_briefing(
         bdir, tid, old_principal, pid, note=note,
         workers=rebound_workers, leases=migrated_leases, permissions=rerouted_perms,
+        since=since,
     )
 
     result = f"Principal set to {pid}" if pid else "Principal cleared"

@@ -723,13 +723,33 @@ def restart_iteration(iteration_id: str, **overrides) -> Dict[str, Any]:
         return state
 
 
-def t_spin_iteration(task: str, participants: Any, threshold: float = 0.85, max_rounds: int = 4,
+def _iteration_settings(threshold, max_rounds, stall_rounds, round_seconds, round_tokens):
+    """Fill omitted iteration knobs from Settings > Workers > Delegation. Returns (error, values)."""
+    from hud_server import settings_api as _sa
+    cfg = _sa.load_config()
+    if "mesh" not in (_sa.value("delegation.shapes", cfg) or []):
+        return "Error: iteration (mesh shape) is turned off in Settings > Workers > Delegation.", None
+    if threshold is None:
+        threshold = _sa.value("iteration.threshold_pct", cfg) / 100.0
+
+    def pick(given, key):
+        return _sa.value(key, cfg) if given is None else given
+
+    return "", (threshold, pick(max_rounds, "iteration.max_rounds"), pick(stall_rounds, "iteration.stall_rounds"),
+                pick(round_seconds, "iteration.round_seconds"), pick(round_tokens, "iteration.round_tokens"))
+
+
+def t_spin_iteration(task: str, participants: Any, threshold: Any = None, max_rounds: Any = None,
                      rubric: str = "", track: str = "main", budget_per_phase: float = 0,
-                     project_dir: str = "", stall_rounds: int = 2,
-                     round_seconds: int = 600, round_tokens: int = 350000,
+                     project_dir: str = "", stall_rounds: Any = None,
+                     round_seconds: Any = None, round_tokens: Any = None,
                      overseer: Any = None,
                      overseer_provider: str = "", overseer_model: str = "", overseer_effort: str = "") -> str:
     """Run the same task across 2-4 participants who critique and improve on one another's work."""
+    err, vals = _iteration_settings(threshold, max_rounds, stall_rounds, round_seconds, round_tokens)
+    if err:
+        return err
+    threshold, max_rounds, stall_rounds, round_seconds, round_tokens = vals
     task = (task or "").strip()
     if not task:
         return "Error: task is required."

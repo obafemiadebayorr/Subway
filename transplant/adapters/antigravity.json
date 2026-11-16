@@ -1,0 +1,58 @@
+{
+  "id": "antigravity",
+  "store": {
+    "kind": "sqlite",
+    "path": [
+      "{home}/.gemini/antigravity-cli/conversations/{session_id}.db"
+    ],
+    "fingerprint": {
+      "sqlite_tables": [
+        "trajectory_meta",
+        "steps",
+        "executor_metadata",
+        "trajectory_metadata_blob"
+      ]
+    }
+  },
+  "hook": "antigravity_store",
+  "detect": {
+    "binary": [
+      "agy"
+    ],
+    "version_cmd": [
+      "{bin}",
+      "--version"
+    ]
+  },
+  "resume": {
+    "argv": [
+      "{bin}",
+      "--conversation",
+      "{session_id}",
+      "--print",
+      "{text}",
+      "--output-format",
+      "text",
+      "--print-timeout",
+      "0"
+    ],
+    "model_flag": [
+      "--model",
+      "{model}"
+    ],
+    "effort_flag": [
+      "--effort",
+      "{effort}"
+    ]
+  },
+  "context_tokens": {
+    "default": 1000000
+  },
+  "write": {
+    "session_id": "uuid4"
+  },
+  "probe": {
+    "ask": "Reply with only the exact text of my previous message, nothing else."
+  },
+  "notes": "Measured 2026-11-15 on the Antigravity CLI (agy). Store: one SQLite file per conversation at ~/.gemini/antigravity-cli/conversations/<conversation uuid>.db, WAL mode (read through a copy opened with ?immutable=1). Tables: trajectory_meta(trajectory_id, cascade_id=conversation id, trajectory_type, source), steps(idx, step_type, status, ..., metadata, step_payload, step_format), executor_metadata(idx, data), trajectory_metadata_blob(id, data), gen_metadata, parent_references, battle_mode_infos. step_payload is protobuf: field 1 step type (14 user, 15 model reply, 132 tool call), 4 status, 5 step metadata (same bytes as the metadata column: 1 timestamp, 20/2 step index, 20/3 generation index, 35 per-step hex id, 6/7 start/end time), 19 user input (2 text, 3/1 text item, 12 workspace config), 20 model reply (1 and 8 text, 3 reasoning, 14 reasoning signature, 6 bot id, 7 tool call). The write hook clones the newest local conversation as a template, swaps every id and workspace path, replaces only text fields and drops reasoning plus signature. gen_metadata is not written. Resume: agy --conversation <id> --print <text>."
+}

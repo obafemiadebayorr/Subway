@@ -134,9 +134,14 @@ export function startPairingCard() {
   ensureHost();
   poll();
   if (timer) clearInterval(timer);
-  timer = setInterval(poll, POLL_MS);
+  timer = setInterval(poll, Math.max(POLL_MS, 15000));
+  const onPush = () => poll();
+  window.addEventListener("subway:push", onPush);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") poll();
   });
-  return () => clearInterval(timer);
+  return () => {
+    clearInterval(timer);
+    window.removeEventListener("subway:push", onPush);
+  };
 }

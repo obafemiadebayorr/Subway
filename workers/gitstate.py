@@ -58,6 +58,8 @@ def _git_change_fingerprint(project_dir: str) -> Optional[str]:
         raise subprocess.CalledProcessError(status.returncode, status.args, status.stdout, status.stderr)
 
     digest = hashlib.sha256(status.stdout)
+    head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=project_dir, capture_output=True)
+    digest.update(head.stdout)  # committing leaves the tree clean, but HEAD moves
     for args in (["git", "diff", "--binary", "--"], ["git", "diff", "--cached", "--binary", "--"]):
         diff = subprocess.run(args, cwd=project_dir, capture_output=True, check=True)
         digest.update(diff.stdout)

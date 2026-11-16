@@ -158,7 +158,7 @@ def _autostart_hud(port: int = _s.HUD_PORT) -> None:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **_detach_kwargs(),
             cwd=_s.HOME,
             env=env,
         )
@@ -191,9 +191,13 @@ def _cli_path(ed: Dict[str, Any]) -> Optional[str]:
     return None
 
 def _has_extension(cli: str) -> bool:
+    """True only for the current id: the old `subway.subway-context` can't open subway.subway:// links."""
     try:
         res = subprocess.run([cli, "--list-extensions"], capture_output=True, text=True, timeout=5)
-        return res.returncode == 0 and "subway.subway" in (res.stdout or "").lower()
+        if res.returncode != 0:
+            return False
+        ids = {ln.strip().lower().split("@", 1)[0] for ln in (res.stdout or "").splitlines()}
+        return "subway.subway" in ids
     except Exception:
         return False
 
@@ -291,6 +295,59 @@ def _open_hud(port: int) -> None:
                 with contextlib.suppress(Exception):
                     _s.notify_desktop_event("editor_extension_missing|editor", "Subway", _s.EDITOR_HINT["text"][:180])
 
+def _detach_kwargs() -> Dict[str, Any]:
+    """Popen kwargs that detach the child: process-group/detached flags on Windows, new session on POSIX."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0), "close_fds": True}
+    return {"start_new_session": True}
+
+def _windows_port_pids(port: int) -> Set[int]:
+    """Find listening PIDs for a port on Windows via psutil, falling back to netstat -ano."""
+    pids: Set[int] = set()
+    try:
+        import psutil  # type: ignore
+        for c in psutil.net_connections(kind="inet"):
+            if c.status == "LISTEN" and c.laddr and c.laddr.port == port and c.pid:
+                pids.add(int(c.pid))
+        return pids
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                # TCP    127.0.0.1:8080    0.0.0.0:0    LISTENING    1234
+                if len(parts) >= 5 and parts[3].upper() == "LISTENING" and parts[1].rsplit(":", 1)[-1] == str(port):
+                    if parts[4].isdigit():
+                        pids.add(int(parts[4]))
+    except Exception:
+        pass
+    return pids
+
+def _terminate_pid(pid: int, hard: bool = False) -> None:
+    """Terminate/kill a PID, using signal on POSIX and psutil/taskkill on Windows."""
+    if sys.platform == "win32":
+        try:
+            import psutil  # type: ignore
+            proc = psutil.Process(pid)
+            proc.kill() if hard else proc.terminate()
+            return
+        except Exception:
+            pass
+        try:
+            cmd = ["taskkill", "/PID", str(pid), "/T"]
+            if hard:
+                cmd.append("/F")
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except Exception:
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
+    except OSError:
+        pass
+
 def t_start_hud(port: int = 0) -> str:
     """Start the Live HUD as its own process, so it outlives any one agent window."""
     port = int(port or _s.HUD_PORT)
@@ -301,7 +358,7 @@ def t_start_hud(port: int = 0) -> str:
         return f"Port {port} is held by an older HUD (v{probe.get('version', '?')}). Stop it, then start again."
     subprocess.Popen([sys.executable, os.path.abspath(_s.__file__), "hud", str(port)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True, cwd=_s.HOME, env=dict(os.environ, SUBWAY_PROJECT_DIR=os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()))
+                     **_detach_kwargs(), cwd=_s.HOME, env=dict(os.environ, SUBWAY_PROJECT_DIR=os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()))
     deadline = time.time() + 5
     while time.time() < deadline:
         if _s._hud_probe(port):
@@ -351,14 +408,20 @@ def _stop_hud_on_port(port: int) -> None:
         except Exception:
             pass
 
+    if sys.platform == "win32":
+        pids_to_kill |= _windows_port_pids(port)
+
     my_pid = os.getpid()
     for pid in pids_to_kill:
         if pid == my_pid or pid <= 1:
             continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        if sys.platform == "win32":
+            _terminate_pid(pid)
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
     deadline = time.time() + 2.5
     while time.time() < deadline:
@@ -368,8 +431,11 @@ def _stop_hud_on_port(port: int) -> None:
     else:
         for pid in pids_to_kill:
             if pid != my_pid and pid > 1:
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    _terminate_pid(pid, hard=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        os.kill(pid, signal.SIGKILL)
         time.sleep(0.2)
 
 def t_restart_hud(port: int = 0) -> str:
@@ -383,7 +449,7 @@ def t_restart_hud(port: int = 0) -> str:
 
     subprocess.Popen([sys.executable, os.path.abspath(_s.__file__), "hud", str(port)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True, cwd=_s.HOME, env=dict(os.environ, SUBWAY_PROJECT_DIR=os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()))
+                     **_detach_kwargs(), cwd=_s.HOME, env=dict(os.environ, SUBWAY_PROJECT_DIR=os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()))
     deadline = time.time() + 5
     while time.time() < deadline:
         if _s._hud_probe(port):
@@ -406,12 +472,37 @@ def start_hud_server(port: int = _s.HUD_PORT, daemon: bool = True) -> Optional[h
     if not _s._sampler_running:
         _s._sampler_running = True
         threading.Thread(target=_s._sampler_loop, daemon=True).start()
+    # Warm the skill index (dynamic discovery takes ~2s) so the first list/borrow and peer route is instant.
+    def _warm_skills() -> None:
+        try:
+            import skills as _skills
+            _skills.index_skills(refresh=True)
+        except Exception as e:
+            _s.log(f"skill index warm-up failed: {e}")
+    threading.Thread(target=_warm_skills, daemon=True).start()
     # /api/events reads a file spool so events produced by other processes (the MCP
     # server, workers) actually reach subscribers. One tailer per HUD process.
     if not getattr(_s, "_sse_tailer_started", False):
         _s._sse_tailer_started = True
         sse_stream.add_spool_listener(_hud_data.patch_cached_worker)
         sse_stream.start_spool_tailer()
+    try:
+        from hud_server import tunnel_supervisor
+        tunnel_supervisor.start(port, _s._load_json("config.json"), _s.log)
+    except Exception as e:  # the HUD must start even if the tunnel can't
+        _s.log(f"Subway Tunnel supervisor not started: {e}")
+    try:
+        from hud_server import peer_watch
+        if not os.environ.get("SUBWAY_WORKER"):
+            peer_watch.start(_s.log)
+    except Exception as e:
+        _s.log(f"Peer watch not started: {e}")
+    try:
+        from hud_server import media_watch
+        if not os.environ.get("SUBWAY_WORKER"):
+            media_watch.start(_s.log)
+    except Exception as e:
+        _s.log(f"Media watch not started: {e}")
     _s.log(f"Subway Live HUD running at {_s._hud_url(port)}")
     return httpd
 

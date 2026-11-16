@@ -165,10 +165,24 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     scale = _s._scale_of(text)
     bulk = scale >= 100 and _s._has_any(text, _s.BULK_WORDS)
     skill, skill_from = _s._skill_for(role, prompt)
-    if private or _s._has_any(text, _s.PRIVATE_WORDS):
-        local_model = _s.choose_local_model(need_tools=False) or "local"
-        return {"order": ["local"], "picks": [{"provider": "local", "model": local_model}], "tier": c["tier"], "effort": c["effort"],
-                "private": True, "skill": skill, "reason": "Private data, so it stays on this machine."}
+    config = _s._load_json("config.json")
+    privacy_mode = str(config.get("private_routing", "auto")).lower()
+    if privacy_mode not in ("local_only", "auto", "off"):
+        privacy_mode = "auto"
+    import privacy
+    assessment = privacy.assess(prompt) if privacy_mode != "off" else {"private": False, "reason": "", "kind": "none"}
+    explicit_private = bool(private)
+    privacy_flagged = explicit_private or (privacy_mode != "off" and assessment["private"])
+    private_reason = "explicit private flag" if explicit_private else (assessment["reason"] if privacy_flagged else "")
+    private_kind = "explicit_phrase" if explicit_private else (assessment["kind"] if privacy_flagged else "none")
+    local_model = _s.choose_local_model(need_tools=False) if privacy_flagged else None
+    force_local = privacy_flagged and (
+        explicit_private or privacy_mode in ("local_only", "off") or bool(local_model)
+    )
+    if force_local:
+        return {"order": ["local"], "picks": [{"provider": "local", "model": local_model or "local"}], "tier": c["tier"], "effort": c["effort"],
+                "private": True, "private_reason": private_reason, "private_kind": private_kind, "skill": skill,
+                "reason": "Private task routed to local models."}
 
     tier = "frontier" if god else c["tier"]
     need = _s.TIER_STRENGTH[tier]
@@ -177,7 +191,10 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
     providers = providers if providers is not None else _s.discover_connected_providers()
     usable = {p["id"] for p in providers if (p.get("client") or {}).get("dispatchable")}
     stats = _s._load_model_stats()
-    raw_weights = _s.load_routing_weights() if hasattr(_s, "load_routing_weights") else {}
+    from hud_server import settings_api as _shapes
+    # Adaptive shape off: route on static ranks only; t_routing_weights still reports the weights.
+    raw_weights = (_s.load_routing_weights() if hasattr(_s, "load_routing_weights") and _shapes.shape_enabled("adaptive")
+                   else {})
     learned_edges = raw_weights.get("edges", {}) if isinstance(raw_weights, dict) else {}
     raw_copilot = _s._copilot_raw()
     copilot_limited = False
@@ -393,7 +410,8 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
         reason = f"{tier.capitalize()} {skill} task, with skill taken from {skill_from}. {label} is " + \
                  ("the strongest available." if need >= 4 else "the cheapest good enough, saving stronger allowances.")
     return {"order": list(dict.fromkeys(p["provider"] for p in picks)), "picks": picks, "tier": tier, "effort": c["effort"],
-            "private": False, "skill": skill, "reason": reason}
+            "private": privacy_flagged, "private_reason": private_reason, "private_kind": private_kind,
+            "skill": skill, "reason": reason}
 
 def t_routing_weights(role: str = "", complexity: str = "") -> str:
     """Return learned routing weights, run counts, and last explanation for matching roles and tiers."""
@@ -490,7 +508,10 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         return cmd
 
     if provider == "claude":
-        cmd = [bin_path, "--model", model, "--effort", effort, "--output-format", "stream-json", "--verbose"]
+        cmd = [bin_path, "--model", model]
+        if effort:  # Only send --effort when the model actually has levels.
+            cmd.extend(["--effort", effort])
+        cmd.extend(["--output-format", "stream-json", "--verbose"])
         if thread_id:
             cmd.extend(["--resume", thread_id])
         if "browser" in caps:

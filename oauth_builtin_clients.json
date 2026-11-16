@@ -1,0 +1,7 @@
+{
+  "https://github.com/login/oauth": {
+    "client_id": "",
+    "flow": "device",
+    "note": "Subway's GitHub OAuth App, device flow on. Its client ID is public, not a secret. Paste it here once registered."
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "stream_flags": {
+    "pi": ["--mode", "json"],
+    "claude": ["--output-format", "stream-json", "--include-partial-messages", "--verbose"],
+    "opencode": ["--format", "json"]
+  },
+  "stream_kind": {
+    "pi": "event_delta",
+    "claude": "partial_messages",
+    "opencode": "whole_parts"
+  },
+  "db_sig": {
+    "opencode": {
+      "dir": ["~", ".local", "share", "opencode"],
+      "names": ["opencode.db", "opencode.sqlite", "opencode.sqlite3", "db.sqlite", "opencode"]
+    }
+  },
+  "streaming_ids": ["pi", "claude", "opencode"],
+  "cli_noise_re": "^(pi-deep: using subway config\\b.*|Warning: No project session found with id .*)$"
+}

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -145,17 +146,37 @@ def _theos_uncached() -> Optional[Dict[str, Any]]:
     return _fetch_theos()
 
 
-try:
-    theos_live = _s.ttl_cached(60.0)(_theos_uncached)  # type: ignore[attr-defined]
-except Exception:
-    # Server module unavailable (e.g. standalone script): plain local TTL cache.
-    _cache: Dict[Any, Any] = {}
+# Stale-while-revalidate. The DeepAI API takes up to ~5 s, and this is read while the HUD snapshot
+# is built, so a caller never waits on the network: it gets the last answer (None before the first
+# one arrives, briefly) and an expired answer starts one background refresh.
+_TTL = 60.0
+_FIRST_WAIT = 0.4
+_swr: Dict[str, Any] = {"at": None, "value": None, "busy": False}
+_swr_lock = threading.Lock()
+_swr_done = threading.Event()
 
-    def theos_live() -> Optional[Dict[str, Any]]:
-        now = time.monotonic()
-        hit = _cache.get("v")
-        if hit and now - hit[0] < 60.0:
-            return hit[1]
+
+def _swr_refresh() -> None:
+    try:
         value = _theos_uncached()
-        _cache["v"] = (now, value)
-        return value
+        with _swr_lock:
+            _swr["value"], _swr["at"] = value, time.monotonic()
+    finally:
+        with _swr_lock:
+            _swr["busy"] = False
+        _swr_done.set()
+
+
+def theos_live() -> Optional[Dict[str, Any]]:
+    with _swr_lock:
+        fresh = _swr["at"] is not None and time.monotonic() - _swr["at"] < _TTL
+        start = not fresh and not _swr["busy"]
+        if start:
+            _swr["busy"] = True
+        first = _swr["at"] is None
+    if start:
+        threading.Thread(target=_swr_refresh, name="theos-refresh", daemon=True).start()
+    if first:
+        _swr_done.wait(_FIRST_WAIT)
+    with _swr_lock:
+        return _swr["value"]

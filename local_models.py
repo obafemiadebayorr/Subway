@@ -23,10 +23,13 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 sys.modules.setdefault("server", sys.modules[__name__])  # one module object when run as a script
+
+FREE_MODEL_IDS = frozenset({"big-pickle"})  # OpenCode models that are free despite no "free" in the name
 import tempfile
 import threading
 try:
@@ -91,6 +94,26 @@ def benchmark_strengths(rows: List[Dict[str, Any]], models: List[Dict[str, Any]]
     """Map models to benchmark strength (1-5) based on leaderboard rating."""
     matched_ratings: Dict[str, float] = {}
 
+    known_suffixes: Set[str] = set()
+    model_ids = {str(m.get("model") or "").lower().strip() for m in models if m.get("model")}
+    for m in models:
+        for eff in (m.get("efforts") or []):
+            if isinstance(eff, str) and eff.strip():
+                known_suffixes.add(eff.strip().lower())
+    for mid in model_ids:
+        if "-" in mid:
+            parts = mid.split("-")
+            for i in range(1, len(parts)):
+                base = "-".join(parts[:i])
+                if base in model_ids:
+                    known_suffixes.add(parts[-1])
+                    known_suffixes.add("-".join(parts[i:]))
+
+    suffix_re = (
+        re.compile(r"-(?:" + "|".join(re.escape(s) for s in sorted(known_suffixes, key=len, reverse=True)) + r")$")
+        if known_suffixes else None
+    )
+
     def matches_model(m_id: str, row_name: str) -> bool:
         r = row_name.lower().strip()
         m = m_id.lower().strip()
@@ -107,25 +130,27 @@ def benchmark_strengths(rows: List[Dict[str, Any]], models: List[Dict[str, Any]]
             r_vers = re.findall(r"\d+(?:\.\d+)?", r)
             if m_vers and r_vers and set(m_vers).isdisjoint(set(r_vers)):
                 return False
-            clean_m = re.sub(r"-(?:low|medium|high|preview|thinking|latest)$", "", m)
-            clean_r = re.sub(r"-(?:low|medium|high|preview|thinking|latest)$", "", r)
+            clean_m = suffix_re.sub("", m) if suffix_re else m
+            clean_r = suffix_re.sub("", r) if suffix_re else r
             if clean_m in r or clean_r in m:
                 return True
-        if m in ("claude-opus", "opus") or m.startswith("claude-opus-"):
-            return "opus" in r
-        elif m in ("claude-sonnet", "sonnet") or m.startswith("claude-sonnet-"):
-            return "sonnet" in r
-        elif m in ("claude-haiku", "haiku") or m.startswith("claude-haiku-"):
-            return "haiku" in r
-        elif m == "gemini-4-argon" or m.startswith("gemini-4-argon-") or m.startswith("gemini-4-argon"):
-            return "gemini" in r and "argon" in r
-        elif m == "gemini-3.8-flash" or m.startswith("gemini-3.8-flash-") or m.startswith("gemini-3.8-flash"):
-            return "gemini" in r and "flash" in r
+        elif m_id.startswith("claude-") or m.startswith("claude-"):
+            clean_m = suffix_re.sub("", m) if suffix_re else m
+            clean_m_norm = re.sub(r"[\s_\-]+", " ", clean_m).strip()
+            r_norm = re.sub(r"[\s_\-]+", " ", r).strip()
+            fam_match = re.match(r"^claude-([a-z]+)", clean_m)
+            fam = fam_match.group(1) if fam_match else ""
+            return clean_m_norm in r_norm or r_norm in clean_m_norm or (bool(fam) and fam in r_norm)
         elif m_id.startswith("opencode/"):
             clean = m_id[len("opencode/"):]
             if clean.endswith("-free"):
                 clean = clean[:-len("-free")]
             return clean.lower() in r
+        elif m_id.startswith("deepai/"):
+            # pi catalogs the DeepAI models as "deepai/<id>"; benchmark rows use the bare id.
+            clean = re.sub(r"[\s_\-]+", " ", m_id[len("deepai/"):].lower()).strip()
+            row = re.sub(r"[\s_\-]+", " ", r).strip()
+            return bool(clean) and (clean == row or clean in row or row in clean)
         elif "gemma" in m and "gemma" in r:
             clean_m = re.sub(r":latest$", "", m)
             clean_m = re.sub(r"-\d+k$", "", clean_m)
@@ -334,7 +359,7 @@ def _opencode_models(block: bool = True) -> List[str]:
     if has_cache and cache.get("timestamp") and (now - cache["timestamp"] < 86400):
         return cache["models"]
 
-    cached_models = cache["models"] if has_cache else []
+    cached_models = [m for m in cache["models"] if isinstance(m, str) and m.strip()] if has_cache else []
 
     def _refresh() -> List[str]:
         now_ts = time.time()
@@ -346,9 +371,19 @@ def _opencode_models(block: bool = True) -> List[str]:
                 if proc.returncode == 0 and proc.stdout.strip():
                     try:
                         res = json.loads(proc.stdout)
-                        models = [m.get("id") for m in res.get("data", []) if m.get("providerID") == "opencode" and m.get("id")]
+                        models = []
+                        efforts = {}
+                        for m in res.get("data", []):
+                            m_id = m.get("id")
+                            if not m_id or m.get("providerID") != "opencode":
+                                continue
+                            models.append(m_id)
+                            variants = [v.get("id") for v in (m.get("variants") or []) if isinstance(v, dict) and v.get("id")]
+                            efforts[m_id] = variants
+                            provider_id = m.get("providerID") or "opencode"
+                            efforts[f"{provider_id}/{m_id}"] = variants
                         if models:
-                            _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": models})
+                            _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": models, "efforts": efforts})
                             return models
                     except Exception:
                         pass
@@ -358,10 +393,11 @@ def _opencode_models(block: bool = True) -> List[str]:
             try:
                 proc = subprocess.run([binary, "models"], cwd=_s.HOME, capture_output=True, text=True, timeout=10)
                 if proc.returncode == 0:
-                    lines = [line.strip().replace("opencode/", "") for line in proc.stdout.splitlines() if line.strip()]
+                    lines = [l for l in (line.strip().replace("opencode/", "") for line in proc.stdout.splitlines()) if l.strip()]
                     lines = [l for l in lines if not l.startswith("Available") and not l.startswith("Usage:")]
                     if lines:
-                        _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": lines})
+                        old_efforts = cache.get("efforts", {}) if isinstance(cache, dict) else {}
+                        _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": lines, "efforts": old_efforts if isinstance(old_efforts, dict) else {}})
                         return lines
             except Exception:
                 pass
@@ -384,7 +420,8 @@ def _opencode_models(block: bool = True) -> List[str]:
                 con.close()
                 if models:
                     res_models = sorted(models)
-                    _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": res_models})
+                    old_efforts = cache.get("efforts", {}) if isinstance(cache, dict) else {}
+                    _s._save_json("opencode_models.json", {"timestamp": now_ts, "models": res_models, "efforts": old_efforts if isinstance(old_efforts, dict) else {}})
                     return res_models
             except Exception:
                 pass
@@ -428,22 +465,124 @@ def _local_models(block: bool = True) -> List[str]:
     return _refresh()
 
 
+def _claude_account_catalog() -> Dict[str, Any]:
+    """Read Claude Code's per-account model catalog (~/.claude/cache/model-catalog/*-cc.json)."""
+    home = getattr(_s, "HOME", os.path.expanduser("~"))
+    cat_dir = os.path.join(home, ".claude", "cache", "model-catalog")
+    if not os.path.isdir(cat_dir):
+        return {}
+    try:
+        candidates = [
+            os.path.join(cat_dir, fn)
+            for fn in os.listdir(cat_dir)
+            if fn.endswith("-cc.json") or fn.endswith(".json")
+        ]
+        if not candidates:
+            return {}
+        newest = max(candidates, key=lambda p: os.path.getmtime(p))
+        with open(newest, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cfg = (data.get("catalog") or {}).get("config") or {}
+        if isinstance(cfg, dict) and isinstance(cfg.get("models"), list):
+            return cfg
+    except Exception:
+        pass
+    return {}
+
+
 def _claude_models(block: bool = True) -> List[str]:
-    """Return Claude CLI models, cached in SUBWAY_DIR for 24h."""
+    """Return Claude CLI models for the active account/subscription, cached in SUBWAY_DIR for 24h."""
     cache = _s._load_json("claude_models.json")
     now = time.time()
     has_cache = isinstance(cache, dict) and isinstance(cache.get("models"), list)
     if has_cache and cache.get("timestamp") and (now - cache["timestamp"] < 86400):
-        return cache["models"]
+        return list(cache["models"])
 
-    cached_models = cache["models"] if has_cache else []
+    cached_models = list(cache["models"]) if has_cache else []
 
     def _refresh() -> List[str]:
         now_ts = time.time()
+        models: List[str] = []
+        entries: Dict[str, Dict[str, Any]] = {}
+        cfg = _claude_account_catalog()
+        alias_targets = cfg.get("provider_alias_targets") if isinstance(cfg, dict) else {}
+        if not isinstance(alias_targets, dict):
+            alias_targets = {}
+        target_to_alias: Dict[str, str] = {}
+        for alias_name, target_obj in alias_targets.items():
+            if isinstance(target_obj, dict) and isinstance(target_obj.get("default"), str):
+                target_to_alias[target_obj["default"]] = alias_name
+                if alias_name not in models:
+                    models.append(alias_name)
+        for m in (cfg.get("models") or []) if isinstance(cfg, dict) else []:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "").strip()
+            if not mid:
+                continue
+            rt = m.get("runtime") if isinstance(m.get("runtime"), dict) else {}
+            effs = rt.get("effort_levels")
+            eff_list = [str(x) for x in effs] if isinstance(effs, list) else []
+            info = {
+                "id": mid,
+                "name": str(m.get("name") or mid),
+                "short_name": str(m.get("short_name") or ""),
+                "section": str(m.get("section") or ""),
+                "description": str(m.get("description") or ""),
+                "efforts": eff_list,
+                "default_effort": rt.get("default_effort"),
+                "alias": target_to_alias.get(mid, ""),
+            }
+            entries[mid] = info
+            if mid in target_to_alias:
+                entries[target_to_alias[mid]] = dict(info, id=target_to_alias[mid], target=mid)
+            if mid not in models:
+                models.append(mid)
+
         cb = _s.find_claude_binary()
-        if cb:
-            models = ["opus", "sonnet", "haiku"]
-            _s._save_json("claude_models.json", {"timestamp": now_ts, "models": models})
+        if not models and cb:
+            try:
+                target = os.path.realpath(cb)
+                with open(target, "rb") as f:
+                    data = f.read()
+                pos = data.find(b'Fzo={"//":"Hand-maintained')
+                if pos != -1:
+                    end = data.find(b"};function ", pos)
+                    raw = data[pos:end + 1].decode("utf-8", "replace")
+                    for mm in re.finditer(r'\{id:"([^"]+)",family:"([^"]+)",display_name:"([^"]+)".*?capabilities:\[([^\]]*)\]', raw):
+                        mid, _fam, dname, caps_raw = mm.group(1), mm.group(2), mm.group(3), mm.group(4)
+                        caps = {c.strip('"') for c in caps_raw.split(",") if c.strip('"')}
+                        eff_list = []
+                        if "effort" in caps:
+                            eff_list = ["low", "medium", "high"]
+                            if "xhigh_effort" in caps:
+                                eff_list.append("xhigh")
+                            if "max_effort" in caps:
+                                eff_list.append("max")
+                        entries[mid] = {"id": mid, "name": dname, "efforts": eff_list}
+                        if mid not in models:
+                            models.append(mid)
+            except Exception:
+                pass
+
+        try:
+            settings_path = os.path.join(getattr(_s, "HOME", os.path.expanduser("~")), ".claude", "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if isinstance(st, dict):
+                    if isinstance(st.get("model"), str) and st["model"] not in models:
+                        models.append(st["model"])
+                    env_st = st.get("env")
+                    if isinstance(env_st, dict):
+                        for k, v in env_st.items():
+                            if k.startswith("ANTHROPIC_DEFAULT_") and k.endswith("_MODEL") and isinstance(v, str) and v not in models:
+                                models.append(v)
+        except Exception:
+            pass
+
+        if models:
+            _s._save_json("claude_models.json", {"timestamp": now_ts, "models": models, "entries": entries})
             return models
         return cached_models
 
@@ -452,6 +591,192 @@ def _claude_models(block: bool = True) -> List[str]:
         return cached_models
 
     return _refresh()
+
+
+LADDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+PI_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def _claude_efforts(block: bool = True) -> List[str]:
+    """Return Claude CLI effort levels from account catalog or binary, cached for 24h."""
+    cache = _s._load_json("claude_efforts.json")
+    now = time.time()
+    if (isinstance(cache, dict) and isinstance(cache.get("levels"), list) and cache.get("timestamp")
+            and (now - cache["timestamp"] < 86400)):
+        return list(cache["levels"])
+
+    cached_levels = cache.get("levels") if isinstance(cache, dict) and isinstance(cache.get("levels"), list) else []
+
+    def _refresh() -> List[str]:
+        now_ts = time.time()
+        cfg = _claude_account_catalog()
+        vocab = ((cfg.get("settings_vocabulary") or {}).get("effort_level") or {}) if isinstance(cfg, dict) else {}
+        if isinstance(vocab, dict) and vocab:
+            levels = [k for k, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+            if levels:
+                _s._save_json("claude_efforts.json", {"timestamp": now_ts, "levels": levels})
+                return levels
+        cb = _s.find_claude_binary()
+        if not cb:
+            return cached_levels
+        try:
+            target = os.path.realpath(cb)
+            with open(target, "rb") as f:
+                data = f.read()
+            m = re.search(rb"supportedEffortLevels:A\(B\(\[([^\]]+)\]\)\)", data)
+            if m:
+                raw = m.group(1).decode("utf-8", "ignore")
+                levels = [p.strip().strip("'\"") for p in raw.split(",") if p.strip().strip("'\"")]
+                if levels:
+                    _s._save_json("claude_efforts.json", {"timestamp": now_ts, "levels": levels})
+                    return levels
+        except Exception:
+            pass
+        return cached_levels
+
+    if not block:
+        _s._refresh_discovery_background("claude_efforts", _refresh)
+        return cached_levels
+
+    return _refresh()
+
+
+def _provider_alias(provider: str) -> str:
+    return {"claude-code": "claude", "opencode2": "opencode", "agy": "antigravity",
+            "ollama": "local", "github-copilot": "copilot", "deepai": "pi"}.get((provider or "").lower(), (provider or "").lower())
+
+
+def effort_levels(provider: str, model: str) -> Optional[List[str]]:
+    """Return the effort levels a given provider/model supports.
+
+    None = unknown (no discovery data); [] = the model has no effort setting.
+    """
+    p = _provider_alias(provider)
+    m = (model or "").strip()
+    if not m:
+        return []
+    if p == "opencode":
+        _s._opencode_models(block=False)  # trigger background refresh; read cache below
+        cache = _s._load_json("opencode_models.json")
+        efforts = cache.get("efforts") if isinstance(cache, dict) else None
+        if not isinstance(efforts, dict):
+            return None
+        levels = efforts.get(m)
+        if not isinstance(levels, list):
+            levels = efforts.get(f"opencode/{m}")
+        if not isinstance(levels, list):
+            return None
+        return [str(v) for v in levels]
+    if p == "claude":
+        clean_m = re.sub(r"\[1m\]$", "", m, flags=re.IGNORECASE)
+        cm_cache = _s._load_json("claude_models.json")
+        entries = cm_cache.get("entries") if isinstance(cm_cache, dict) else None
+        if isinstance(entries, dict) and clean_m in entries:
+            effs = entries[clean_m].get("efforts")
+            if isinstance(effs, list):
+                return list(effs)
+        cfg = _claude_account_catalog()
+        if cfg:
+            alias_targets = cfg.get("provider_alias_targets") or {}
+            if isinstance(alias_targets.get(clean_m), dict) and alias_targets[clean_m].get("default"):
+                clean_m = alias_targets[clean_m]["default"]
+            for cm in cfg.get("models") or []:
+                if isinstance(cm, dict) and cm.get("id") == clean_m:
+                    rt = cm.get("runtime") or {}
+                    effs = rt.get("effort_levels")
+                    return [str(x) for x in effs] if isinstance(effs, list) else []
+        levels = _claude_efforts(block=False)
+        return levels or None
+    if p == "antigravity":
+        _, effs = _antigravity_base_and_efforts(m)
+        return effs
+    if p == "copilot":
+        for entry in _s._copilot_models(block=False):
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("id") or entry.get("model")
+            if eid != m:
+                continue
+            re_ = entry.get("reasoning_effort")
+            if isinstance(re_, list):
+                return [str(v) for v in re_]
+            caps = entry.get("capabilities")
+            supports = caps.get("supports") if isinstance(caps, dict) else None
+            if isinstance(supports, dict) and isinstance(supports.get("reasoning_effort"), list):
+                return [str(v) for v in supports["reasoning_effort"]]
+            return []
+        return None
+    if p == "pi":
+        return list(PI_THINKING)
+    return None
+
+
+def resolve_effort(provider: str, model: str, requested: str) -> Dict[str, Any]:
+    """Map a requested effort level (already resolved from "auto") onto what the
+    model actually offers.
+
+    Returns {effort, model, note}: effort "" means send no effort at all;
+    for antigravity, model becomes the sibling id matching the chosen level.
+    """
+    p = _provider_alias(provider)
+    m = (model or "").strip()
+    req = (requested or "").strip()
+    levels = effort_levels(p, m)
+    ladder_order = {name: i for i, name in enumerate(LADDER)}
+    ladder_order["off"] = 0  # "off" sits at index 0 alongside "none" (pi's ladder)
+    if levels is None and p == "opencode":
+        # OpenCode rejects a level its model does not offer ("effort not found: max"), so an unknown
+        # model (including "default") gets no effort rather than a guess.
+        return {"effort": "", "model": m, "note": f"effort {req} not sent: {m or 'default'} levels unknown" if req else ""}
+    if levels is None:
+        effort = req if req in LADDER else ("max" if req == "god" else "")
+        return {"effort": effort, "model": m, "note": ""}
+    if not levels:
+        return {"effort": "", "model": m, "note": f"{m} has no effort levels"}
+
+    def _note(chosen: str) -> str:
+        return f"effort {req} → {chosen} ({m} offers {', '.join(levels)})"
+
+    if req == "god" or req not in LADDER:
+        chosen = max(levels, key=lambda s: ladder_order.get(s, len(LADDER)))
+    elif req in levels:
+        chosen = req
+    else:
+        req_i = ladder_order[req]
+        # Nearest offered level by ladder index; ties go up.
+        chosen = min(levels, key=lambda s: (abs(ladder_order.get(s, len(LADDER)) - req_i), -ladder_order.get(s, len(LADDER))))
+    out_model = m
+    if p == "antigravity" and chosen:
+        base, _ = _antigravity_base_and_efforts(m)
+        sibling = f"{base}-{chosen}"
+        known = [mid for mid in _s._discovered_model_ids("antigravity", block=False) if mid == sibling]
+        if known:
+            out_model = sibling
+    note = _note(chosen) if chosen != req else ""
+    return {"effort": chosen, "model": out_model, "note": note}
+
+
+def _antigravity_base_and_efforts(model: str) -> Tuple[str, Optional[List[str]]]:
+    """Return (base_model_id, efforts) for an Antigravity model ID or base family."""
+    m = (model or "").strip()
+    if not m or m == "inherit":
+        return m, []
+    discovered = _s._discovered_model_ids("antigravity", block=False)
+    if not discovered:
+        return m, None
+    ladder_order = {name: i for i, name in enumerate(LADDER)}
+    ladder_order["off"] = 0
+    s1 = [mid[len(m) + 1:] for mid in discovered if mid.startswith(f"{m}-") and "-" not in mid[len(m) + 1:]]
+    if len(s1) >= 2:
+        return m, sorted(set(s1), key=lambda s: (ladder_order.get(s, len(LADDER)), s))
+    if "-" in m:
+        base = m.rsplit("-", 1)[0]
+        s2 = [mid[len(base) + 1:] for mid in discovered if mid.startswith(f"{base}-") and "-" not in mid[len(base) + 1:]]
+        if len(s2) >= 2:
+            return base, sorted(set(s2), key=lambda s: (ladder_order.get(s, len(LADDER)), s))
+    if m in discovered:
+        return m, []
+    return m, None
 
 
 def _cursor_models(block: bool = True) -> List[str]:
@@ -653,12 +978,14 @@ def _copilot_models(block: bool = True) -> List[Dict[str, Any]]:
         sorted_entries = sorted(entries, key=_pref_copilot_key)
         best = sorted_entries[0]
         aliases = [e.get("id") for e in sorted_entries[1:] if e.get("id")]
+        supports = (best.get("capabilities") or {}).get("supports") if isinstance(best.get("capabilities"), dict) else None
         res_entry = {
             "model": best.get("id"),
             "name": best.get("name"),
             "vendor": best.get("vendor"),
             "price_band": best.get("model_picker_price_category"),
             "default": bool(best.get("is_chat_default")),
+            "reasoning_effort": supports.get("reasoning_effort") if isinstance(supports, dict) else None,
         }
         if aliases:
             res_entry["aliases"] = aliases
@@ -722,9 +1049,6 @@ def _validate_model_for_provider(provider: str, model: str) -> Tuple[bool, str, 
     p = {"claude-code": "claude", "opencode2": "opencode", "agy": "antigravity", "ollama": "local", "github-copilot": "copilot", "deepai": "pi"}.get(p, p)
     if p == "antigravity" and m == "inherit":
         return True, "inherit", ""
-    if p in ("copilot", "pi"): return True, m, ""
-    if p == "claude" and m in ("opus", "sonnet", "haiku"):
-        return True, m, ""
 
     available = _s._discovered_model_ids(p, block=False)
     if not available:
@@ -734,20 +1058,18 @@ def _validate_model_for_provider(provider: str, model: str) -> Tuple[bool, str, 
     if m in available:
         return True, m, ""
 
-    # bare family name that matches '<x>-medium' is accepted as that
-    if f"{m}-medium" in available:
-        return True, f"{m}-medium", ""
+    # bare family name: prefer middle effort level if provider exposes efforts
+    effs = effort_levels(p, m) or []
+    if effs:
+        mid = effs[len(effs) // 2]
+        cand_mid = f"{m}-{mid}"
+        if cand_mid in available:
+            return True, cand_mid, ""
+    for cand in available:
+        if cand.startswith(f"{m}-"):
+            return True, cand, ""
 
-    prov_label = {
-        "antigravity": "Antigravity",
-        "claude": "Claude",
-        "opencode": "OpenCode",
-        "copilot": "Copilot",
-        "pi": "Pi (DeepAI)",
-        "cursor": "Cursor",
-        "devin": "Devin",
-        "local": "Local",
-    }.get(p, p.capitalize())
+    prov_label = p.replace("-", " ").title()
 
     matches = difflib.get_close_matches(m, available, n=1, cutoff=0.4)
     did_you_mean = f" Did you mean '{matches[0]}'?" if matches else ""
@@ -823,7 +1145,7 @@ class DynamicModelCatalog:
         key = f"{provider}:{model_id}"
         is_free_tier = (
             "free" in model_id.lower()
-            or model_id == "big-pickle"
+            or model_id in FREE_MODEL_IDS
             or (provider in ("pi", "deepai") and _is_pi_model_free(model_id))
         )
         rec = models.get(key) or {
@@ -883,14 +1205,50 @@ def get_edge_endpoints() -> List[Dict[str, Any]]:
                 "name": str(item.get("name") or "edge").strip(),
                 "base_url": str(item.get("base_url")).rstrip("/"),
                 "api_key": str(item.get("api_key") or "").strip(),
-                "model": str(item.get("model") or "").strip()
+                "model": str(item.get("model") or "").strip(),
+                "telemetry": item.get("telemetry") if isinstance(item.get("telemetry"), dict) else None,
             })
     return endpoints
 
 
+def edge_telemetry_ok(telemetry: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """May a remote edge station receive work this Mac started?
+
+    A phone on 5G in a pocket must not become an Ollama node: it may take work only while
+    charging, thermally nominal, and on wifi. Unknown telemetry is a no, so silence never
+    looks like consent, and the reason names the first field that failed.
+    """
+    if not isinstance(telemetry, dict) or not telemetry:
+        return False, "no telemetry reported"
+    state = str(telemetry.get("battery_state") or "").strip().lower()
+    charging = telemetry.get("charging") is True or state == "charging"
+    if not charging:
+        return False, "battery is unplugged"
+    thermal = str(telemetry.get("thermal_state") or "").strip().lower()
+    if thermal != "nominal":
+        return False, f"thermal state {thermal or 'unknown'}"
+    network = str(telemetry.get("network_type") or "").strip().lower()
+    if network != "wifi":
+        return False, "on cellular" if network == "cellular" else f"network {network or 'unknown'}"
+    if telemetry.get("low_power") is True:
+        return False, "low power mode"
+    return True, "charging, nominal, wifi"
+
+
+def edge_eligible(endpoint: Dict[str, Any]) -> bool:
+    """Convenience: an endpoint entry is eligible only if its telemetry passes."""
+    if not isinstance(endpoint, dict):
+        return False
+    return edge_telemetry_ok(endpoint.get("telemetry"))[0]
+
+
 def _discover_edge_models(timeout: float = 1.0) -> List[Dict[str, Any]]:
-    """Discover models from registered OpenAI-compatible edge endpoints without blocking."""
-    endpoints = get_edge_endpoints()
+    """Discover models from registered OpenAI-compatible edge endpoints without blocking.
+
+    Endpoints that are not charging, nominal and on wifi are skipped: a phone asleep in a
+    pocket must not be asked to answer a model listing.
+    """
+    endpoints = [ep for ep in get_edge_endpoints() if edge_eligible(ep)]
     discovered = []
     for ep in endpoints:
         base_url = ep["base_url"]
@@ -898,7 +1256,7 @@ def _discover_edge_models(timeout: float = 1.0) -> List[Dict[str, Any]]:
         req = urllib.request.Request(url)
         if ep["api_key"]:
             req.add_header("Authorization", f"Bearer {ep['api_key']}")
-        req.add_header("User-Agent", "Subway/1.3.7")
+        req.add_header("User-Agent", "Subway/1.3.8")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -1086,7 +1444,7 @@ def _model_catalog(_stamp: Tuple[float, ...]) -> List[Dict[str, Any]]:
                 "model": oc_model,
                 "source": "default",
             }
-            if "free" in oc_model.lower() or oc_model == "big-pickle":
+            if "free" in oc_model.lower() or oc_model in FREE_MODEL_IDS:
                 entry["free"] = True
             if oc_model == "beam-free" or oc_model.startswith("beam-"):
                 entry["auth_blocked"] = True
@@ -1261,17 +1619,52 @@ def _mark_model_stall_cooldown(model: str, seconds: float = 15 * 60) -> None:
         _s._save_json("stall_cooldowns.json", cooldowns)
 
 
+def _dynamic_suffix_re() -> Optional[re.Pattern]:
+    """Build suffix regex dynamically from discovered model efforts and sibling <base>-<suffix> IDs."""
+    suffixes: Set[str] = set()
+    entries: List[Dict[str, Any]] = []
+    try:
+        entries.extend(_s.model_catalog() or [])
+    except Exception:
+        pass
+    try:
+        entries.extend(getattr(_s, "DEFAULT_MODELS", []) or [])
+    except Exception:
+        pass
+    model_ids: Set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        mid = str(entry.get("model") or "").strip().lower()
+        if mid:
+            model_ids.add(mid.split("/", 1)[1] if "/" in mid else mid)
+        for eff in (entry.get("efforts") or []):
+            if isinstance(eff, str) and eff.strip():
+                suffixes.add(eff.strip().lower())
+    for mid in model_ids:
+        if "-" in mid:
+            parts = mid.split("-")
+            for i in range(1, len(parts)):
+                if "-".join(parts[:i]) in model_ids:
+                    suffixes.add("-".join(parts[i:]))
+                    suffixes.add(parts[-1])
+    if not suffixes:
+        return None
+    return re.compile(r"-(?:" + "|".join(re.escape(s) for s in sorted(suffixes, key=len, reverse=True)) + r")$")
+
+
 def _clear_model_stall_cooldown(model: str) -> None:
     if not model:
         return
     clean = model.split("/", 1)[1] if "/" in model else model
+    suffix_re = _dynamic_suffix_re()
     with _s._state_lock("stall_cooldowns"):
         cooldowns = _s._load_json("stall_cooldowns.json")
         changed = False
         for key in list(cooldowns):
             key_clean = key.split("/", 1)[1] if "/" in key else key
-            base_key = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', key_clean)
-            base_model = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', clean)
+            base_key = suffix_re.sub('', key_clean) if suffix_re else key_clean
+            base_model = suffix_re.sub('', clean) if suffix_re else clean
             if key == model or key_clean == clean or (base_key and base_key == base_model):
                 cooldowns.pop(key, None)
                 changed = True
@@ -1287,22 +1680,114 @@ def _match_bad_entry(bad: Dict[str, Any], model: str) -> Optional[Dict[str, Any]
     clean = model.split("/", 1)[1] if "/" in model else model
     if clean in bad:
         return bad[clean]
+    suffix_re = _dynamic_suffix_re()
+    base_m = suffix_re.sub('', clean) if suffix_re else clean
     for k, v in bad.items():
         k_clean = k.split("/", 1)[1] if "/" in k else k
         if k_clean == clean:
             return v
-        base_k = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', k_clean)
-        base_m = re.sub(r'-(low|medium|high|preview|thinking|latest)$', '', clean)
+        base_k = suffix_re.sub('', k_clean) if suffix_re else k_clean
         if base_k and base_m and base_k == base_m:
             return v
     return None
 
 
+_BAD_FILES: Dict[str, Any] = {"key": None}
+_BAD_STATE_LOCK = threading.Lock()
+_BAD_PIN: Dict[str, Any] = {"depth": 0, "state": None}
+
+
+def _prepare_bad(table: Dict[str, Any]) -> Dict[str, Any]:
+    suffix_re = _dynamic_suffix_re()
+    rows = []
+    for k, v in table.items():
+        k_clean = k.split("/", 1)[1] if "/" in k else k
+        rows.append((k_clean, suffix_re.sub('', k_clean) if suffix_re else k_clean, v))
+    return {"table": table, "rows": rows, "suffix_re": suffix_re}
+
+
+def _match_prepared(prep: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+    """_match_bad_entry on a pre-normalised table: same order and result, no regex per entry."""
+    if not model:
+        return None
+    table = prep["table"]
+    if model in table:
+        return table[model]
+    clean = model.split("/", 1)[1] if "/" in model else model
+    if clean in table:
+        return table[clean]
+    suffix_re = prep.get("suffix_re")
+    base_m = suffix_re.sub('', clean) if suffix_re else clean
+    for k_clean, base_k, v in prep["rows"]:
+        if k_clean == clean or (base_k and base_m and base_k == base_m):
+            return v
+    return None
+
+
+def _bad_files() -> Dict[str, Any]:
+    """bad_models.json and stall_cooldowns.json, parsed and pre-normalised once, reused until either
+    file changes (mtime/size). Writers go through _save_json, which changes the mtime."""
+    def sig(name: str):
+        try:
+            st = os.stat(os.path.join(_s.SUBWAY_DIR, name))
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+    key = (sig("bad_models.json"), sig("stall_cooldowns.json"))
+    with _BAD_STATE_LOCK:
+        if _BAD_FILES["key"] == key:
+            return _BAD_FILES
+    files = {"key": key, "bad": _prepare_bad(_s._load_json("bad_models.json")),
+             "cool": _prepare_bad(_s._load_json("stall_cooldowns.json"))}
+    with _BAD_STATE_LOCK:
+        _BAD_FILES.clear()
+        _BAD_FILES.update(files)
+        return _BAD_FILES
+
+
+def _opencode_exhausted() -> Dict[str, float]:
+    with contextlib.suppress(Exception):
+        return _s._opencode_free_exhausted_models() or {}
+    return {}
+
+
+@contextlib.contextmanager
+def bad_state_pinned():
+    """Within this block (any thread), the OpenCode exhaustion list is read once and reused.
+    A HUD snapshot asks _model_is_bad about each model thousands of times; outside a block
+    every ask reads it live, so routing never sees a stale answer."""
+    with _BAD_STATE_LOCK:
+        if _BAD_PIN["depth"] == 0:
+            _BAD_PIN["state"] = None
+        _BAD_PIN["depth"] += 1
+    try:
+        yield
+    finally:
+        with _BAD_STATE_LOCK:
+            _BAD_PIN["depth"] -= 1
+            if _BAD_PIN["depth"] == 0:
+                _BAD_PIN["state"] = None
+
+
+def _bad_state() -> Dict[str, Any]:
+    files = _bad_files()
+    with _BAD_STATE_LOCK:
+        pinned = _BAD_PIN["depth"] > 0
+        oc = _BAD_PIN["state"] if pinned else None
+    if oc is None:
+        oc = _opencode_exhausted()
+        if pinned:
+            with _BAD_STATE_LOCK:
+                if _BAD_PIN["depth"] > 0 and _BAD_PIN["state"] is None:
+                    _BAD_PIN["state"] = oc
+    return {"bad": files["bad"], "cool": files["cool"], "oc": oc}
+
+
 def _model_is_bad(model: str) -> bool:
     if not model:
         return False
-    bad = _s._load_json("bad_models.json")
-    entry = _s._match_bad_entry(bad, model)
+    st = _bad_state()
+    entry = _match_prepared(st["bad"], model)
     if entry:
         if isinstance(entry, dict) and ("reset_time" in entry or "resets_at" in entry):
             rt = entry.get("reset_time") or entry.get("resets_at")
@@ -1319,17 +1804,16 @@ def _model_is_bad(model: str) -> bool:
                         return True
                 except (TypeError, ValueError):
                     pass
-    cooldowns = _s._load_json("stall_cooldowns.json")
-    cooldown = _s._match_bad_entry(cooldowns, model)
+    cooldown = _match_prepared(st["cool"], model)
     if cooldown:
         try:
             if time.time() < float(cooldown.get("until", 0)):
                 return True
         except (AttributeError, TypeError, ValueError):
             pass
-    with contextlib.suppress(Exception):
-        if _s._is_opencode_model_exhausted(model):
-            return True
+    oc = st["oc"]
+    if model in oc or (model.split("/", 1)[1] if "/" in model else model) in oc:
+        return True
     return False
 
 
@@ -1337,8 +1821,14 @@ def _resolve_agy_model(model: str = "") -> str:
     m = (model or "").strip()
     discovered = _s._discovered_model_ids("antigravity", block=False)
     if m and m != "inherit":
-        if f"{m}-medium" in discovered:
-            return f"{m}-medium"
+        effs = effort_levels("antigravity", m) or []
+        if effs:
+            mid = effs[len(effs) // 2]
+            if f"{m}-{mid}" in discovered:
+                return f"{m}-{mid}"
+        for cand in discovered:
+            if cand.startswith(f"{m}-"):
+                return cand
         return m
     env_m = os.environ.get("ANTIGRAVITY_MODEL") or os.environ.get("AGY_MODEL")
     if env_m:
@@ -1351,7 +1841,7 @@ def _resolve_agy_model(model: str = "") -> str:
             cand = entry.get("model", "")
             if cand and not _s._model_is_bad(cand):
                 return cand
-    return "gemini-4-argon-medium"
+    return discovered[0] if discovered else ""
 
 
 def run_batch(meta: Dict[str, Any], stopped: Dict[str, bool], deadline: Optional[float],
@@ -1635,7 +2125,7 @@ def local_room(data: Dict[str, Any]) -> int:
     return data["memory"]["available"] + loaded - data["profile"]["reserve"]
 
 
-def local_fit(model: str, data: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+def local_fit(model: str, data: Optional[Dict[str, Any]] = None, workers: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, str]:
     data = data or _s._source("local", 5.0).get("data") or {}
     if not data.get("running"):
         return False, "Ollama isn't running."
@@ -1647,7 +2137,7 @@ def local_fit(model: str, data: Optional[Dict[str, Any]] = None) -> Tuple[bool, 
     if cfg.get("local_memory_guard", True) is False or os.environ.get("SUBWAY_LOCAL_MEMORY_GUARD") == "0":
         return True, f"'{name}' runs with the memory guard off (your setting)."
     room = _s.local_room(data)
-    running_local = [w for w in _s._all_workers() if w.get("status") in ("running", "launching", "stopping") and w.get("provider") == "local"]
+    running_local = [w for w in (workers if workers is not None else _s._all_workers()) if w.get("status") in ("running", "launching", "stopping") and w.get("provider") == "local"]
     loaded_names = {m["name"] for m in (data.get("loaded") or [])}
     running_needs = 0
     for w in running_local:
@@ -1786,6 +2276,50 @@ def get_models_track() -> List[Dict[str, Any]]:
     return result
 
 
+def _tcp_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True when a TCP connect to host:port succeeds within timeout."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _app_pi_dir_if_live() -> Optional[str]:
+    """The DeepAI Code app's pi data dir when its local proxy is actually running.
+
+    The app writes ~/.deepai-code/userdata/<app>/pi/<app>/models.json whose
+    providers.deepai.baseUrl points at its own local proxy
+    (http://127.0.0.1:<port>). When that proxy answers, workers must use it:
+    it is the route that completes long sessions, while the direct route gets
+    its streams cut. Returns None when the app is not running (no local proxy
+    listening), so callers fall back to their normal choice.
+
+    Only providers.deepai.baseUrl is read; apiKey values are never touched.
+    """
+    home = getattr(_s, "HOME", os.path.expanduser("~"))
+    pattern = os.path.join(home, ".deepai-code", "userdata", "*", "pi", "*", "models.json")
+    for cand in sorted(glob.glob(pattern)):
+        if not os.path.isfile(cand):
+            continue
+        url = _pi_deepai_base_url(cand)
+        if not url:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+        except Exception:
+            continue
+        if parsed.scheme != "http" or host not in ("127.0.0.1", "localhost"):
+            continue
+        if not port:
+            continue
+        if _tcp_open(host, port):
+            return os.path.dirname(cand)
+    return None
+
+
 def pi_agent_dir() -> str:
     """The DeepAI Code data dir the pi CLI must read to know its provider catalog.
 
@@ -1797,6 +2331,11 @@ def pi_agent_dir() -> str:
     override = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
     if override:
         return os.path.expanduser(override)
+    # The DeepAI Code app's own local proxy is the proven-good route: prefer it
+    # whenever the app is actually running (its proxy answers on 127.0.0.1).
+    live = _app_pi_dir_if_live()
+    if live is not None:
+        return live
     home = getattr(_s, "HOME", os.path.expanduser("~"))
     subway_pi = os.path.join(subway_home.subway_dir(home), "pi")
     if os.path.isfile(os.path.join(subway_pi, "models.json")):
@@ -1806,6 +2345,100 @@ def pi_agent_dir() -> str:
         if os.path.isfile(os.path.join(cand, "models.json")):
             return cand
     return os.path.join(home, ".pi", "agent")
+
+
+def _pi_deepai_base_url(models_json: str) -> Optional[str]:
+    """Read the deepai provider baseUrl from a pi models.json. """
+    try:
+        with open(models_json, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return ""
+    providers = data.get("providers") if isinstance(data, dict) else None
+    deepai = providers.get("deepai") if isinstance(providers, dict) else None
+    url = deepai.get("baseUrl") if isinstance(deepai, dict) else None
+    return str(url).strip() if url else ""
+
+
+def _pi_is_local_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _pi_port_alive(url: str) -> bool:
+    """True when a local proxy answers at url: curl exit 0, or any HTTP status != 000."""
+    try:
+        proc = subprocess.run(["curl", "-s", "-m", "1", "-o", "/dev/null", "-w", "%{http_code}", url],
+                              capture_output=True, text=True, timeout=5)
+    except Exception:
+        return False
+    if proc.returncode == 0:
+        return True
+    code = (proc.stdout or "").strip()
+    return bool(code) and code != "000"
+
+
+def pi_config_dir() -> str:
+    """The pi data dir selected the way bin/pi-deep does when PI_CODING_AGENT_DIR is unset:
+
+    app userdata models.json (newest mtime first; a local proxy baseUrl must answer),
+    else ~/.subway-context/pi when it has models.json, else ~/.pi/agent.
+    """
+    override = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+    if override:
+        return os.path.expanduser(override)
+    home = getattr(_s, "HOME", os.path.expanduser("~"))
+    candidates = glob.glob(os.path.join(home, ".deepai-code", "userdata", "*", "pi", "*", "models.json"))
+    try:
+        candidates.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        candidates.sort()
+    for cand in candidates:
+        if not os.path.isfile(cand):
+            continue
+        url = _pi_deepai_base_url(cand)
+        if not url:
+            continue
+        if _pi_is_local_url(url):
+            if _pi_port_alive(url):
+                return os.path.dirname(cand)
+            continue
+        return os.path.dirname(cand)
+    subway_pi = os.path.join(home, ".subway-context", "pi")
+    if os.path.isfile(os.path.join(subway_pi, "models.json")):
+        return subway_pi
+    return os.path.join(home, ".pi", "agent")
+
+
+def _pi_models_from_models_json(path: str) -> List[Dict[str, Any]]:
+    """Read model ids from a pi models.json: [{"id": "<provider>/<model id>", "name": ...}]."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for prov_name, prov in providers.items():
+        if not isinstance(prov, dict):
+            continue
+        for m in prov.get("models") or []:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id") or m.get("model")
+            if not mid:
+                continue
+            entry: Dict[str, Any] = {"id": f"{prov_name}/{mid}", "name": str(m.get("name") or mid), "provider": str(prov_name)}
+            for key in ("theosPerRequest", "premier", "contextWindow", "reasoning"):
+                if key in m:
+                    entry[key] = m[key]
+            out.append(entry)
+    return out
 
 
 def pi_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1877,6 +2510,8 @@ def _parse_pi_list_models_output(text: str) -> List[Dict[str, Any]]:
         if "provider" in low and "model" in low:
             # split by 2+ spaces to find columns
             parts = [p.strip().lower() for p in re.split(r"\s{2,}", ln.strip()) if p.strip()]
+            if header is not None or "provider" not in parts or "model" not in parts:
+                continue  # prose/doc-path line mentioning both words, not the column header
             for j, p in enumerate(parts):
                 if "provider" in p: col_idx["provider"] = j
                 elif p == "model" or "model" in p: col_idx["model"] = j
@@ -1908,41 +2543,53 @@ def _parse_pi_list_models_output(text: str) -> List[Dict[str, Any]]:
             mid = f"{prov}/{mod}"
         else:
             mid = mod or prov
-        if not mid:
-            continue
+        if not mid or mid.lower().endswith((".md", ".txt", ".json", ".html")) \
+                or not re.fullmatch(r"[A-Za-z0-9][\w.:+@-]*(/[\w.:+@-]+)*", mid):
+            continue  # skips doc/file paths and prose rows
         models.append({"id": mid, "provider": prov or mid.split("/")[0],
                        "context": get("context"), "max_out": get("max_out"),
                        "thinking": get("thinking"), "images": get("images")})
     return models
 
 
+def _pi_cache_is_stale(cached_models: Any, fetched_at: Any) -> bool:
+    """True when the pi_models.json cache is known-bad: doc paths instead of ids, or
+    the pi catalog (models.json) is newer than the cache we fetched."""
+    if isinstance(cached_models, list):
+        for m in cached_models:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "")
+            if mid.startswith("/") or mid.endswith(".md"):
+                return True
+    try:
+        fetched = float(fetched_at or 0)
+    except (TypeError, ValueError):
+        fetched = 0.0
+    try:
+        mtime = os.path.getmtime(os.path.join(pi_config_dir(), "models.json"))
+    except OSError:
+        return False
+    return mtime > fetched
+
+
 def _pi_models(block: bool = True) -> List[Dict[str, Any]]:
-    """Discover pi-coding-agent models via --list-models; cache to pi_models.json. No hardcoded ids."""
+    """Model ids from the pi config selected by pi_config_dir(); cache to pi_models.json."""
     cache = _s._load_json("pi_models.json")
     now = time.time()
-    has_cache = isinstance(cache, dict) and isinstance(cache.get("models"), list) and bool(cache["models"])
+    cache = cache if isinstance(cache, dict) else {}
+    has_cache = isinstance(cache.get("models"), list) and bool(cache["models"])
     cached_models = cache["models"] if has_cache else []
     ttl = 86400
     fetched_at = cache.get("fetched_at") or cache.get("timestamp") or 0
-    if has_cache and fetched_at and (now - float(fetched_at) < ttl):
+    if has_cache and fetched_at and (now - float(fetched_at) < ttl) and not _pi_cache_is_stale(cached_models, fetched_at):
         return cached_models
 
     def _refresh() -> List[Dict[str, Any]]:
-        cmd = _pi_cmd() + ["--list-models"]
-        attempts = [cmd, cmd + ["--mode", "json"]]
-        for attempt in attempts:
-            try:
-                proc = subprocess.run(attempt, cwd=getattr(_s, "HOME", os.path.expanduser("~")),
-                                      capture_output=True, text=True, timeout=20)
-            except Exception:
-                continue
-            if proc.returncode != 0 and not (proc.stdout or "").strip():
-                continue
-            out = (proc.stdout or "") + ("\n" + proc.stderr if not (proc.stdout or "").strip() and proc.stderr else "")
-            models = _parse_pi_list_models_output(out)
-            if models:
-                _s._save_json("pi_models.json", {"fetched_at": time.time(), "models": models})
-                return models
+        models = _pi_models_from_models_json(os.path.join(pi_config_dir(), "models.json"))
+        if models:
+            _s._save_json("pi_models.json", {"fetched_at": time.time(), "models": models})
+            return models
         return cached_models  # stale-cache fallback; failure => [] (via cached_models default)
 
     if not block:

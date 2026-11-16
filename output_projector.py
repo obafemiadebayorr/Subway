@@ -95,7 +95,6 @@ def _filter_fail_output(cmd: str, out: str) -> list[str]:
 
     if is_pytest:
         in_short_summary = False
-        in_assertion = False
         for line in raw_lines:
             if _is_passing_or_progress(line):
                 continue
@@ -133,6 +132,15 @@ def _filter_fail_output(cmd: str, out: str) -> list[str]:
     return filtered
 
 
+def _setting(key: str, default):
+    """A projector setting from the settings contract; the default when it cannot be read."""
+    try:
+        from hud_server import settings_api
+        return settings_api.value(key)
+    except Exception:
+        return default
+
+
 def project(cmd: str, rc: int, out: str, log_id: str = "") -> str:
     if not log_id:
         log_id = f"term_{secrets.token_hex(3)}"
@@ -143,14 +151,18 @@ def project(cmd: str, rc: int, out: str, log_id: str = "") -> str:
     log_file = logs_dir / f"{log_id}.log"
     log_file.write_text(out, encoding="utf-8")
 
+    if not _setting("projector_enabled", True):
+        return out
+
     if rc == 0:
         summary = _parse_pass_summary(cmd, out)
         return f"PASS ({summary}) [full log: {log_id}]"
 
     # rc != 0
     lines = _filter_fail_output(cmd, out)
-    if len(lines) > 40:
-        lines = lines[:40]
+    max_lines = int(_setting("projector_max_lines", 40) or 40)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
 
     trailer = f"[full log: {log_id}; read_terminal(id=\"{log_id}\", mode=\"full\")]"
     if lines:

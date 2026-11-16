@@ -276,12 +276,13 @@ def _provider_budget_reset(provider_id: str) -> Optional[float]:
     return None
 
 
-def enforce_budgets() -> None:
+def enforce_budgets(workers: Optional[List[Dict[str, Any]]] = None) -> None:
     try:
         cfg = _s._load_json("config.json")
         budgets = cfg.get("budgets") or {}
         custom_ids = {p.get("id") for p in _s.load_custom_providers()} if "load_custom_providers" in vars(_s) else set()
-        for w in _s._all_workers():
+        source = workers if workers is not None else _s._all_workers()
+        for w in (source or []):
             if w.get("status") != "running":
                 continue
             prov = (w.get("provider") or "").lower().strip()

@@ -6,6 +6,12 @@ import server as _s
 _WATCH_REPORTED: dict[str, set[str]] = {}
 
 
+def _swarm_prefix(notes):
+    if not notes:
+        return ""
+    return "Swarm retries that left the queue:\n" + "\n".join("- " + n for n in notes) + "\n\n"
+
+
 
 def _format_ended_worker(w: dict) -> str:
     wid = w.get("id", "")
@@ -77,7 +83,12 @@ def t_watch_workers(wait_seconds: int = 50) -> str:
         if time.time() >= deadline:
             break
 
-        time.sleep(1.0)
+        rem = min(1.0, max(0.05, deadline - time.time()))
+        try:
+            import permissions as _perm
+            _perm.wait_for_activity(timeout=rem)
+        except Exception:
+            time.sleep(rem)
     return "Nothing new. Workers are still running."
 
 
@@ -92,6 +103,11 @@ def t_await_worker(worker_id: str = "", timeout_seconds: int = 600) -> str:
         return f"Invalid worker ID `{wid}`. Expected worker_<6 hex>."
     meta = _s.wait_for_worker(wid, timeout_seconds=timeout_seconds)
     status = str(meta.get("status") or "unknown")
+    if not meta.get("wait_timed_out"):
+        waiter = _s._self_id()
+        if waiter and waiter != "unknown" and waiter != wid:
+            import thread_edges
+            thread_edges.edge("waited_on", waiter, wid, {"status": status})
     report = str(meta.get("report") or "").strip()
     lines = [f"# Worker `{wid}`", f"Status: {status}"]
     if meta.get("exit_code") is not None:
@@ -107,7 +123,17 @@ def t_await_worker(worker_id: str = "", timeout_seconds: int = 600) -> str:
 
 def t_worker_status(worker_id: str = "", track: str = "", all: bool = False) -> str:
     """Check the execution status and output tail of worker subagents."""
-    return _s.poll_guard_check("worker_status", worker_id or track, _t_worker_status_impl(worker_id, track, all=all))
+    _swarm_notes = []
+    try:
+        from workers.spawn import retry_swarm_pending
+        _swarm_notes = retry_swarm_pending()
+    except Exception:
+        pass
+    if worker_id:
+        import peers as _peers
+        if _peers.split_worker(worker_id):
+            return _swarm_prefix(_swarm_notes) + _peers.remote_worker_status(worker_id)
+    return _swarm_prefix(_swarm_notes) + _s.poll_guard_check("worker_status", worker_id or track, _t_worker_status_impl(worker_id, track, all=all))
 
 
 def _t_worker_status_impl(worker_id: str = "", track: str = "", all: bool = False) -> str:

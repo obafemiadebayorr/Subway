@@ -28,6 +28,28 @@ When you work across multiple windows (e.g. Antigravity IDE on screen 1, Claude 
 
 ---
 
+## Work Comfortably From Your Favourite IDE
+
+Stay in your groove without context switching. Whether you code inside **Antigravity**, **Claude Code**, **OpenCode**, **Pi**, **GitHub Copilot**, **Cursor**, or your favorite terminal dock, Subway keeps your agents unified in the background:
+
+- **Stay in Your Environment**: Dispatch autonomous workers, coordinate multi-agent threads, and review diffs directly from your preferred editor or terminal without jumping across disconnected apps.
+- **Unified Live HUD**: Monitor real-time fleet health, active worker swarms, approval queues, quotas, and transit lines in an interactive heads-up display while remaining focused in your IDE.
+- **Cross-Agent Decision Sync**: Architectural decisions, file claims, and rationale sync bi-directionally between windows in real time—eliminating context amnesia across tools.
+
+![Subway Live HUD & Fleet Overview](assets/exhibit-hud-overview.png)
+_Subway Live HUD: Unified fleet overview displaying connected agent lines, worker swarms, and system health._
+
+![Subway Worker Dispatch & Execution](assets/exhibit-worker-dispatch.png)
+_Autonomous worker dispatch: Launching and delegating scoped subagent tasks directly from your active editor session._
+
+![Subway Real-Time Decision Sync](assets/exhibit-decision-sync.png)
+_Shared decision tracks: Synchronizing architectural choices, rationale, and file touch manifests across agents without token waste._
+
+![Subway Fleet Thread & Permission Management](assets/exhibit-fleet-management.png)
+_Multi-window coordination: Managing threads, reviewing approvals, and monitoring active file locks across concurrent IDE windows._
+
+---
+
 ## Supported Transit Lines
 
 ![Subway Transit Pipeline](assets/subway-transit-pipeline.svg)
@@ -181,6 +203,14 @@ Subway eliminates raw UUIDs and context jacking with a layered 4-tier naming hie
 
 ---
 
+## Fast Mail vs Direct Chat
+
+Subway separates agent-to-agent mail from direct user-to-agent chat:
+
+- **Fast Mail (`send_note` / `reply_note`)**: Asynchronous agent-to-agent mailbox channel. `send_note` delivers straight into an online agent's chat (`mode="fast"`) or queues it (`mode="normal"`). `reply_note` threads answers, `fastmail_status` tracks each message (queued, delivered, read, replied), and `ask_room` asks every chat in a project at once. Waking an offline chat needs your approval in the HUD. Settings live under `mail.*`; mute noisy stations from the HUD's Fast mail panel.
+- **Direct Chat (`/api/chat`)**: Synchronous user-to-agent chat channel in the HUD. Messages sent via `/api/chat` deliver directly to the target agent session without passing through the Fast Mail queue, and support **background continue** for **OpenCode** and **Claude** chats so you can resume or steer sessions directly from the browser.
+- **Provider swap & live streaming**: You can swap a conversation's provider while keeping it in one HUD tab, and chat replies stream token by token into the HUD panel. The new-chat (+) button opens a fresh chat for the selected provider.
+
 ## Core Tool Reference
 
 Subway exposes MCP tools divided across functional roles:
@@ -281,17 +311,21 @@ Subway provides a central **Workspace Guard** (`~/.subway/locks.json`):
 
 ---
 
-## Live Station Board HUD
+## Live Station Board HUD (`1.3.8`)
 
-Subway includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a cyber-transit dark-mode web dashboard.
+Subway `1.3.8` includes a real-time, interactive **Station Departure Board HUD** available both in the terminal and as a web dashboard.
 
 ### Architecture & Security
 
-- **Native ES Modules**: The HUD lives in the `hud/` folder as native ES modules with **zero build step** (`hud/index.html`, `app.js`, `views.js`, `usage.js`, `lib.js`, `styles.css`).
+- **`hud_next` Default & `/classic`**: `hud_next` is now the default web interface served at `http://127.0.0.1:7890`. The legacy cyber-transit dashboard (`hud/index.html`, `app.js`, `views.js`, `usage.js`, `lib.js`, `styles.css`) remains accessible at `http://127.0.0.1:7890/classic`.
+- **Principal small edits**: Settings → Principal → "Small edits allowed" (`principal_small_edit_lines`, default 0) lets the principal chat make edits of up to that many changed lines itself; 0 keeps every principal edit blocked so work goes to workers.
+- **Multi-Provider HUD Support**: Unified tracking, station browsing, and control across **Claude**, **Pi**, **OpenCode**, **Antigravity**, **Copilot**, **Cursor**, and **Devin**.
+- **Separate Chat & Mail Channels**: The HUD provides both direct chat delivery (`/api/chat`, with background continue for **OpenCode** and **Claude** chats) and the asynchronous **Fast Mail** channel (`send_note` / `reply_note`).
 - **Loopback Only (`127.0.0.1`)**: The HUD server binds strictly to `127.0.0.1` (or `SUBWAY_HUD_PORT`, default 7890). There is deliberately no option to bind to `0.0.0.0` or external network interfaces.
 - **Per-User Authentication Token**: Protected by a random HMAC token stored in `~/.subway/hud_token`. The token is injected into served HTML and validated via the `X-Subway-Token` header on all API calls. Requests missing or mismatched tokens are rejected with `403 Forbidden`.
 - **Live Updates**: HUD updates are pushed the moment a worker or permission changes (`GET /api/events`), about 1 ms locally. Chats still depend on the model taking its turn.
 - **HUD Features**: Displays budget rows with real usage, a reset card that cycles through providers, a spend chart coloured per provider, and worker history pages with Load more.
+- **Low-power mode**: Settings → Appearance → Display (Auto/On/Off) uses a static map and background with no idle animation; Auto enables it for low-resource machines and the map pauses when the tab is hidden or idle.
 - **No Automatic Launch**: To conserve resources, the HUD **no longer starts automatically** when MCP connects. You start it whenever you want via:
   1. The `start_hud` MCP tool
   2. CLI: `subway hud` (or `python3 server.py hud [--open] [port]`)
@@ -299,10 +333,11 @@ Subway includes a real-time, interactive **Station Departure Board HUD** availab
 
 ### Opening the HUD in an IDE Browser
 
-You can open the HUD in your system browser or inside an IDE built-in browser panel (such as VS Code's Simple Browser or Antigravity's webview):
+You can open the HUD (`hud_next` by default, or `/classic` for the classic view) in your system browser or inside an IDE built-in browser panel (such as VS Code's Simple Browser or Antigravity's webview):
 
 ```text
 http://127.0.0.1:7890
+http://127.0.0.1:7890/classic
 ```
 
 #### Custom Allowed Origins (`SUBWAY_HUD_ORIGINS`)
@@ -358,6 +393,7 @@ Subway tracks live rate limits, token usage, and session windows across detected
   - `copilot_inline_monthly_cap`: Monthly allowance cap for inline Copilot calls (default `100`).
   - `copilot_inline_per_worker_cap`: Per-worker cap for inline Copilot calls (default `5`).
   - `reload_gate`: `true` locks dynamic live reload unless `force=True` is explicitly passed.
+  - `mcp_relay`: `true` makes each chat's MCP process a lightweight relay to the running HUD instead of a full server (off by default). Set with `subway settings set mcp_relay true`.
 
 ---
 

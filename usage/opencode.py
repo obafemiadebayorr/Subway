@@ -127,7 +127,30 @@ def _opencode_session_tokens(session_id: str) -> Dict[str, int]:
     return {}
 
 
+_OPENCODE_USAGE_CACHE: Dict[str, Any] = {"sig": None, "at": 0.0, "val": None}
+
+
+def _opencode_usage_sig():
+    path_fn = getattr(_s, "_opencode_db_path", None)
+    db_path = path_fn() if path_fn else os.path.join(getattr(_s, "OPENCODE_DIR", ""), "opencode.db")
+    sig = []
+    for p in (db_path, db_path + "-wal"):
+        try:
+            st = os.stat(p)
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
 def _fetch_opencode_usage() -> Dict[str, Any]:
+    sig = _opencode_usage_sig()
+    cached = _OPENCODE_USAGE_CACHE.get("val")
+    if cached is not None and _OPENCODE_USAGE_CACHE.get("sig") == sig:
+        return dict(cached)
+    now = time.time()
+    if cached is not None and (now - float(_OPENCODE_USAGE_CACHE.get("at") or 0.0)) < 30.0:
+        return dict(cached)
     con = _s._opencode_db()
     if con is None:
         raise RuntimeError("OpenCode has no database yet")
@@ -223,7 +246,11 @@ def _fetch_opencode_usage() -> Dict[str, Any]:
         accounts = 0
         with contextlib.suppress(Exception):
             accounts = con.execute("select (select count(*) from account)+(select count(*) from credential)").fetchone()[0]
-        return {"tokens": tokens, "cost": cost, "model": model, "signed_in": accounts > 0, "limit_hit": limit_hit, "limited": limited, "per_model": per_model}
+        result = {"tokens": tokens, "cost": cost, "model": model, "signed_in": accounts > 0, "limit_hit": limit_hit, "limited": limited, "per_model": per_model}
+        _OPENCODE_USAGE_CACHE["sig"] = sig
+        _OPENCODE_USAGE_CACHE["at"] = time.time()
+        _OPENCODE_USAGE_CACHE["val"] = dict(result)
+        return dict(result)
     finally:
         con.close()
 

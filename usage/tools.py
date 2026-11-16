@@ -149,7 +149,7 @@ def hook_prompt(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     b_state[sid] = crossed
                     _s._save_json("prompt_banner_state.json", b_state)
                     label = "this chat's" if scope == "chat" else "the universal chat"
-                    cmd = f"subway budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" and sid else "")
+                    cmd = "subway budget chat <tokens>" + (f" --chat {sid}" if scope == "chat" and sid else "")
                     notices.append(f"[BUDGET] Warning: {label} budget at {pct:.1f}% ({used:,} of {limit:,} tokens). Add more with: {cmd}, or in the HUD.")
 
     prompt_text = str(event.get("prompt") or "")

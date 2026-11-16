@@ -27,9 +27,11 @@ KINDS = {
     "spawned", "followed", "rerouted", "approved", "rejected", "started", "stopped", "finished",
     "escalated", "permission_asked", "permission_answered", "note", "terminal_run",
     "forked", "resumed", "rewound",
+    "reviewed", "briefed", "handed_off", "waited_on", "merged",
 }
 RECORD_KINDS = KINDS
-EDGE_KINDS = {"spawned", "followed", "rerouted", "note", "terminal_run", "forked", "resumed", "rewound"}
+EDGE_KINDS = {"spawned", "followed", "rerouted", "note", "terminal_run", "forked", "resumed", "rewound",
+              "reviewed", "briefed", "handed_off", "waited_on", "merged"}
 
 STRING_CAP = 500
 LIST_CAP = 50
@@ -97,6 +99,13 @@ def record(base_dir: str, thread_id: str, kind: str, node: str, peer: str = "", 
     """Append one record to the thread's log. Raises ValueError for an unknown kind or an empty thread id."""
     if kind not in KINDS:
         raise ValueError(f"unknown thread record kind '{kind}'")
+    payload_data = _capped(dict(data or {}))
+    # (b/m) every thread record carries attribution; callers may override explicitly.
+    who_person = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+    if "requested_by" not in payload_data:
+        payload_data["requested_by"] = str(payload_data.get("launcher") or payload_data.get("requested_by") or who_person)
+    if "paid_by" not in payload_data:
+        payload_data["paid_by"] = str(payload_data.get("provider") or payload_data.get("paid_by") or "unknown")
     line = json.dumps({
         "v": 1,
         "thread": str(thread_id),
@@ -105,11 +114,13 @@ def record(base_dir: str, thread_id: str, kind: str, node: str, peer: str = "", 
         "node": str(node or ""),
         "peer": str(peer or ""),
         "who": {
-            "person": os.environ.get("USER") or os.environ.get("USERNAME") or "user",
+            "person": who_person,
             "station_id": _caller_station_id(),
             "hostname": socket.gethostname()
         },
-        "data": _capped(dict(data or {})),
+        "requested_by": payload_data.get("requested_by"),
+        "paid_by": payload_data.get("paid_by"),
+        "data": payload_data,
     }, ensure_ascii=False) + "\n"
     payload = line.encode("utf-8")
     path = thread_path(base_dir, thread_id)
@@ -147,7 +158,7 @@ def record_edge(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             detail = args[4]
     elif len(args) == 3:
         # Either (base, parent, child) or (parent, child, kind)
-        if (os.path.isdir(str(args[0])) or str(args[0]).startswith("/") or str(args[0]).startswith(".")) and not os.path.isdir(str(args[1])):
+        if (os.path.isdir(str(args[0])) or os.path.isabs(str(args[0])) or str(args[0]).startswith(".")) and not os.path.isdir(str(args[1])):
             base = str(args[0])
             parent_id = str(args[1])
             child_id = str(args[2])

@@ -116,15 +116,6 @@ def _handle_worker_exhaustion_or_stall(
         _s._mark_model_bad(model, reason=reason, reset_time=reset_time)
         if "/" in model:
             _s._mark_model_bad(model.split("/", 1)[1], reason=reason, reset_time=reset_time)
-        if (meta.get("provider") == "opencode"
-                and model.lower().split("/", 1)[-1].endswith("-free")
-                and re.search(r"free\s+usage\s+limit\s+reached", reason, re.IGNORECASE)):
-            for free_model in _s._opencode_models():
-                clean_model = str(free_model).lower().split("/", 1)[-1]
-                if clean_model.endswith("-free"):
-                    _s._mark_model_bad(str(free_model), reason=reason, reset_time=reset_time)
-                    if "/" in str(free_model):
-                        _s._mark_model_bad(str(free_model).split("/", 1)[1], reason=reason, reset_time=reset_time)
 
     condition = "stalled" if is_stall else "exhausted"
 
@@ -225,6 +216,7 @@ def _handle_worker_exhaustion_or_stall(
             "max_budget_usd": budget.get("max_usd"),
             "max_tokens": int(budget.get("max_tokens") or 0),
             "max_seconds": int(budget.get("max_seconds") or 0),
+            "max_tool_calls": int(budget.get("max_tool_calls") or 0),
             "thread": meta.get("thread", ""),
             "private": private,
             "isolate": bool(meta.get("isolate")),
@@ -232,6 +224,8 @@ def _handle_worker_exhaustion_or_stall(
             "swarm_id": meta.get("swarm_id", ""),
             "then": json.dumps(then) if isinstance(then, list) else then,
             "review": meta.get("review", ""),
+            "doctor": meta.get("doctor") or "",
+            "doctor_budget": int(meta.get("doctor_budget") or 0),
         }
     # Deduct what the failed run already consumed (bug-hunt-1.3.5 Bug 4).
     # NOTE: supervision records spend as meta["usage"] = {input, output, cache_read}

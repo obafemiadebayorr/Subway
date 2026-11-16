@@ -231,7 +231,12 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         deadline = time.time() + max(1, min(timeout_seconds, 600)) + 5
         matching = None
         while time.time() < deadline:
-            time.sleep(0.5)
+            rem = min(0.5, max(0.05, deadline - time.time()))
+            try:
+                import permissions as _perm
+                _perm.wait_for_activity(timeout=rem)
+            except Exception:
+                time.sleep(rem)
             with _s._state_lock("terminals"):
                 term = terminals.get_terminal(_s._terminals_dir(), terminal_id)
             cmds = (term or {}).get("commands") or []
@@ -312,5 +317,10 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
             if rec.get("error"):
                 return f"Error: {rec['error']}"
             return f"[exit {rec.get('exit_code')}] {rec.get('output', '')}"
-        time.sleep(0.5)
+        rem = min(0.5, max(0.05, deadline - time.time()))
+        try:
+            import permissions as _perm
+            _perm.wait_for_activity(timeout=rem)
+        except Exception:
+            time.sleep(rem)
     return f"Error: `{terminal_id}` did not respond within {timeout_seconds}s."

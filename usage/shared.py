@@ -93,8 +93,13 @@ def _check_cap(run: Dict[str, Any]) -> None:
     cap, spent = run.get("cap"), run.get("spent", 0)
     if not cap:
         return
+    if int(run.get("tool_calls") or 0) == 0 and int(spent or 0) < 2 * int(cap or 0):
+        return
     if spent >= cap:
-        run["on_cap"](f"Stopped at its token cap of {cap:,}.")
+        if int(run.get("tool_calls") or 0) == 0:
+            run["on_cap"](f"Stopped before its first tool call: the brief alone used {spent:,} of its {cap:,} cap. Raise max_tokens or trim the code packets.")
+        else:
+            run["on_cap"](f"Stopped at its token cap of {cap:,}.")
     elif run.get("soft") and spent >= run["soft"]:
         run["on_cap"](f"Told to wrap up at {spent:,} of its {cap:,} token budget.")
     elif spent + run.get("last_step", 0) + run.get("max_thinking", 0) >= cap:  # Every call resends the whole context; thinking is not resent but can repeat.

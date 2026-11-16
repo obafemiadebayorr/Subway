@@ -24,6 +24,7 @@ def _pi_session_files() -> List[str]:
         os.path.expanduser("~/.deepai-code/userdata/*/pi/*/sessions/**/*.jsonl"),
         os.path.join(home, ".deepai-code", "userdata", "*", "pi", "*", "sessions", "**", "*.jsonl"),
         os.path.join(home, ".pi", "agent", "sessions", "**", "*.jsonl"),
+        os.path.join(getattr(_s, "SUBWAY_DIR", os.path.join(home, ".subway")), "pi", "sessions", "**", "*.jsonl"),
     ]
     try:
         pi_dir = getattr(_s, "PI_DIR", None)
@@ -39,9 +40,10 @@ def _pi_session_files() -> List[str]:
     seen = set()
     result = []
     for f in files:
-        if f in seen:
+        abs_f = os.path.abspath(f)
+        if abs_f in seen:
             continue
-        seen.add(f)
+        seen.add(abs_f)
         if os.path.isfile(f):
             result.append(f)
     return result

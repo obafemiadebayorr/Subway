@@ -19,8 +19,11 @@ Usage:
 
 import glob
 import subway_home
+import pi_lane
+import claude_hooks
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -101,7 +104,7 @@ def _safe_write_marked_file(path: str, content: str, marker: str = "<!-- subway-
 def get_default_paths() -> Tuple[str, str]:
     server_dir = os.path.dirname(os.path.abspath(__file__))
     server_py = os.path.join(server_dir, "server.py")
-    py_bin = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    py_bin = sys.executable or shutil.which("python3") or shutil.which("python") or ("python" if os.name == "nt" else "/usr/bin/python3")
     return server_py, py_bin
 
 
@@ -111,6 +114,58 @@ def server_command(server_py: str, py_bin: str) -> List[str]:
         return [npx, "-y", "@obafemi_adebayorr/subway"]
     return [py_bin, server_py]
 
+
+def _norm_cmp_path(p: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.expanduser(p)))
+
+
+def _user_home() -> str:
+    if os.name == "nt":
+        up = os.environ.get("USERPROFILE", "").strip()
+        if up:
+            return up
+    return os.path.expanduser("~")
+
+
+def _opencode_config_dirs() -> List[str]:
+    home = _user_home()
+    dirs = [os.path.join(home, ".config", "opencode")]
+    appdata = os.environ.get("APPDATA", "").strip()
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if appdata:
+        dirs.append(os.path.join(appdata, "opencode"))
+    if localappdata:
+        dirs.append(os.path.join(localappdata, "opencode"))
+    seen = set()
+    out = []
+    for d in dirs:
+        nd = _norm_cmp_path(d)
+        if nd not in seen:
+            seen.add(nd)
+            out.append(d)
+    return out
+
+
+def _opencode_config_dir() -> str:
+    cands = _opencode_config_dirs()
+    for d in cands:
+        if os.path.exists(os.path.join(d, "opencode.json")) or os.path.exists(d):
+            return d
+    if os.name == "nt" and os.environ.get("APPDATA", "").strip():
+        return os.path.join(os.environ["APPDATA"].strip(), "opencode")
+    return cands[0]
+
+
+def _opencode_data_dirs() -> List[str]:
+    home = _user_home()
+    dirs = [os.path.join(home, ".local", "share", "opencode")]
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    appdata = os.environ.get("APPDATA", "").strip()
+    if localappdata:
+        dirs.append(os.path.join(localappdata, "opencode"))
+    if appdata:
+        dirs.append(os.path.join(appdata, "opencode"))
+    return dirs
 
 def detect_environments() -> Dict[str, Dict[str, Any]]:
     """Probes system to see which supported coding agent environments exist."""
@@ -129,9 +184,14 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
         claude_evidence = "neither claude binary on PATH nor ~/.claude/projects found"
 
     a_config = os.path.expanduser("~/.gemini/config/mcp_config.json")
-    agy_bin = os.path.expanduser("~/.gemini/bin/agy")
+    agy_bin = os.path.join(_user_home(), ".gemini", "bin", "agy.exe" if os.name == "nt" else "agy")
+    if not os.path.exists(agy_bin): agy_bin = os.path.expanduser("~/.gemini/bin/agy")
     agy_which = shutil.which("agy")
     agy_app = "/Applications/Antigravity IDE.app"
+    if os.name == "nt" and not os.path.exists(agy_app):
+        for _b in filter(None, [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES")]):
+            _p = os.path.join(_b, "Programs", "Antigravity IDE", "Antigravity IDE.exe")
+            if os.path.exists(_p): agy_app = _p; break
     agy_brain = os.path.expanduser("~/.gemini/antigravity/brain")
     agy_detected = False
     agy_evidence = ""
@@ -150,10 +210,11 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
     else:
         agy_evidence = "none of ~/.gemini/bin/agy, agy on PATH, /Applications/Antigravity IDE.app, ~/.gemini/antigravity/brain found"
 
-    o_config = os.path.expanduser("~/.config/opencode/opencode.json")
+    o_config = os.path.join(_opencode_config_dir(), "opencode.json")
     o_bin2 = shutil.which("opencode2")
     o_bin = shutil.which("opencode")
-    o_db = os.path.expanduser("~/.local/share/opencode/opencode.db")
+    o_dbs = [os.path.join(d, "opencode.db") for d in _opencode_data_dirs()]
+    o_db = next((p for p in o_dbs if os.path.exists(p)), o_dbs[0])
     opencode_detected = False
     opencode_evidence = ""
     if o_bin2:
@@ -171,6 +232,10 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
     pi_config = os.path.expanduser("~/.pi/agent/mcp.json")
     pi_which = shutil.which("pi") or shutil.which("deepai")
     pi_app = "/Applications/DeepAI Code.app"
+    if os.name == "nt" and not os.path.exists(pi_app):
+        for _b in filter(None, [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES")]):
+            _p = os.path.join(_b, "Programs", "DeepAI Code", "DeepAI Code.exe")
+            if os.path.exists(_p): pi_app = _p; break
     pi_dir = os.path.expanduser("~/.pi")
     pi_agent_dir = os.path.expanduser("~/.pi/agent")
     pi_detected = False
@@ -189,6 +254,10 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
 
     cursor_config = os.path.expanduser("~/.cursor/mcp.json")
     cursor_app = "/Applications/Cursor.app"
+    if os.name == "nt" and not os.path.exists(cursor_app):
+        for _b in filter(None, [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES")]):
+            _p = os.path.join(_b, "Programs", "cursor", "Cursor.exe")
+            if os.path.exists(_p): cursor_app = _p; break
     cursor_dir = os.path.expanduser("~/.cursor")
     cursor_detected = False
     cursor_evidence = ""
@@ -206,8 +275,16 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
 
     devin_config = os.path.expanduser("~/.codeium/windsurf/mcp_config.json")
     devin_app = "/Applications/Devin.app"
+    if os.name == "nt" and not os.path.exists(devin_app):
+        for _b in filter(None, [os.environ.get("LOCALAPPDATA"), os.environ.get("PROGRAMFILES")]):
+            _p = os.path.join(_b, "Programs", "Devin", "Devin.exe")
+            if os.path.exists(_p): devin_app = _p; break
     devin_dir = os.path.expanduser("~/.devin")
     devin_user = os.path.expanduser("~/Library/Application Support/Devin")
+    if os.name == "nt" and not os.path.exists(devin_user):
+        for _b in filter(None, [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")]):
+            _p = os.path.join(_b, "Devin")
+            if os.path.exists(_p): devin_user = _p; break
     devin_detected = False
     devin_evidence = ""
     if os.path.exists(devin_app):
@@ -288,6 +365,19 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
     return envs
 
 
+def _opencode_major() -> int:
+    """Major version of the installed OpenCode, 0 when unknown. OpenCode 2 changed the plugin format."""
+    for exe in ("opencode", "opencode2"):
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = re.search(r"(\d+)\.\d+", out or "")
+        if m:
+            return int(m.group(1))
+    return 0
+
+
 def install_governor_adapters(repo_dir: Optional[str] = None) -> bool:
     """Install governor adapters for OpenCode (plugin) and Antigravity (hooks.json).
 
@@ -297,17 +387,30 @@ def install_governor_adapters(repo_dir: Optional[str] = None) -> bool:
         repo_dir = os.path.dirname(os.path.abspath(__file__))
 
     # 1. OpenCode plugin: copy or link into ~/.config/opencode/plugin/ when ~/.config/opencode exists
-    opencode_dir = os.path.expanduser("~/.config/opencode")
+    opencode_dir = _opencode_config_dir()
     if os.path.exists(opencode_dir):
         plugin_dir = os.path.join(opencode_dir, "plugin")
         os.makedirs(plugin_dir, exist_ok=True)
-        src_plugin = os.path.join(repo_dir, "adapters", "opencode-governor.js")
+        src_name = "opencode-governor-v1.js" if _opencode_major() == 1 else "opencode-governor.js"
+        src_plugin = os.path.join(repo_dir, "adapters", src_name)
         dst_plugin = os.path.join(plugin_dir, "opencode-governor.js")
         if os.path.exists(src_plugin):
             try:
                 shutil.copy2(src_plugin, dst_plugin)
             except Exception as e:
                 print(f"  Warning: failed to copy opencode governor plugin: {e}")
+
+        # 1b. OpenCode wake plugin: native wake only exists in the OpenCode 2 format.
+        if _opencode_major() >= 2:
+            src_wake = os.path.join(repo_dir, "adapters", "opencode-wake.js")
+            dst_wake = os.path.join(plugin_dir, "opencode-wake.js")
+            if os.path.exists(src_wake):
+                try:
+                    shutil.copy2(src_wake, dst_wake)
+                except Exception as e:
+                    print(f"  Warning: failed to copy opencode wake plugin: {e}")
+        else:
+            print("OpenCode wake needs OpenCode 2")
 
     # 2. Antigravity hook: add PreToolUse entry (matcher ".*") running
     #    python3 <repo>/adapters/antigravity_governor.py to ~/.gemini/config/hooks.json
@@ -323,7 +426,10 @@ def install_governor_adapters(repo_dir: Optional[str] = None) -> bool:
             hooks_data = {}
 
         agy_adapter = os.path.join(repo_dir, "adapters", "antigravity_governor.py")
-        hook_cmd = f"python3 {shlex.quote(agy_adapter)}"
+        if os.name == "nt":
+            hook_cmd = subprocess.list2cmdline([sys.executable or "python", agy_adapter])
+        else:
+            hook_cmd = f"python3 {shlex.quote(agy_adapter)}"
 
         governor_entry = hooks_data.get("subway-governor")
         if not isinstance(governor_entry, dict):
@@ -409,10 +515,12 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
             hook_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-guard"
             hook_prompt_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-prompt"
             hook_precompact_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-precompact"
+            hook_session_cmd = f"{shlex.quote(npx)} -y @obafemi_adebayorr/subway hook-session"
         else:
             hook_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-guard"
             hook_prompt_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-prompt"
             hook_precompact_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-precompact"
+            hook_session_cmd = f"{shlex.quote(py_bin)} {shlex.quote(server_py)} hook-session"
 
         # Remove existing subway hooks and drop entries left empty
         for event, entries in list(hooks.items()):
@@ -424,7 +532,7 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
                     remaining_hooks = [
                         h for h in entry["hooks"]
                         if isinstance(h, dict) and not (
-                            "hook-guard" in h.get("command", "") or "hook-prompt" in h.get("command", "") or "hook-precompact" in h.get("command", "")
+                            "hook-guard" in h.get("command", "") or "hook-prompt" in h.get("command", "") or "hook-precompact" in h.get("command", "") or "hook-session" in h.get("command", "")
                         )
                     ]
                     if remaining_hooks:
@@ -433,7 +541,7 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
                         cleaned.append(entry_copy)
                 elif isinstance(entry, dict):
                     cmd = entry.get("command", "")
-                    if not ("hook-guard" in cmd or "hook-prompt" in cmd or "hook-precompact" in cmd):
+                    if not ("hook-guard" in cmd or "hook-prompt" in cmd or "hook-precompact" in cmd or "hook-session" in cmd):
                         cleaned.append(entry)
                 else:
                     cleaned.append(entry)
@@ -458,7 +566,20 @@ def install_claude(server_py: str, py_bin: str) -> Tuple[bool, str]:
                 "hooks": [{"type": "command", "command": hook_precompact_cmd}],
             })
 
+        session_start = hooks.setdefault("SessionStart", [])
+        if isinstance(session_start, list):
+            session_start.append({
+                "hooks": [{"type": "command", "command": hook_session_cmd}],
+            })
+
         _atomic_write_json(settings_path, settings_data)
+
+    # Native asyncRewake hook (replaces the channel push); never fail install.
+    try:
+        claude_hooks.install(settings_path)
+    except Exception as err:
+        print(f"  Warning: could not install Claude wake hook: {err}")
+
     install_governor_adapters()
 
     # Keyboard / slash command listeners (~/.claude/commands/)
@@ -543,11 +664,12 @@ def install_antigravity(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
 
 def install_opencode(server_py: str, py_bin: str) -> Tuple[bool, str]:
-    jsonc_path = os.path.expanduser("~/.config/opencode/opencode.jsonc")
+    oc_dir = _opencode_config_dir()
+    jsonc_path = os.path.join(oc_dir, "opencode.jsonc")
     if os.path.exists(jsonc_path):
         print(f"  Note: {jsonc_path} exists; leaving it unmodified.")
 
-    config_path = os.path.expanduser("~/.config/opencode/opencode.json")
+    config_path = os.path.join(oc_dir, "opencode.json")
     try:
         data = _load_json(config_path)
     except ValueError as err:
@@ -656,12 +778,9 @@ def _sync_deepai_models(agent_dirs: List[str]) -> str:
             provs = data.get("providers") or {}
             deepai_prov = provs.get("deepai")
             if isinstance(deepai_prov, dict):
-                headers = {"api-key": api_key, "X-DeepAI-Code-Theos": "4"}
-                deepai_prov["baseUrl"] = "https://api.deepai.org/deepai_code"
-                deepai_prov["headers"] = headers
-                for m in deepai_prov.get("models") or []:
-                    if isinstance(m, dict):
-                        m["headers"] = headers
+                catalog = pi_lane.app_catalog(home) or deepai_prov
+                provs["deepai"] = pi_lane.build_provider(api_key, catalog)
+                data["providers"] = provs
                 _atomic_write_json(mpath, data)
                 updated.append(mpath)
         except Exception:
@@ -709,7 +828,7 @@ def install_pi(server_py: str, py_bin: str) -> Tuple[bool, str]:
         from local_models import pi_agent_dir
 
         discovered = os.path.join(pi_agent_dir(), "extensions")
-        if discovered not in ext_dst_dirs:
+        if _norm_cmp_path(discovered) not in {_norm_cmp_path(x) for x in ext_dst_dirs}:
             ext_dst_dirs.insert(0, discovered)
     except Exception:
         pass
@@ -806,23 +925,37 @@ def install_cursor(server_py: str, py_bin: str) -> Tuple[bool, str]:
 
 def install_devin(server_py: str, py_bin: str) -> Tuple[bool, str]:
     config_path = os.path.expanduser("~/.codeium/windsurf/mcp_config.json")
-    try:
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        data = _load_json(config_path)
-    except ValueError as err:
-        reason = str(err)
-        print(f"  Error reading {config_path}: {reason}")
-        return False, reason
+    targets = [config_path]
+    devin_dir = os.path.expanduser("~/.config/devin")
+    if os.path.exists(devin_dir):
+        targets.append(os.path.join(devin_dir, "mcp_config.json"))
 
     base_cmd = server_command(server_py, py_bin)
-    servers = data.setdefault("mcpServers", {})
-    servers.pop("subway-context", None)
-    servers["subway"] = {
-        "command": base_cmd[0],
-        "args": base_cmd[1:]
-    }
-    _atomic_write_json(config_path, data)
-    return True, f"Connected in {config_path}"
+    written = []
+    first_err = ""
+    for path in targets:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = _load_json(path)
+        except ValueError as err:
+            reason = str(err)
+            print(f"  Error reading {path}: {reason}")
+            if not first_err:
+                first_err = reason
+            continue
+
+        servers = data.setdefault("mcpServers", {})
+        servers.pop("subway-context", None)
+        servers["subway"] = {
+            "command": base_cmd[0],
+            "args": base_cmd[1:]
+        }
+        _atomic_write_json(path, data)
+        written.append(path)
+
+    if not written and first_err:
+        return False, first_err
+    return True, f"Connected in {', '.join(written)}"
 
 
 def install_all() -> int:
@@ -941,6 +1074,28 @@ def remove_target(target: str) -> bool:
                         hooks["PreCompact"] = new_pc
                         _atomic_write_json(s_path, s_data)
                         removed = True
+
+                session_start = hooks.get("SessionStart", [])
+                if isinstance(session_start, list):
+                    new_ss = []
+                    ss_found = False
+                    for entry in session_start:
+                        if isinstance(entry, dict):
+                            sub_hooks = entry.get("hooks", [])
+                            filtered = [h for h in sub_hooks if isinstance(h, dict) and "hook-session" not in h.get("command", "")]
+                            if len(filtered) != len(sub_hooks):
+                                ss_found = True
+                            if filtered:
+                                entry["hooks"] = filtered
+                                new_ss.append(entry)
+                            else:
+                                ss_found = True
+                        else:
+                            new_ss.append(entry)
+                    if ss_found:
+                        hooks["SessionStart"] = new_ss
+                        _atomic_write_json(s_path, s_data)
+                        removed = True
             except Exception as e:
                 print(f"  Error updating {s_path}: {e}")
 
@@ -1008,32 +1163,33 @@ def remove_target(target: str) -> bool:
                     pass
 
     if target in ("opencode", "opencode2", "all"):
-        o_path = os.path.expanduser("~/.config/opencode/opencode.json")
-        if os.path.exists(o_path):
-            try:
-                d = _load_json(o_path)
-                if "mcp" in d and "servers" in d["mcp"] and any(k in d["mcp"]["servers"] for k in ("subway", "subway-context")):
-                    for k in ("subway", "subway-context"): d["mcp"]["servers"].pop(k, None)
-                    _atomic_write_json(o_path, d)
-                    print("  ✓ OpenCode: Disconnected from ~/.config/opencode/opencode.json")
-                    removed = True
-            except Exception as e:
-                print(f"  Error updating {o_path}: {e}")
+        for oc_dir in _opencode_config_dirs():
+            o_path = os.path.join(oc_dir, "opencode.json")
+            if os.path.exists(o_path):
+                try:
+                    d = _load_json(o_path)
+                    if "mcp" in d and "servers" in d["mcp"] and any(k in d["mcp"]["servers"] for k in ("subway", "subway-context")):
+                        for k in ("subway", "subway-context"): d["mcp"]["servers"].pop(k, None)
+                        _atomic_write_json(o_path, d)
+                        print("  ✓ OpenCode: Disconnected from ~/.config/opencode/opencode.json")
+                        removed = True
+                except Exception as e:
+                    print(f"  Error updating {o_path}: {e}")
 
-        agents_dir = os.path.expanduser("~/.config/opencode/agents")
-        if os.path.isdir(agents_dir):
-            for fname in os.listdir(agents_dir):
-                fpath = os.path.join(agents_dir, fname)
-                if os.path.isfile(fpath):
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        if "<!-- subway-auto-stub -->" in content:
-                            os.remove(fpath)
-                            print(f"  ✓ OpenCode: Removed stub {fpath}")
-                            removed = True
-                    except Exception:
-                        pass
+            agents_dir = os.path.join(oc_dir, "agents")
+            if os.path.isdir(agents_dir):
+                for fname in os.listdir(agents_dir):
+                    fpath = os.path.join(agents_dir, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            if "<!-- subway-auto-stub -->" in content:
+                                os.remove(fpath)
+                                print(f"  ✓ OpenCode: Removed stub {fpath}")
+                                removed = True
+                        except Exception:
+                            pass
 
     if target in ("pi", "deepai", "all"):
         p_path = os.path.expanduser("~/.pi/agent/mcp.json")
@@ -1194,7 +1350,7 @@ def check_status() -> None:
     targets = [
         ("Claude Code", os.path.expanduser("~/.claude.json"), "claude"),
         ("Antigravity", os.path.expanduser("~/.gemini/config/mcp_config.json"), "antigravity"),
-        ("OpenCode", os.path.expanduser("~/.config/opencode/opencode.json"), "opencode"),
+        ("OpenCode", os.path.join(_opencode_config_dir(), "opencode.json"), "opencode"),
         ("pi (DeepAI Code)", os.path.expanduser("~/.pi/agent/mcp.json"), "pi"),
     ]
 

@@ -46,32 +46,99 @@ except ImportError:  # Windows: state stays atomic per write, but not serialized
 
 from store import ttl_cached
 import server as _s
+
+# Set by the HUD relay endpoint to the calling chat's process facts ({"ppid": int, "env": {..}}),
+# because the HUD is not that chat's child. Unset = this process is the caller (normal stdio).
+CALLER: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar("subway_caller", default=None)
+_caller_self_cache: Dict[tuple, tuple] = {}
+
+
+def _env(key: str) -> Optional[str]:
+    c = CALLER.get()
+    if c is not None:
+        v = (c.get("env") or {}).get(key)
+        return str(v) if v is not None else None
+    return os.environ.get(key)
+
+
+def _ppid() -> int:
+    c = CALLER.get()
+    if c is not None:
+        try:
+            return int(c.get("ppid") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return os.getppid()
+
+# Single source of truth for chat providers Subway can detect.
+DETECTED_CHAT_SOURCES: Tuple[str, ...] = (
+    "claude",
+    "antigravity",
+    "opencode",
+    "copilot",
+    "pi",
+    "cursor",
+    "devin",
+)
+
+
+def _list_claude_chats(include_subagents: bool = False) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    opens = _s.claude_open_sessions()
+    for p in _s.claude_files(include_subagents):
+        try:
+            out.append(_s.claude_meta(p, opens))
+        except Exception as e:
+            _s.log("claude meta failed", p, e)
+    return out
+
+
+_CHAT_LISTERS: Dict[str, Callable[[bool], List[Dict[str, Any]]]] = {
+    "claude": _list_claude_chats,
+    "antigravity": lambda include_subagents=False: _s.agy_list(include_subagents),
+    "opencode": lambda include_subagents=False: _s.opencode_list(include_subagents),
+    "copilot": lambda include_subagents=False: _s.copilot_list(include_subagents),
+    "pi": lambda include_subagents=False: getattr(_s, "pi_list", lambda _inc=False: [])(include_subagents),
+    "cursor": lambda include_subagents=False: getattr(_s, "cursor_list", lambda _inc=False: [])(include_subagents),
+    "devin": lambda include_subagents=False: getattr(_s, "devin_list", lambda _inc=False: [])(include_subagents),
+}
+
+
+DEFAULT_LAUNCH_TITLES = ("subway event", "subway standing rules")
+DEFAULT_LAUNCH_PREFIXES = ("[subway event]", "act as the implementation sub-agent", "act as the research sub-agent",
+                           "act as the review sub-agent", "subway standing rules",
+                           # model availability pings
+                           "reply with the single word", "reply with exactly: pong")
+
+
+def launched_marker(chat, titles=None, prefixes=None):
+    """True for sessions Subway launched (wake runs, worker briefs), judged by title."""
+    if titles is None or prefixes is None:
+        cfg = _s._load_json("config.json") or {}
+        if titles is None:
+            titles = tuple(t.lower() for t in (cfg.get("launched_titles") or DEFAULT_LAUNCH_TITLES))
+        if prefixes is None:
+            prefixes = tuple(p.lower() for p in (cfg.get("launched_prefixes") or DEFAULT_LAUNCH_PREFIXES))
+    title = str(chat.get("title") or "").strip().lower()
+    return bool(title) and (title in titles or title.startswith(prefixes))
+
+
 def all_chats(source: str = "all", include_subagents: bool = False) -> List[Dict[str, Any]]:
     chats: List[Dict[str, Any]] = []
-    if source in ("all", "claude"):
-        opens = _s.claude_open_sessions()
-        for p in _s.claude_files(include_subagents):
-            try:
-                chats.append(_s.claude_meta(p, opens))
-            except Exception as e:
-                _s.log("claude meta failed", p, e)
-    if source in ("all", "antigravity"):
-        chats.extend(_s.agy_list(include_subagents))
-    if source in ("all", "opencode"):
-        chats.extend(_s.opencode_list(include_subagents))
-    if source in ("all", "copilot"):
-        chats.extend(_s.copilot_list(include_subagents))
-    if source in ("all", "pi"):
-        chats.extend(getattr(_s, "pi_list", lambda include_subagents=False: [])(include_subagents))
-    if source in ("all", "cursor"):
-        chats.extend(getattr(_s, "cursor_list", lambda include_subagents=False: [])(include_subagents))
-    if source in ("all", "devin"):
-        chats.extend(getattr(_s, "devin_list", lambda include_subagents=False: [])(include_subagents))
+    for src in DETECTED_CHAT_SOURCES:
+        if source in ("all", src):
+            lister = _CHAT_LISTERS.get(src)
+            if lister:
+                chats.extend(lister(include_subagents))
     if not include_subagents:
         worker_sessions = _s._worker_chat_session_ids()
+        cfg = _s._load_json("config.json") or {}
+        titles = tuple(t.lower() for t in (cfg.get("launched_titles") or DEFAULT_LAUNCH_TITLES))
+        prefixes = tuple(p.lower() for p in (cfg.get("launched_prefixes") or DEFAULT_LAUNCH_PREFIXES))
         chats = [chat for chat in chats
                  if not _s._chat_is_in_worker_worktree(chat)
-                 and str(chat.get("id") or "") not in worker_sessions]
+                 and str(chat.get("id") or "") not in worker_sessions
+                 and not launched_marker(chat, titles, prefixes)]
     excl = threads.load_exclusions(_s.SUBWAY_DIR)
     if excl.get("apps") or excl.get("projects"):
         chats = [c for c in chats if not threads.is_chat_excluded(c, excl)]
@@ -198,24 +265,24 @@ def resolve(ident: str, source: str = "all", project: str = "", strict: bool = F
 
 
 def _detect_self_uncached() -> Optional[Dict[str, Any]]:
-    forced = os.environ.get("SUBWAY_STATION_ID")
+    forced = _env("SUBWAY_STATION_ID")
     if forced:
         return {"source": "manual", "id": forced, "tab_name": None, "synthetic": True}
-    worker_id = os.environ.get("SUBWAY_WORKER_ID")
+    worker_id = _env("SUBWAY_WORKER_ID")
     if worker_id:
         return {"source": "worker", "id": worker_id, "tab_name": None, "synthetic": True}
     # DeepAI Code (pi): the app spawns this MCP server as a child of the `pi`
     # runtime and marks the environment. The station id is the newest session
     # transcript for this cwd, so it matches what list_chats/read_chat report.
-    if os.environ.get("PI_CODING_AGENT") or os.environ.get("PI_CODING_AGENT_DIR"):
+    if _env("PI_CODING_AGENT") or _env("PI_CODING_AGENT_DIR"):
         pi_sid = _pi_session_from_ancestry()
-        return {"source": "pi", "id": pi_sid or f"pi-{os.getppid()}", "tab_name": None,
+        return {"source": "pi", "id": pi_sid or f"pi-{_ppid()}", "tab_name": None,
                 "synthetic": not bool(pi_sid)}
 
-    agy_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    agy_conv = _env("ANTIGRAVITY_CONVERSATION_ID")
     if agy_conv:
         return {"source": "antigravity", "id": agy_conv, "tab_name": None}
-    if os.environ.get("SUBWAY_NO_NOTIFY"):
+    if _env("SUBWAY_NO_NOTIFY"):
         return None
 
     opens: Dict[int, Dict[str, Any]] = {}
@@ -227,7 +294,7 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    pid = os.getppid()
+    pid = _ppid()
     if sys.platform == "win32":
         try:
             cmd = 'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select ProcessId,ParentProcessId,CommandLine | ConvertTo-Json"'
@@ -330,11 +397,22 @@ def _pi_session_from_ancestry() -> str:
             return base.rsplit("_", 1)[-1].split(".")[0] if "_" in base else base.split(".")[0]
     except Exception:
         pass
-    return f"pi-{os.getppid()}"
+    return f"pi-{_ppid()}"
 
 
 def detect_self() -> Optional[Dict[str, Any]]:
     """Identify the agent window this server belongs to, across every supported client."""
+    c = CALLER.get()
+    if c is not None:
+        key = (_ppid(), tuple(sorted((c.get("env") or {}).items())))
+        now = time.time()
+        hit = _caller_self_cache.get(key)
+        if hit is None or now - hit[0] > _s._SELF_TTL:
+            if len(_caller_self_cache) > 256:
+                _caller_self_cache.clear()
+            hit = (now, _s._detect_self_uncached())
+            _caller_self_cache[key] = hit
+        return hit[1]
     now = time.time()
     forced = os.environ.get("SUBWAY_STATION_ID")
     worker = os.environ.get("SUBWAY_WORKER_ID")
@@ -354,7 +432,7 @@ def detect_self() -> Optional[Dict[str, Any]]:
 def _self_id() -> str:
     """Stable id for this window. Unknown callers get one per process, so two of them still collide."""
     me = _s.detect_self()
-    return me["id"] if me else f"host-{os.getpid()}"
+    return me["id"] if me else (f"host-{_ppid()}" if CALLER.get() is not None else f"host-{os.getpid()}")
 
 
 def _short_id(station: str) -> str:
@@ -423,6 +501,12 @@ def _get_last_entry_preview(chat: Dict[str, Any]) -> str:
             data = _s.copilot_read_segments(chat)[0][0]
         elif src == "pi":
             data = _s.pi_read_segments(chat)[0][0]
+        elif src == "cursor":
+            import chat_readers.cursor as _cr_cursor
+            data = _cr_cursor.cursor_read(cid)
+        elif src == "devin":
+            import chat_readers.devin as _cr_devin
+            data = _cr_devin.devin_read(cid)
         else:
             data = _s.agy_read(cid)
 

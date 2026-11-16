@@ -63,17 +63,31 @@ def claude_open_sessions() -> Dict[str, Dict[str, Any]]:
     return res
 
 
+_SUBWAY_CONTINUED_PREFIX = "[SUBWAY: this conversation continued"
+
+
+def _subway_continued_user_text(text: str) -> Optional[str]:
+    if not isinstance(text, str) or not text.startswith(_SUBWAY_CONTINUED_PREFIX):
+        return None
+    marker = "\nUser message: "
+    if marker in text:
+        return text.rsplit(marker, 1)[1].strip()
+    return text.strip()
+
+
 def _claude_is_human(o: Dict[str, Any], is_subagent: bool = False) -> bool:
     if o.get("isMeta"):
         return False
     if o.get("isSidechain") and not is_subagent:
         return False
+    c = (o.get("message") or {}).get("content")
+    if isinstance(c, str) and c.startswith(_SUBWAY_CONTINUED_PREFIX):
+        return True
     origin = o.get("origin")
     if isinstance(origin, dict):
         return origin.get("kind") == "human"
     if o.get("turnOrigin"):
         return o.get("turnOrigin") == "human"
-    c = (o.get("message") or {}).get("content")
     if isinstance(c, list):
         if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
             return False
@@ -111,7 +125,7 @@ def claude_parse_lines(lines: List[str], is_subagent: bool = False) -> List[Dict
                     txt = content
                 turns.append({"role": "summary", "text": txt, "ts": ts})
                 continue
-            if not _s._claude_is_human(o, is_subagent=is_subagent):
+            if not _claude_is_human(o, is_subagent=is_subagent):
                 continue
             txt_parts = []
             if isinstance(content, str):
@@ -124,6 +138,9 @@ def claude_parse_lines(lines: List[str], is_subagent: bool = False) -> List[Dict
                             txt_parts.append(t)
             user_text = "\n".join(txt_parts).strip()
             if user_text:
+                continued = _subway_continued_user_text(user_text)
+                if continued is not None:
+                    user_text = continued
                 turns.append({"role": "user", "text": user_text, "ts": ts})
 
         elif typ == "assistant":
@@ -201,7 +218,7 @@ def claude_meta(path: str, open_sessions: Optional[Dict[str, Dict[str, Any]]] = 
             if not first_prompt and '"type":"user"' in line:
                 try:
                     o = json.loads(line)
-                    if _s._claude_is_human(o, is_subagent=is_sub) and not o.get("isCompactSummary"):
+                    if _claude_is_human(o, is_subagent=is_sub) and not o.get("isCompactSummary"):
                         c = (o.get("message") or {}).get("content")
                         if isinstance(c, list):
                             first_prompt = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
@@ -242,7 +259,7 @@ def _claude_read_full(path: str, is_sub: bool) -> List[Dict[str, Any]]:
         for raw in f:
             if b'"type":"assistant"' in raw or (b'"type":"user"' in raw and b'"tool_result"' not in raw[:3000]):
                 lines.append(raw.decode("utf-8", "replace"))
-    return _s.claude_parse_lines(lines, is_subagent=is_sub)
+    return claude_parse_lines(lines, is_subagent=is_sub)
 
 
 def claude_read(path: str, mode: str = "full", n: int = 0) -> List[Dict[str, Any]]:
@@ -255,27 +272,107 @@ def claude_read(path: str, mode: str = "full", n: int = 0) -> List[Dict[str, Any
     nbytes = 4_000_000
     while True:
         lines = _s._read_tail(path, nbytes)
-        turns = _s.claude_parse_lines(lines, is_subagent=is_sub)
+        turns = claude_parse_lines(lines, is_subagent=is_sub)
         users = sum(1 for t in turns if t["role"] in ("user", "summary"))
         if users > n or nbytes >= size:
             return turns
         nbytes *= 4
 
 
+def claude_rewound_lines(lines: List[str]) -> Set[int]:
+    """Indexes of lines on branches abandoned by a rewind or an edited message.
+
+    The active branch runs from the newest record back through parentUuid (logicalParentUuid
+    across a compaction). Off-branch records are grouped by where they leave it; a group is
+    dropped only when it holds a human message. Parallel tool calls also branch, but their
+    groups hold only tool results, so they stay. A record whose ancestry can't be traced
+    (missing parent) is kept."""
+    recs: Dict[str, Tuple[int, Optional[str], Dict[str, Any]]] = {}
+    last = None
+    for i, line in enumerate(lines):
+        if '"uuid"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        u = o.get("uuid") if isinstance(o, dict) else None
+        if not u or o.get("isSidechain"):
+            continue
+        recs[u] = (i, o.get("parentUuid") or o.get("logicalParentUuid"), o)
+        last = u
+    if last is None:
+        return set()
+    active: Set[str] = set()
+    cur: Optional[str] = last
+    while cur and cur in recs and cur not in active:
+        active.add(cur)
+        cur = recs[cur][1]
+    if len(active) == len(recs):
+        return set()
+    roots: Dict[str, Optional[str]] = {}  # off-branch uuid -> first off-branch node below the branch point (None: untraceable)
+
+    def root_of(u: str) -> Optional[str]:
+        path: List[str] = []
+        node: Optional[str] = u
+        found: Optional[str] = None
+        while True:
+            if node in roots:
+                found = roots[node]
+                break
+            parent = recs[node][1]
+            path.append(node)
+            if parent in active:
+                found = node
+                break
+            if not parent or parent not in recs or len(path) > len(recs):
+                found = None
+                break
+            node = parent
+        for n in path:
+            roots[n] = found
+        return found
+
+    groups: Dict[str, List[str]] = {}
+    for u in recs:
+        if u not in active:
+            r = root_of(u)
+            if r:
+                groups.setdefault(r, []).append(u)
+    drop: Set[int] = set()
+    for members in groups.values():
+        human = False
+        for u in members:
+            o = recs[u][2]
+            if o.get("type") == "user" and not o.get("isCompactSummary") and _claude_is_human(o):
+                c = (o.get("message") or {}).get("content")
+                if not (isinstance(c, str) and c.startswith(_SUBWAY_CONTINUED_PREFIX)):
+                    human = True
+                    break
+        if human:
+            drop.update(recs[u][0] for u in members)
+    return drop
+
+
 def claude_read_segments(path: str, is_sub: bool = False) -> List[List[Dict[str, Any]]]:
-    """Read a transcript and split turns into segments at compact_boundary lines."""
+    """Read a transcript and split turns into segments at compact_boundary lines.
+    Branches abandoned by a rewind are left out (main transcripts only)."""
     segments_raw: List[List[str]] = [[]]
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"compact_boundary"' in line:
-                    try:
-                        o = json.loads(line)
-                        if o.get("type") == "system" and o.get("subtype") == "compact_boundary":
-                            segments_raw.append([])
-                            continue
-                    except Exception:
-                        pass
-                segments_raw[-1].append(line)
-    parsed = [_s.claude_parse_lines(s_lines, is_subagent=is_sub) for s_lines in segments_raw]
+            all_lines = f.readlines()
+        dropped = set() if is_sub else claude_rewound_lines(all_lines)
+        for idx, line in enumerate(all_lines):
+            if idx in dropped:
+                continue
+            if '"compact_boundary"' in line:
+                try:
+                    o = json.loads(line)
+                    if o.get("type") == "system" and o.get("subtype") == "compact_boundary":
+                        segments_raw.append([])
+                        continue
+                except Exception:
+                    pass
+            segments_raw[-1].append(line)
+    parsed = [claude_parse_lines(s_lines, is_subagent=is_sub) for s_lines in segments_raw]
     return parsed if parsed else [[]]

@@ -1075,7 +1075,7 @@ import sys, os, json, time, urllib.request, urllib.error, subprocess
 
 def _hud():
     base = os.environ.get("SUBWAY_DIR") or os.path.join(os.path.expanduser("~"), ".subway")
-    if not os.environ.get("SUBWAY_DIR") and not os.path.lexists(base) and os.path.isdir(base + "-context"):
+    if not os.environ.get("SUBWAY_DIR") and os.path.isdir(base + "-context") and not os.path.islink(base + "-context"):
         base += "-context"  # not moved to ~/.subway yet
     port = 7890
     try:
@@ -1126,6 +1126,9 @@ def _app_and_tty(tid):
     tp = os.environ.get("TERM_PROGRAM", "")
     app = "terminal" if tp == "Apple_Terminal" else ("iterm" if tp == "iTerm.app" else "")
     tty = ""
+    if sys.platform == "win32":
+        # `ps -o tty=` does not exist on Windows; CONPTY gives no /dev/tty either.
+        return app, tty
     try:
         parts = str(tid).split("-")
         pid = parts[1] if len(parts) >= 2 and parts[0] == "shell" else ""

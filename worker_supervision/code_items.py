@@ -61,13 +61,26 @@ def _py_range_to_defs(source: str, start_l: int, end_l: int) -> Optional[Tuple[i
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             n_start = min([d.lineno for d in getattr(node, "decorator_list", [])] + [node.lineno])
             n_end = getattr(node, "end_lineno", None) or n_start
-            spans.append((n_start, n_end, node.name))
+            spans.append((n_start, n_end, node.name, node.lineno))
     hits = [s for s in spans if s[0] <= end_l and s[1] >= start_l]
     if not hits:
         return None
     new_start = min(s[0] for s in hits)
     new_end = max(s[1] for s in hits)
     label = hits[0][2] if len(hits) == 1 else "+".join(s[2] for s in hits[:4]) + ("+%d more" % (len(hits) - 4) if len(hits) > 4 else "")
+    try:
+        from hud_server import settings_api as _settings_api
+        cfg = _s._load_json("config.json") or {}
+        range_max = int(_settings_api.value("packet_range_max_lines", cfg) or 120)
+    except Exception:
+        range_max = 120
+    if len(hits) == 1 and (new_end - new_start + 1) > range_max:
+        def_start, def_end, name, sig_l = hits[0]
+        src_lines = source.splitlines()
+        sig = src_lines[sig_l - 1].strip() if 0 < sig_l <= len(src_lines) else ""
+        s = max(def_start, start_l - 15)
+        e = min(def_end, end_l + 15)
+        return (s, e, f"{name} (lines {s}-{e} of {def_start}-{def_end}); def signature: {sig}")
     return (new_start, new_end, label)
 
 
@@ -90,18 +103,117 @@ def _js_ast_span(abs_path: str, target: str) -> Optional[Tuple[int, int, str]]:
     except (ValueError, KeyError, TypeError):
         return None
 
+WHOLE_FILE_MAX_LINES = 400
+
+
+def _whole_file_max_lines() -> int:
+    try:
+        from hud_server import settings_api as _settings_api
+        cfg = _s._load_json("config.json") or {}
+        return int(_settings_api.value("whole_file_max_lines", cfg) or WHOLE_FILE_MAX_LINES)
+    except Exception:
+        return WHOLE_FILE_MAX_LINES
+
+
+def _whole_file_item(item: str, root: str) -> Tuple[bool, Optional[Tuple[str, int, int, str, str]]]:
+    """(handled, result) for a bare path. handled is True when the item names a real file under root;
+    the result is the whole file when it has fewer than whole_file_max_lines lines, else None."""
+    if not item or "\n" in item or "\x00" in item:
+        return False, None
+    abs_path = os.path.realpath(os.path.join(root, item))
+    if not (abs_path == root or abs_path.startswith(root + os.sep)) or not os.path.isfile(abs_path):
+        return False, None
+    try:
+        with open(abs_path, "rb") as f:
+            if b"\x00" in f.read(8192):
+                return True, None  # binary
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return True, None
+    if not lines or len(lines) >= _whole_file_max_lines():
+        return True, None
+    return True, (os.path.relpath(abs_path, root), 1, len(lines), "".join(lines), abs_path)
+
+
+
+SKELETON_DEFAULT_MIN_LINES = 400
+
+
+def _skeleton_min_lines() -> int:
+    try:
+        from hud_server import settings_api as _settings_api
+        cfg = _s._load_json("config.json") or {}
+        return int(_settings_api.value("skeleton_min_lines", cfg) or SKELETON_DEFAULT_MIN_LINES)
+    except Exception:
+        return SKELETON_DEFAULT_MIN_LINES
+_SKEL_SYMBOL_RE = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$")
+
+
+def _skeleton_item(file_part: str, symbol: str, root: str, explicit: bool) -> Optional[Tuple[str, int, int, str, str]]:
+    """Folded whole-file packet. explicit=True for `~skel`; otherwise only files over 400 lines qualify.
+    Returns None when the file, language, symbol or size does not qualify, so the caller falls through."""
+    from worker_supervision import skeleton as _skel
+    if not file_part or not symbol or not _SKEL_SYMBOL_RE.match(symbol):
+        return None
+    abs_path = os.path.realpath(os.path.join(root, file_part))
+    if not (abs_path.startswith(root + os.sep)) or not os.path.isfile(abs_path):
+        return None
+    if not abs_path.lower().endswith(_skel.PY_EXTS + _skel.JS_EXTS):
+        return None
+    try:
+        with open(abs_path, "rb") as f:
+            if b"\x00" in f.read(8192):
+                return None
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    nlines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+    if not explicit and nlines <= _skeleton_min_lines():
+        return None
+    folded = _skel.fold_file(abs_path, text, symbol)
+    if not folded:
+        return None
+    out, count = folded
+    if not explicit and (count == 0 or len(out) >= len(text)):
+        return None
+    return os.path.relpath(abs_path, root), 1, max(1, nlines), out, abs_path
+
+
 def _extract_code_item(item: str, cwd: str) -> Optional[Tuple[str, int, int, str, str]]:
-    """Resolve an item specification to (display_path, start_line, end_line, content, abs_path)."""
+    """Resolve an item specification to (display_path, start_line, end_line, content, abs_path).
+
+    Forms: path:symbol, path:START-END, path:LINE (the enclosing def for .py, else a +-10 line window)
+    and a bare path (the whole file when it has fewer than 400 lines)."""
     import ast
     root = os.path.realpath(cwd)
+    item = str(item or "").strip()
+    handled, whole = _whole_file_item(item, root)
+    if handled:
+        return whole
     if ":" in item:
         file_part, target = item.rsplit(":", 1)
+        _explicit_skel = target.endswith("~skel")
+        _force_old = target.endswith("~only")
+        if _explicit_skel or _force_old:
+            target = target[:-5]
+        if not _force_old:
+            _skel_hit = _skeleton_item(file_part, target, root, _explicit_skel)
+            if _skel_hit is not None:
+                return _skel_hit
+            if _explicit_skel:
+                return None
         abs_path = os.path.realpath(os.path.join(root, file_part))
         if not (abs_path == root or abs_path.startswith(root + os.sep)):
             return None
         if not os.path.isfile(abs_path):
             return None
         display_path = os.path.relpath(abs_path, root)
+
+        if re.fullmatch(r"\d+", target):
+            line_no = int(target)
+            target = f"{line_no}-{line_no}" if file_part.endswith(".py") else f"{max(1, line_no - 10)}-{line_no + 10}"
 
         range_match = re.match(r"^(\d+)-(\d+)$", target)
         if range_match:

@@ -64,16 +64,36 @@ def save_locks(data: Dict[str, Any]) -> None:
     _s._save_json("locks.json", data)
 
 
+def release_claims_for_peer(peer_id: str) -> int:
+    """Drop every lease a linked station made, e.g. when that link is removed (item 38 e/n)."""
+    pid = str(peer_id or "")
+    if not pid:
+        return 0
+    with _s._state_lock("locks"):
+        data = load_locks() or {}
+        locks = data.get("locks") or {}
+        keep = {k: v for k, v in locks.items() if str((v or {}).get("peer_id") or "") != pid}
+        removed = len(locks) - len(keep)
+        if removed:
+            data["locks"] = keep
+            save_locks(data)
+    return removed
+
+
 def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, purpose: str = "",
-                 baseline_commit: str = "", role: str = "implementer", project_dir: str = "") -> str:
+                 baseline_commit: str = "", role: str = "implementer", project_dir: str = "",
+                 peer_id: str = "") -> str:
     """Acquire a temporary workspace lease on a file to prevent multi-agent collision and regressions."""
     explicit_holder = bool(holder)
     if not filepath:
         return "Error: filepath is required."
     path = _s._canon_path(filepath, project_dir)
 
-    det = _s._detected_chat()
-    is_unverified = False
+    # A claim arriving from a linked station (peer_id set) is authenticated by its device
+    # token; the local detected chat is the HUD's own window, not the caller, so it must
+    # not veto the station's '@slug' holder (38: silent collision).
+    det = None if peer_id else _s._detected_chat()
+    is_unverified = not bool(peer_id)
     if det is not None:
         det_id = det["id"]
         if holder:
@@ -85,9 +105,9 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
             holder = _s._short_id(det_id)
             me_id = det_id
     else:
-        me_id = _s._self_id()
+        me_id = peer_id or _s._self_id()
         holder = holder or _s._short_id(me_id)
-        is_unverified = True
+        is_unverified = not peer_id
 
     role = (role or "implementer").lower()
 
@@ -97,6 +117,13 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
         duration = 300
 
     head = _s._git_head(path)
+    try:
+        import peers as _peers
+        remote = _peers.remote_claim_conflict(path, holder)
+    except Exception:
+        remote = ""
+    if remote:
+        return remote
     override = ""
     worker = _s._load_worker(me_id)
     parent = worker.get("launched_by") if worker else None
@@ -151,6 +178,7 @@ def t_claim_file(filepath: str, holder: str = "", duration_seconds: int = 300, p
             "baseline_commit": baseline,
             "role": role,
             "status": "LEASED",
+            "peer_id": str(peer_id or ""),
         }
         if parent:
             locks[path]["parent"] = parent

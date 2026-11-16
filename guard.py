@@ -5,6 +5,8 @@ usage helpers read them at call time to preserve patch/test behavior.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subway_home
 import re
@@ -35,8 +37,8 @@ from cli_tools import (
 def _writes_subway_state(command: str) -> bool:
     """Best effort: a shell can write a file in too many ways to catch them all, so this stops the plain ones."""
     # Match the state folder as a path (".../.subway", or the old ".../.subway-context"), not names like the "subway.subway-context" extension id.
-    return bool(re.search(r">\s*\S*/\.subway(?:-context)?\b|\btee\b.*/\.subway(?:-context)?\b|"
-                          r"\bsed\s+-i.*/\.subway(?:-context)?\b|\b(mv|cp|rm)\b.*/\.subway(?:-context)?\b", command))
+    return bool(re.search(r">\s*\S*[/\\]\.subway(?:-context)?\b|\btee\b.*[/\\]\.subway(?:-context)?\b|"
+                          r"\bsed\s+-i.*[/\\]\.subway(?:-context)?\b|\b(mv|cp|rm|del|copy|move|xcopy|robocopy)\b.*[/\\]\.subway(?:-context)?\b", command))
 
 
 DEFAULT_PRINCIPAL_MCP_READ_TOOLS = [
@@ -74,6 +76,38 @@ def _principal_settings():
     read_budget.setdefault("scope", "all")
     read_budget.setdefault("per_provider", {})
     return enabled, max(0, max_reads), principal_mcp_read_tools(cfg), read_budget
+
+
+def _principal_small_edit_lines() -> int:
+    import server
+    cfg = server._load_json("config.json") or {}
+    try:
+        return max(0, int(cfg.get("principal_small_edit_lines", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _edit_line_count(tool_name: str, tool_input: Dict[str, Any]) -> int:
+    """Lines an Edit/MultiEdit actually changes (context lines excluded); -1 when not measurable."""
+    import difflib
+
+    def one(e: Dict[str, Any]) -> int:
+        if e.get("replace_all"):
+            return -1
+        a = str(e.get("old_string") or "").splitlines()
+        b = str(e.get("new_string") or "").splitlines()
+        n = 0
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+            if tag != "equal":
+                n += max(i2 - i1, j2 - j1)
+        return n
+
+    if tool_name in ("Edit", "edit_file") and "old_string" in tool_input:
+        return one(tool_input)
+    if tool_name == "MultiEdit" and isinstance(tool_input.get("edits"), list):
+        counts = [one(e) for e in tool_input["edits"] if isinstance(e, dict)]
+        return -1 if (not counts or any(c < 0 for c in counts)) else sum(counts)
+    return -1
 
 
 def resolve_read_reset(settings, provider):
@@ -117,6 +151,96 @@ def reset_principal_reads(session_id):
     data["sessions"] = sessions
     try: _json.dump(data, open(p, "w", encoding="utf-8"))
     except Exception: pass
+
+
+def _stale_reads_path():
+    import server
+    sdir = getattr(server, "SUBWAY_DIR", None) or subway_home.subway_dir()
+    return os.path.join(sdir, "stale_reads.json")
+
+
+def _load_stale_reads():
+    p = _stale_reads_path(); data = {}
+    try:
+        if os.path.exists(p):
+            data = json.load(open(p, encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    return p, (data if isinstance(data, dict) else {})
+
+
+def _save_stale_reads(p, data):
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        json.dump(data, open(tmp, "w", encoding="utf-8"))
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+
+def _sha1_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return _sha1_bytes(f.read())
+    except Exception:
+        return None
+
+
+def _stale_guard_enabled() -> bool:
+    try:
+        import server
+        cfg = server._load_json("config.json") or {}
+        v = cfg.get("stale_write_guard", True)
+        return not (v is False or (isinstance(v, str) and str(v).lower() == "off"))
+    except Exception:
+        return True
+
+
+def _stale_record_read(sid: str, real: str, sha: str):
+    p, data = _load_stale_reads()
+    sess = data.get(sid)
+    if not isinstance(sess, dict):
+        sess = {}
+    sess[real] = sha
+    if len(sess) > 500:
+        # keep arbitrary 500 entries (cap)
+        for k in list(sess.keys())[:-500]:
+            sess.pop(k, None)
+    data[sid] = sess
+    _save_stale_reads(p, data)
+
+
+def _stale_get_hash(sid: str, real: str) -> Optional[str]:
+    _, data = _load_stale_reads()
+    sess = data.get(sid)
+    if not isinstance(sess, dict):
+        return None
+    v = sess.get(real)
+    return v if isinstance(v, str) else None
+
+
+def _stale_set_hash(sid: str, real: str, sha: Optional[str]):
+    p, data = _load_stale_reads()
+    sess = data.get(sid)
+    if not isinstance(sess, dict):
+        sess = {}
+    if sha is None:
+        sess.pop(real, None)
+    else:
+        sess[real] = sha
+        if len(sess) > 500:
+            for k in list(sess.keys())[:-500]:
+                sess.pop(k, None)
+    if sess:
+        data[sid] = sess
+    else:
+        data.pop(sid, None)
+    _save_stale_reads(p, data)
 
 def _is_mcp_read_tool(tool_name: str, tool_input: Dict[str, Any], mcp_read_tools: list) -> bool:
     if tool_name in mcp_read_tools:
@@ -222,15 +346,21 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "write_file", "edit_file") and isinstance(_fp, str) and _fp:
                 cpath = _canon_path(_fp, cwd)
                 sdir = os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or ""))
+                import tempfile as _tempfile
                 roots = [os.path.join(cwd, "scratchpad"), os.path.join(sdir, "worktrees"),
-                         os.path.expanduser("~/.claude"), os.path.expanduser("~/.gemini"), "/tmp"]
-                ar = [os.path.realpath(x) for x in roots if x]
-                creal = os.path.realpath(cpath)
-                in_allowed = any(creal == x or creal.startswith(x + os.sep) for x in ar)
-                rcwd = os.path.realpath(cwd)
+                         os.path.expanduser("~/.claude"), os.path.expanduser("~/.gemini"), "/tmp", _tempfile.gettempdir()]
+                ar = [os.path.normcase(os.path.normpath(os.path.realpath(x))) for x in roots if x]
+                creal = os.path.normcase(os.path.normpath(os.path.realpath(cpath)))
+                rcwd = os.path.normcase(os.path.normpath(os.path.realpath(cwd)))
+                in_allowed = any((creal == x or creal.startswith(x + os.sep))
+                                 and not (rcwd == x or rcwd.startswith(x + os.sep)) for x in ar)
                 in_project = creal == rcwd or creal.startswith(rcwd + os.sep)
                 if in_project and not in_allowed:
-                    return _deny("Principal hands off: your chat does not edit project files. Spin a worker (spin_worker) with the exact edit.")
+                    small = _principal_small_edit_lines()
+                    n = _edit_line_count(tool_name, tool_input) if small else -1
+                    if not (0 <= n <= small):
+                        extra = f" Small edits up to {small} changed lines are allowed; this one changes {n}." if small and n > small else ""
+                        return _deny("Principal hands off: your chat does not edit project files. Spin a worker (spin_worker) with the exact edit." + extra)
             if (tool_name in ("Read", "Grep", "Glob", "Bash", "read_file", "run_command", "search_web")
                     or _is_mcp_read_tool(tool_name, tool_input, mcp_read_tools)):
                 if max_reads > 0:
@@ -241,14 +371,6 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                                 if reset_mode == "compaction" else " Run `subway read-budget reset`.")
                         return _deny(f"Read budget reached ({n} reads, limit {max_reads}). Delegate this: spin a worker with spin_worker, "
                                      "and use code= packets in the brief instead of pulling code into this chat." + tail)
-            try:
-                import governor
-                turn_key = ""
-                r = governor.check("claude", event.get("session_id", ""), event.get("tool_name", ""), event.get("tool_input"), turn_key=turn_key)
-                if isinstance(r, dict) and not r.get("allow", True):
-                    return _deny(r.get("reason", "Governor limit reached."))
-            except Exception:
-                pass
 
     cmd = tool_input.get("CommandLine") or tool_input.get("command")
     if cmd and _writes_subway_state(str(cmd)):
@@ -260,31 +382,158 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     filepath = (tool_input.get("Path") or tool_input.get("path") or tool_input.get("file_path") or
                 tool_input.get("filepath") or tool_input.get("notebook_path")) if isinstance(tool_input, dict) else None
+    cpath = None
+    real_cpath = None
     if filepath and isinstance(filepath, str):
-        cpath = _canon_path(filepath, cwd)
-        sdir = os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or subway_home.subway_dir()))
-        sreal = os.path.realpath(sdir)
-        creal = os.path.realpath(cpath)
-        wdir = os.path.join(sdir, "worktrees")
-        wreal = os.path.join(sreal, "worktrees")
+        cpath = os.path.normcase(os.path.normpath(_canon_path(filepath, cwd)))
+        sdir = os.path.normcase(os.path.normpath(os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or subway_home.subway_dir()))))
+        sreal = os.path.normcase(os.path.normpath(os.path.realpath(sdir)))
+        real_cpath = os.path.normcase(os.path.normpath(os.path.realpath(cpath)))
+        wdir = os.path.normcase(os.path.normpath(os.path.join(sdir, "worktrees")))
+        wreal = os.path.normcase(os.path.normpath(os.path.join(sreal, "worktrees")))
         in_worktrees = (cpath == wdir or cpath.startswith(wdir + os.sep)
-                        or creal == wreal or creal.startswith(wreal + os.sep))
+                        or real_cpath == wreal or real_cpath.startswith(wreal + os.sep))
         if not in_worktrees and (cpath == sdir or cpath.startswith(sdir + os.sep)
-                or creal == sreal or creal.startswith(sreal + os.sep)):
+                or real_cpath == sreal or real_cpath.startswith(sreal + os.sep)):
             return _deny("Subway's state files are the user's to change.")
+
+    # 62b chat branches: a chat with its own branch edits only its worktree; with chat_branch_auto on, a second
+    # chat editing a tree another chat is editing must take a branch first.
+    try:
+        if (sid and principal and filepath and isinstance(filepath, str) and tool_name in
+                ("Edit", "MultiEdit", "Write", "NotebookEdit", "write_file", "edit_file", "replace_file_content", "write_to_file")):
+            import chat_branches
+            why = chat_branches.guard_edit(sid, cpath or _canon_path(filepath, cwd))
+            if why:
+                return _deny(why)
+    except Exception:
+        pass
+
+    # Stale-write guard (after existing denials, before governor block)
+    try:
+        if sid and _stale_guard_enabled():
+            if tool_name in ("Read", "view_file", "read_file") and filepath and isinstance(filepath, str):
+                if cpath is None:
+                    cpath = os.path.normcase(os.path.normpath(_canon_path(filepath, cwd)))
+                    real_cpath = os.path.normcase(os.path.normpath(os.path.realpath(cpath)))
+                if os.path.exists(cpath):
+                    sha = _sha1_file(cpath)
+                    if sha is not None:
+                        _stale_record_read(sid, real_cpath, sha)
+            elif tool_name in ("Edit", "MultiEdit", "Write", "replace_file_content", "write_to_file") and filepath and isinstance(filepath, str):
+                if cpath is None:
+                    cpath = os.path.normcase(os.path.normpath(_canon_path(filepath, cwd)))
+                    real_cpath = os.path.normcase(os.path.normpath(os.path.realpath(cpath)))
+                stored = _stale_get_hash(sid, real_cpath)
+                if stored is not None:
+                    if not os.path.exists(cpath):
+                        # no stored hash or missing file → allow (stored exists but file missing treated as allow)
+                        pass
+                    else:
+                        cur = _sha1_file(cpath)
+                        if cur is not None and cur != stored:
+                            return _deny(f"Stale write: {os.path.basename(cpath)} changed since you read it (another chat or worker edited it). Re-read it, then redo your edit.")
+                        if cur is not None and cur == stored:
+                            # compute expected post-write hash
+                            new_sha = None
+                            try:
+                                if tool_name == "Write":
+                                    content = tool_input.get("content")
+                                    if isinstance(content, str):
+                                        new_sha = _sha1_bytes(content.encode("utf-8"))
+                                    elif isinstance(content, bytes):
+                                        new_sha = _sha1_bytes(content)
+                                    else:
+                                        new_sha = None
+                                elif tool_name == "Edit":
+                                    old_string = tool_input.get("old_string")
+                                    new_string = tool_input.get("new_string")
+                                    replace_all = bool(tool_input.get("replace_all"))
+                                    with open(cpath, "rb") as f:
+                                        raw = f.read()
+                                    text = raw.decode("utf-8", "replace")
+                                    if not isinstance(old_string, str) or old_string not in text:
+                                        _stale_set_hash(sid, real_cpath, None)
+                                        stored = None  # allow
+                                        new_sha = "__deleted__"
+                                    else:
+                                        if not isinstance(new_string, str):
+                                            new_string = "" if new_string is None else str(new_string)
+                                        if replace_all:
+                                            new_text = text.replace(old_string, new_string)
+                                        else:
+                                            new_text = text.replace(old_string, new_string, 1)
+                                        new_sha = _sha1_bytes(new_text.encode("utf-8"))
+                                elif tool_name == "MultiEdit":
+                                    edits = tool_input.get("edits")
+                                    if isinstance(edits, list):
+                                        with open(cpath, "rb") as f:
+                                            raw = f.read()
+                                        text = raw.decode("utf-8", "replace")
+                                        ok = True
+                                        for ed in edits:
+                                            if not isinstance(ed, dict):
+                                                ok = False; break
+                                            o = ed.get("old_string")
+                                            n = ed.get("new_string")
+                                            ra = bool(ed.get("replace_all"))
+                                            if not isinstance(o, str) or o not in text:
+                                                ok = False; break
+                                            if not isinstance(n, str):
+                                                n = "" if n is None else str(n)
+                                            text = text.replace(o, n) if ra else text.replace(o, n, 1)
+                                        if not ok:
+                                            _stale_set_hash(sid, real_cpath, None)
+                                            new_sha = "__deleted__"
+                                        else:
+                                            new_sha = _sha1_bytes(text.encode("utf-8"))
+                                    else:
+                                        _stale_set_hash(sid, real_cpath, None)
+                                        new_sha = "__deleted__"
+                                else:
+                                    # replace_file_content, write_to_file, others → delete entry
+                                    _stale_set_hash(sid, real_cpath, None)
+                                    new_sha = "__deleted__"
+                            except Exception:
+                                _stale_set_hash(sid, real_cpath, None)
+                                new_sha = "__deleted__"
+                            if new_sha is not None and new_sha != "__deleted__":
+                                _stale_set_hash(sid, real_cpath, new_sha)
+    except Exception:
+        pass
+
+    if principal:
+        try:
+            import governor
+            turn_key = ""
+            # Antigravity is governed by adapters/antigravity_governor.py; an event
+            # with no session id would share one never-resetting "claude:" counter.
+            if provider != "claude" or not event.get("session_id"):
+                raise LookupError("governor: not a Claude Code event")
+            r = governor.check("claude", event.get("session_id", ""), event.get("tool_name", ""), event.get("tool_input"), turn_key=turn_key)
+            if isinstance(r, dict) and not r.get("allow", True):
+                return _deny(r.get("reason", "Governor limit reached."))
+        except Exception:
+            pass
 
     if not filepath or not isinstance(filepath, str):
         return _allow()
-    cpath = _canon_path(filepath, cwd)
+    if cpath is None:
+        cpath = os.path.normcase(os.path.normpath(_canon_path(filepath, cwd)))
     locks_data = load_locks()["locks"]
     lease = locks_data.get(cpath)
+    if lease is None:
+        for lk, lv in locks_data.items():
+            if "::" not in lk and os.path.normcase(os.path.normpath(lk)) == cpath:
+                lease = lv
+                break
     if lease and lease.get("holder_id") != sid and lease.get("holder") != sid:
         rem = max(0, int(lease.get("expires_at", 0) - time.time()))
         return _deny(f"Subway lease: {filepath} is held by {lease.get('holder')} for "
                      f"'{lease.get('purpose')}' ({rem}s left). Wait, or coordinate through send_note.")
 
     prefix = f"{cpath}::"
-    sym_leases = {k: v for k, v in locks_data.items() if k.startswith(prefix)}
+    sym_leases = {k: v for k, v in locks_data.items() if os.path.normcase(os.path.normpath(k.split("::", 1)[0])) + "::" == prefix and "::" in k}
     if not lease and sym_leases:
         other_sym_leases = [
             v for v in sym_leases.values()
