@@ -5,6 +5,7 @@ Spools and delivers wakeup events across AI coding clients (OpenCode, Claude Cod
 import os
 import subprocess as _subprocess_for_guard
 _REAL_POPEN = _subprocess_for_guard.Popen
+import glob
 import json
 import re
 import time
@@ -24,6 +25,7 @@ class WakeEvent:
     text: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+    thread_id: str = ""
 
 def get_spool_dir() -> str:
     spool_dir = os.path.join(_s.SUBWAY_DIR, "wake_spools")
@@ -36,6 +38,8 @@ def wake_spool_enqueue(chat_id: str, event: WakeEvent) -> bool:
     safe_id = "".join(c for c in chat_id if c.isalnum() or c in ("-", "_", "@", "."))
     spool_file = os.path.join(get_spool_dir(), f"{safe_id}.jsonl")
     payload = asdict(event)
+    if not payload.get("thread_id") and isinstance(event.data, dict):
+        payload["thread_id"] = str(event.data.get("thread_id") or event.data.get("thread") or "")
     payload["timestamp"] = payload.get("timestamp") or time.time()
     try:
         with open(spool_file, "a", encoding="utf-8") as f:
@@ -79,12 +83,12 @@ def _push_file(chat_id: str) -> str:
 PUSH_MAX_BYTES = 256 * 1024
 
 
-def wake_push_enqueue(chat_id: str, text: str, kind: str = "", worker_id: str = "") -> bool:
+def wake_push_enqueue(chat_id: str, text: str, kind: str = "", worker_id: str = "", thread_id: str = "") -> bool:
     """Events the user's wake rules say should wake this chat now. Read by the chat's own MCP server."""
     if not chat_id or not text:
         return False
     path = _push_file(chat_id)
-    line = json.dumps({"ts": time.time(), "kind": kind, "worker_id": worker_id, "text": text}) + "\n"
+    line = json.dumps({"ts": time.time(), "kind": kind, "worker_id": worker_id, "thread_id": thread_id, "text": text}) + "\n"
     try:
         with open(path, "a+", encoding="utf-8") as f:
             win_lock.lock(f.fileno())
@@ -133,6 +137,63 @@ def wake_push_end(chat_id: str) -> int:
         return os.path.getsize(_push_file(chat_id))
     except OSError:
         return 0
+
+
+def archive_orphaned_spools(min_age_days: float = 2.0) -> Dict[str, int]:
+    """Across-the-board spool hygiene: move spool files of dead chats to an archive dir.
+
+    A spool file only drains when its chat next calls Subway; chats that are gone keep
+    the file forever (236 of 393 files here were dead-chat graveyards, 156 holding
+    undelivered events). Events are archived, never deleted — they are the record of
+    what never arrived. Live sessions (by pi_sessions pid mapping or an open worker)
+    are never touched.
+    """
+    import shutil, time as _time
+    spool = get_spool_dir()
+    attic = os.path.join(os.path.dirname(spool), "wake_spools_archive")
+    os.makedirs(attic, exist_ok=True)
+    cutoff = _time.time() - max(0.0, min_age_days) * 86400.0
+    live_ids: set = set()
+    # live pi sessions
+    pd = os.path.join(os.path.dirname(spool), "pi_sessions")
+    try:
+        for name in os.listdir(pd):
+            try:
+                pid = int(name)
+                os.kill(pid, 0)
+                with open(os.path.join(pd, name), "r", encoding="utf-8", errors="replace") as f:
+                    sid = f.read().strip()
+                    if sid:
+                        live_ids.add(sid)
+            except (ValueError, OSError):
+                continue
+    except OSError:
+        pass
+    # live workers
+    try:
+        for w in _s._all_workers():
+            if str(w.get("status") or "") in getattr(_s, "ACTIVE_WORKER_STATES", ()):
+                live_ids.add(str(w.get("id") or ""))
+    except Exception:
+        pass
+    moved = 0
+    bytes_moved = 0
+    for path in glob.glob(os.path.join(spool, "*.jsonl")):
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue  # too young to judge
+            sid = os.path.basename(path)[:-6]
+            if sid in live_ids:
+                continue
+            size = os.path.getsize(path)
+            stamp = _time.strftime("%Y%m%d-%H%M%S", _time.localtime(os.path.getmtime(path)))
+            dest = os.path.join(attic, f"{stamp}-{sid}.jsonl")
+            shutil.move(path, dest)
+            moved += 1
+            bytes_moved += size
+        except OSError:
+            continue
+    return {"moved": moved, "bytes": bytes_moved, "archive_dir": attic}
 
 
 def wake_spool_depth(chat_id: str) -> int:
@@ -398,10 +459,47 @@ def agy_window_registered(pid: int) -> bool:
         return False
 
 
+_AGY_WIN_PID_RE = re.compile(r"^agy-(\d+)$")
+
+
 def agy_window_pid(chat_id: str) -> Optional[int]:
-    """`agy-<pid>` names a GUI window, which is the only id the extension can claim."""
-    m = re.match(r"^agy-(\d+)$", str(chat_id or "").strip())
-    return int(m.group(1)) if m else None
+    """`agy-<pid>` names a GUI window directly; a UUID conversation id is resolved to a
+    window through the ~/.subway/agy_windows/*.json registry (pid, app, workspace,
+    updated_at), preferring the newest window whose workspace matches the cwd. B4."""
+    clean = str(chat_id or "").strip().lstrip("@")
+    m = _AGY_WIN_PID_RE.match(clean)
+    if m:
+        return int(m.group(1))
+    if not _AGY_CID_RE.match(clean):
+        return None
+    try:
+        reg = os.path.join(_s.SUBWAY_DIR, "agy_windows")
+        files = sorted(glob.glob(os.path.join(reg, "*.json")),
+                       key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        return None
+    try:
+        cwd = os.path.normpath(os.getcwd()).lower()
+    except Exception:
+        cwd = ""
+    best = None
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        pid = int(data.get("pid") or 0)
+        if pid <= 0:
+            continue
+        workspaces = data.get("workspace") or []
+        hit = any(os.path.normpath(str(w)).lower() and cwd and os.path.normpath(str(w)).lower() in cwd
+                  or (cwd and cwd in os.path.normpath(str(w)).lower())
+                  for w in workspaces if isinstance(w, str))
+        if hit:
+            return pid  # newest window whose workspace matches cwd
+        best = best or pid  # first (newest) window as fallback
+    return best
 
 
 def agy_gui_wake(chat_id: str, text: str) -> bool:
@@ -815,7 +913,18 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
     event_dict["actions"] = list(rule["actions"])
     event_dict["rule_source"] = rule["source"]
 
-    wake_push_enqueue(chat_id, message, kind=getattr(event, "kind", ""), worker_id=getattr(event, "worker_id", ""))
+    event_thread_id = getattr(event, "thread_id", "") or (
+        str(event.data.get("thread_id") or event.data.get("thread") or "")
+        if isinstance(getattr(event, "data", None), dict)
+        else ""
+    )
+    wake_push_enqueue(
+        chat_id,
+        message,
+        kind=getattr(event, "kind", ""),
+        worker_id=getattr(event, "worker_id", ""),
+        thread_id=event_thread_id,
+    )
 
     dispatch_res: Dict[str, bool] = {}
     try:
@@ -865,9 +974,10 @@ def wake_chat(chat_id: str, event: WakeEvent, config: Optional[Dict[str, Any]] =
 
     # The wake is out (push enqueued and/or dispatched); it stands in for everything
     # in the spool, so drain it. Quiet events returned earlier and stay spooled, and so do
-    # events whose Antigravity wake was throttled or failed: they were never delivered, and
-    # the next wake reports them as "(+N earlier event(s) queued ...)".
-    if method not in ("antigravity_throttled", "antigravity_failed"):
+    # undelivered events, claude_spooled (consumed by hook/session monitor), and events whose
+    # Antigravity wake was throttled or failed: the next wake reports them as
+    # "(+N earlier event(s) queued ...)".
+    if delivered and method not in ("antigravity_throttled", "antigravity_failed", "claude_spooled"):
         wake_spool_drain(chat_id)
 
     return {

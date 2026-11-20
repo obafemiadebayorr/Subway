@@ -20,6 +20,7 @@ import hashlib
 
 import hmac
 
+import http.cookies
 import http.server
 
 import ipaddress
@@ -78,6 +79,10 @@ import urllib.request
 
 import uuid
 
+# Peer-scope rate-limit audit throttle: at most one audit entry per device per minute.
+_peer_rate_audit_lock = threading.Lock()
+_peer_rate_audit_last: dict = {}
+
 
 def _wake_rules_error(rules):
     """None when rules is a valid {event: {"wake": bool, "actions": [str]}} override, else the reason."""
@@ -125,19 +130,19 @@ import fastmail
 
 
 # Mutating routes whose successful answers are recorded in audit.jsonl (layer 2: who did what).
-AUDITED = frozenset({"/api/answer_permission", "/api/approve_worker", "/api/reject_worker", "/api/stop_worker",
-    "/api/spawn", "/api/peer/spawn", "/api/peer/approve_worker", "/api/run_concurrent", "/api/thread_action", "/api/home_prefs", "/api/mail", "/api/peer/mail", "/api/chat", "/api/chat/new", "/api/conversation/swap", "/api/peer/hub_call", "/api/peer/file", "/api/broadcast", "/api/settings",
-    "/api/remote_workers/approve", "/api/remote_workers/reject", "/api/remote_workers/land",
-    "/api/budget", "/api/chat_budget", "/api/pair/approve", "/api/pair/deny", "/api/pair/revoke", "/api/pair/rename",
+AUDITED = frozenset({"/api/acp_pump/close", "/api/peer/thread/send", "/api/answer_permission", "/api/approve_worker", "/api/reject_worker", "/api/stop_worker",
+    "/api/spawn", "/api/peer/spawn", "/api/peer/approve_worker", "/api/run_concurrent", "/api/thread_action", "/api/thread_cut", "/api/thread_fork", "/api/chat_compact", "/api/home_prefs", "/api/mail", "/api/peer/mail", "/api/chat", "/api/chat/new", "/api/conversation/swap", "/api/peer/hub_call", "/api/peer/file", "/api/peer/term/run", "/api/broadcast", "/api/settings",
+    "/api/remote_workers/approve", "/api/remote_workers/reject", "/api/remote_workers/land", "/api/peers/answer_permission", "/api/peers/alias",
+    "/api/budget", "/api/chat_budget", "/api/pair/approve", "/api/pair/deny", "/api/pair/revoke", "/api/pair/rename", "/api/worker/instruct", "/api/devices/grant",
     "/api/claim", "/api/release", "/api/landing/resolve", "/api/landing/drop", "/api/landing/merge", "/api/landing/discard", "/api/worker_archive", "/api/worker_unarchive", "/api/clear_history",
     "/api/iteration/start", "/api/iteration/stop", "/api/thread/rewind", "/api/thread/fork",
-    "/api/peer/prepare", "/api/peer/complete", "/api/peers/allowance", "/api/peers/grants", "/api/peers/controller", "/api/peer/unlink", "/api/peer/link", "/api/peer/screen/request", "/api/screen/answer", "/api/screen/control"})
+    "/api/peer/prepare", "/api/peer/complete", "/api/peers/allowance", "/api/peers/grants", "/api/peers/controller", "/api/peers/rotate_keys", "/api/peer/unlink", "/api/peer/wake", "/api/peer/link", "/api/peer/screen/request", "/api/screen/answer", "/api/screen/control", "/api/ship/start", "/api/ship/advance", "/api/peer/thread/pen", "/api/vms/action"})
 
 
 def _conversation_links() -> list:
     """Linked-provider handoffs: which chats continue as one conversation elsewhere."""
-    import fastmail_lines
-    raw = fastmail_lines._load_handoff_map()
+    import provider_lines
+    raw = provider_lines._load_handoff_map()
     links = []
     for k, v in raw.items():
         if k.endswith(":needs_digest") or not isinstance(v, str) or ":" not in k:
@@ -145,6 +150,46 @@ def _conversation_links() -> list:
         cid, prov = k.rsplit(":", 1)
         links.append({"from": cid, "to_provider": prov, "to": v})
     return links
+
+
+def _is_starting_chat(chat_id: str) -> bool:
+    """Return True when chat_id is a newly launched/pending or handoff-mapped session."""
+    cid = str(chat_id or "").strip().lstrip("@")
+    if not cid:
+        return False
+    try:
+        import provider_lines
+    except Exception:
+        provider_lines = None
+    if provider_lines is not None:
+        try:
+            if provider_lines.latest_run(cid) is not None:
+                return True
+        except Exception:
+            pass
+        pending_fn = getattr(provider_lines, "is_pending_launch", None)
+        if callable(pending_fn):
+            try:
+                if pending_fn(cid):
+                    return True
+            except Exception:
+                pass
+        try:
+            hmap = provider_lines._load_handoff_map() or {}
+            if cid in hmap or cid in hmap.values():
+                return True
+        except Exception:
+            pass
+    try:
+        import handoff_sessions
+        load_fn = getattr(handoff_sessions, "load_handoff_map", None)
+        if callable(load_fn):
+            hmap = load_fn() or {}
+            if cid in hmap or cid in hmap.values():
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _principal_checkpoints(chat_id: str) -> list:
@@ -160,7 +205,8 @@ def _principal_checkpoints(chat_id: str) -> list:
     for tid, entry in threads_all.items():
         for h in entry.get("principal_history") or []:
             a, b = str(h.get("from_principal") or ""), str(h.get("to_principal") or "")
-            if not a or a == b or cid not in (a, b, str(tid)):
+            a_norm, b_norm, tid_norm = a.strip().lstrip("@"), b.strip().lstrip("@"), str(tid).strip().lstrip("@")
+            if not a_norm or a_norm == b_norm or cid not in (a_norm, b_norm, tid_norm):
                 continue
             try:
                 at = float(h.get("at") or 0)
@@ -454,7 +500,233 @@ def _status_cached(project: str):
         return val
 
 
+
+# ---- Compaction in the Home panel: context meter + manual compaction (auto-compaction lives in usage/compaction.py) ----
+# Only paths that run the command as a command: Claude headless resume (no window open) and pi's queue.
+# A push into an open window's inbox, or `opencode run "/compact"`, may arrive as plain text, so those stay off
+# until verified; the panel tells the user to type it in the window instead.
+COMPACT_CMD = {"claude": "/compact"}
+_CTX_MAX = 200
+_QUEUE_COMPACT = ("pi", "deepai")
+_CTX_CACHE: dict = {}
+
+
+def _claude_tail_context(path, tail=2 << 20):
+    """(tokens in context, window) from the last assistant usage in the transcript's tail. Never reads the whole file."""
+    import json as _j
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - tail))
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, 0
+    for line in reversed(lines):
+        if '"assistant"' not in line or '"usage"' not in line:
+            continue
+        try:
+            ent = _j.loads(line)
+        except ValueError:
+            continue
+        msg = ent.get("message") if isinstance(ent.get("message"), dict) else {}
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
+        if ent.get("type") != "assistant" or not u:
+            continue
+        used = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+        model = str(msg.get("model") or "").lower()
+        window = 1000000 if ("1m" in model or used > 200000) else 200000
+        return used, window
+    return None, 0
+
+
+def _project_allowed(project_dir: str) -> bool:
+    """The HUD may only browse/discover in projects this station actually knows (F1/F2/F5 fix)."""
+    cand = os.path.realpath(str(project_dir or "").strip())
+    if not cand or cand == "/":
+        return False
+    known = {os.path.realpath(str(os.environ.get("SUBWAY_PROJECT_DIR", "") or os.getcwd())), os.path.realpath(os.getcwd())}
+    known |= {os.path.realpath(str(c.get("project") or "")) for c in _s.all_chats("all") if c.get("project")}
+    return cand in known
+
+
+def _chat_context_info(cid):
+    """{provider, used, window, at, pct, can_compact, compactions} for one chat; cached 10 s per id."""
+    import time as _t
+    hit = _CTX_CACHE.get(cid)
+    if hit and _t.time() - hit[0] < 10:
+        return dict(hit[1])
+    from usage import compaction as _cmp
+    try:
+        c = _s.resolve(cid, strict=True) or {}
+    except Exception:
+        c = {}
+    prov = str(c.get("source") or "").lower()
+    cacheable = bool(prov)
+    used, window = None, 0
+    if prov == "claude" and c.get("path"):
+        used, window = _claude_tail_context(c["path"])
+    elif prov in _QUEUE_COMPACT:
+        try:
+            used, window = _cmp.chat_context_usage(cid)
+        except Exception:
+            used, window = None, 0
+    at = int(_cmp.compact_at_tokens() or 0)
+    marks = []
+    if prov == "claude" and c.get("path"):
+        try:
+            from transplant.ir import norm_ts
+            # Same 8MB tail the panel reads (cached by size+mtime), so markers line up with the shown turns.
+            segs = _s.claude_read_segments(c["path"], tail_bytes=8 << 20)
+            for seg in (segs or [])[1:]:
+                ts = norm_ts(seg[0].get("ts")) if seg and isinstance(seg[0], dict) else None
+                if ts:
+                    marks.append(float(ts))
+        except Exception:
+            marks = []
+    info = {"id": cid, "provider": prov, "used": used, "window": int(window or 0), "at": at,
+            "pct": (round(100 * used / at) if used is not None and at else None),
+            "can_compact": prov in COMPACT_CMD or prov in _QUEUE_COMPACT, "compactions": marks[-20:]}
+    if cacheable:
+        if len(_CTX_CACHE) >= _CTX_MAX:
+            _CTX_CACHE.pop(min(_CTX_CACHE, key=lambda k: _CTX_CACHE[k][0]), None)
+        _CTX_CACHE[cid] = (_t.time(), info)
+    return dict(info)
+
+
+def _chat_compact(cid):
+    """(status, body) for a manual compaction: the provider's own slash command, or pi's compaction queue."""
+    try:
+        c = _s.resolve(cid, strict=True) or {}
+    except Exception:
+        c = {}
+    prov = str(c.get("source") or "").lower()
+    name = prov.capitalize() or "This chat"
+    if prov not in COMPACT_CMD and prov not in _QUEUE_COMPACT:
+        return 409, {"error": f"{name} can't be compacted from Subway yet; it compacts on its own at the threshold"}
+    try:
+        from cli_tools import chats as _chats
+        working = ((_chats.chat_live(cid, turns=2) or {}).get("live") or {}).get("working")
+    except Exception:
+        return 502, {"error": "couldn't tell whether a reply is running; try again"}
+    if working:
+        return 409, {"error": "turn running"}
+    import provider_lines
+    if prov == "claude" and not provider_lines.claude_window_closed(cid, c.get("path", "")):
+        return 409, {"error": "This chat is open in a Claude window: type /compact there"}
+    _CTX_CACHE.pop(cid, None)
+    if prov in _QUEUE_COMPACT:
+        from usage import compaction as _cmp
+        path = _cmp.request_chat_compaction(cid, reason="manual", min_gap=0)
+        return (200, {"ok": True, "method": "queued", "command": "/compact"}) if path else (502, {"error": "could not queue the compaction"})
+    cmd = COMPACT_CMD[prov]
+    res = provider_lines.send_to_chat(cid, cmd, source=prov) or {}
+    if res.get("delivered") or res.get("ok"):
+        _CTX_CACHE.pop(cid, None)
+        return 200, {"ok": True, "method": "slash", "command": cmd}
+    return 502, {"error": str(res.get("detail") or "not delivered")}
+
+
+def _opencode_db_file() -> str:
+    """Path to the OpenCode store, honouring the SUBWAY_OPENCODE_DIR override."""
+    root = getattr(_s, "OPENCODE_DIR", "") or os.path.join(
+        os.path.expanduser("~"), ".local", "share", "opencode")
+    return os.path.join(str(root), "opencode.db")
+
+
+def _provider_archive_or_delete(tid: str, action: str, value: Any = None) -> Dict[str, Any]:
+    """Best-effort mirror of an archive/delete onto the provider's own store.
+
+    Returns a small dict merged into the thread_action response. Provider failures never
+    stop Subway's own record from changing: the user can still recall or delete there.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        chat = _s.resolve(tid, strict=False) or {}
+    except Exception:
+        chat = {}
+    source = str(chat.get("source") or "").lower()
+    cid = str(chat.get("id") or tid)
+
+    if action == "archive":
+        if source != "opencode":
+            return out
+        db = _opencode_db_file()
+        if not os.path.isfile(db):
+            return out
+        try:
+            con = sqlite3.connect(db, timeout=5)
+        except Exception:
+            return out
+        try:
+            ts = int(time.time() * 1000) if thread_state._truthy(value) else None
+            for table in ("session", "session_v2"):
+                try:
+                    cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+                except Exception:
+                    continue
+                if "time_archived" not in cols or "id" not in cols:
+                    continue
+                con.execute(f"UPDATE {table} SET time_archived = ? WHERE id = ?", (ts, cid))
+                con.commit()
+                out["provider_archived"] = True
+                break
+        except Exception:
+            pass
+        finally:
+            con.close()
+        return out
+
+    if action != "delete_permanent":
+        return out
+    if not (thread_state._truthy(value) or value in ("on", True, "true", "1", "")):
+        return out
+
+    if source == "opencode":
+        db = _opencode_db_file()
+        if not os.path.isfile(db):
+            out["provider_deleted"] = False
+            return out
+        try:
+            con = sqlite3.connect(db, timeout=5)
+        except Exception:
+            out["provider_deleted"] = False
+            return out
+        deleted = False
+        try:
+            for table in ("part", "message", "session_message"):
+                try:
+                    deleted = con.execute(
+                        f"DELETE FROM {table} WHERE session_id = ?", (cid,)).rowcount > 0 or deleted
+                except Exception:
+                    pass
+            for table in ("session", "session_v2"):
+                try:
+                    deleted = con.execute(
+                        f"DELETE FROM {table} WHERE id = ?", (cid,)).rowcount > 0 or deleted
+                except Exception:
+                    pass
+            con.commit()
+        except Exception:
+            pass
+        finally:
+            con.close()
+        out["provider_deleted"] = bool(deleted)
+        return out
+
+    path = str(chat.get("path") or "")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+            out["provider_deleted"] = True
+        except OSError:
+            out["provider_deleted"] = False
+    else:
+        out["provider_deleted"] = False
+    return out
+
+
 class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     server_version = "SubwayHUD"
     sys_version = ""
 
@@ -525,12 +797,17 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         header = self.headers.get("X-Subway-Token", "").strip()
         auth = self.headers.get("Authorization", "").strip()
         bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
-        q_token = ""
-        # Query token kept for /api/events until the app sends the header (L1-M1); remove after.
-        if hasattr(self, "path") and "?" in self.path and _query_token_allowed(urllib.parse.urlparse(self.path).path):
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            q_token = (qs.get("token") or [""])[0].strip()
-        return [t for t in (header, bearer, q_token) if t]
+        cookie_token = ""
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            try:
+                jar = http.cookies.SimpleCookie(cookie_header)
+                morsel = jar.get("subway_token")
+                if morsel:
+                    cookie_token = morsel.value.strip()
+            except Exception:
+                cookie_token = ""
+        return [t for t in (header, bearer, cookie_token) if t]
 
     def _authorized(self) -> bool:
         """Set `self._scope` and `self._device_id`; False when the request may not proceed."""
@@ -696,7 +973,34 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             _method = getattr(self, "command", "GET")
             if pairing._normalise_scope(_scope) == pairing.SCOPE_PEER:
                 import peers
-                allowed, reason = peers.allows(getattr(self, "_device_id", "") or "", _route, _method)
+                _dev = getattr(self, "_device_id", "") or ""
+                _rok, _retry = peers.rate_ok(_dev)
+                if not _rok:
+                    with _peer_rate_audit_lock:
+                        _now = time.time()
+                        _last = _peer_rate_audit_last.get(_dev, 0.0)
+                        _do_audit = (_now - _last) >= 60.0
+                        if _do_audit:
+                            _peer_rate_audit_last[_dev] = _now
+                    if _do_audit:
+                        try:
+                            import audit
+                            audit.record(self._audit_actor(), "peer_rate_limit", {"device_id": _dev[:120]}, ok=False)
+                        except Exception:
+                            pass
+                    _body = json.dumps({"error": "too many requests from this linked station"}).encode("utf-8")
+                    try:
+                        self.send_response(429)
+                        self.send_header("Retry-After", str(_retry))
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(_body)))
+                        self._security_headers()
+                        self.end_headers()
+                        self.wfile.write(_body)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return False
+                allowed, reason = peers.allows(_dev, _route, _method)
             else:
                 allowed, reason = pairing.scope_allows(_scope, _route, _method)
             if not allowed:
@@ -795,9 +1099,6 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             'if(init&&init.headers&&typeof init.headers.append==="function"){init=new Object(init);init.headers=new Headers(init.headers);init.headers.set("X-Subway-Token",t)}'
             'else{init=init?Object.assign({},init):{};var h=new Headers(init.headers||((typeof i!=="string"&&i&&i.headers)?i.headers:undefined));h.set("X-Subway-Token",t);init.headers=h}}'
             'return F.call(this,i,init)};'
-            'var E=window.EventSource;if(E){window.EventSource=function(u,o){var p=s(u);'
-            'if(p&&p.origin===location.origin&&p.pathname.indexOf("/api/")===0&&t&&!p.searchParams.has("token")){p.searchParams.set("token",t);u=p.toString()}'
-            'return new E(u,o)};window.EventSource.prototype=E.prototype;}'
             '})();</script>'
         ).replace("__CSP_NONCE__", nonce)
         if "</head>" in page:
@@ -809,6 +1110,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
+            if token:
+                self.send_header(
+                    "Set-Cookie",
+                    f"subway_token={token}; Path=/api/; HttpOnly; SameSite=Strict",
+                )
             self._security_headers(nonce)
             self.end_headers()
             self.wfile.write(payload)
@@ -816,7 +1122,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             return
 
     def _serve_hud_next_asset(self, path: str) -> None:
-        """Serve hud_next static root files and allowed subdirs (icons/, wallpaper/)."""
+        """Serve hud_next static root files and allowed subdirs (icons/, wallpaper/, logo/)."""
         rel = path.lstrip("/").split("?", 1)[0]
         if os.path.isabs(rel):
             rel = rel[1:]
@@ -835,9 +1141,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if base.startswith(".") or base.endswith(".txt") or base.endswith(".bak"):
             self._deny(404, "Not found")
             return
-        if rel.startswith("icons/") or rel.startswith("wallpaper/"):
-            allowed_sub = rel.startswith("icons/") or rel.startswith("wallpaper/")
-            if not allowed_sub or "/" not in rel.rstrip("/") or rel.count("/") != 1:
+        if rel.startswith(("icons/", "wallpaper/", "logo/", "assets/devices/")):
+            depth = 2 if rel.startswith("assets/devices/") else 1  # device frame images sit one level deeper
+            if "/" not in rel.rstrip("/") or rel.count("/") != depth:
                 self._deny(404, "Not found")
                 return
         elif "/" in rel:
@@ -858,7 +1164,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if not kind:
             self._deny(404, "Not found")
             return
-        if not re.fullmatch(r"(?:icons/|wallpaper/)?[A-Za-z0-9._-]+\.(?:js|css|svg|png|jpg|jpeg|webp|woff2)", rel):
+        if not re.fullmatch(r"(?:icons/|wallpaper/|logo/)?[A-Za-z0-9._-]+\.(?:js|css|svg|png|jpg|jpeg|webp|woff2)", rel):
             self._deny(404, "Not found")
             return
         try:
@@ -912,14 +1218,22 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         """
         b = sse_stream.get_broadcaster()
         sub_q = b.subscribe()
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         since_raw = (self.headers.get("Last-Event-ID") or "").strip()
         if not since_raw:
-            q = urllib.parse.urlparse(self.path).query
-            since_raw = (urllib.parse.parse_qs(q).get("since", [""])[0] or "").strip()
+            since_raw = (qs.get("since", [""])[0] or "").strip()
         try:
             since = int(since_raw)
         except (TypeError, ValueError):
             since = -1
+        thread_spec = (qs.get("thread", [""])[0] or "").strip()
+        poll_raw = (qs.get("poll_interval", [""])[0] or "").strip()
+        try:
+            poll_interval = max(0.01, float(poll_raw)) if poll_raw else 2.0
+        except (TypeError, ValueError):
+            poll_interval = 2.0
+        min_interval = 0.01 if poll_raw else 2.0
+        tail_stop = threading.Event() if thread_spec else None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -938,6 +1252,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             for frame in replay:
                 self.wfile.write(frame.encode("utf-8"))
             self.wfile.flush()
+            if thread_spec and tail_stop is not None:
+                def _emit_tail(frame: str) -> None:
+                    try:
+                        sub_q.put_nowait(frame)
+                    except queue.Full:
+                        pass
+                threading.Thread(
+                    target=sse_stream.tail_remote_thread,
+                    args=(thread_spec, _emit_tail),
+                    kwargs={"stop_event": tail_stop, "poll_interval": poll_interval, "min_interval": min_interval},
+                    name="subway-thread-tail",
+                    daemon=True,
+                ).start()
             while True:
                 try:
                     msg = sub_q.get(timeout=15.0)
@@ -949,6 +1276,8 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
+            if tail_stop is not None:
+                tail_stop.set()
             b.unsubscribe(sub_q)
 
     def _stream_chat(self, chat_id: str, source: str) -> None:
@@ -982,6 +1311,14 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         last_sent = time.monotonic()
         extra: Optional[str] = None
         last_extra_sig = None
+        run_meta: Optional[dict] = None
+        live_key = ""
+        last_live_v = 0
+        last_live_running: Optional[bool] = None
+        try:
+            from hud_server import live_relay
+        except Exception:
+            live_relay = None  # type: ignore
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
@@ -993,8 +1330,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     if sig != last_sig:
                         last_sig = sig
                         due = True
-                    if _sig(extra) != last_extra_sig:
-                        due = True
+                    elif extra and _sig(extra) != last_extra_sig:
+                        # Transcript unchanged but the run log grew: cheap delta straight
+                        # from the run log, no chat_live call, no full chat event.
+                        last_extra_sig = _sig(extra)
+                        _meta = run_meta or {"log": extra, "offset": 0, "text": ""}
+                        try:
+                            import provider_lines as _fml
+                            _live = _fml.live_from_run(_meta)
+                        except Exception:
+                            _live = {"text": "", "running": False}
+                        msg = f"event: delta\ndata: {json.dumps({'text': _live.get('text') or '', 'running': bool(_live.get('running'))}, ensure_ascii=False)}\n\n"
+                        self.wfile.write(msg.encode("utf-8"))
+                        self.wfile.flush()
                 if due:
                     last_call = now
                     try:
@@ -1005,6 +1353,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.flush()
                         return
                     extra = None
+                    run_meta = None
                     try:
                         from transplant import engine as _eng
                         _root, _rec = _eng.conversation_for(chat_id)
@@ -1017,14 +1366,47 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                                 last_sent_entry = sent[-1]
                                 extra = last_sent_entry.get("log")   # headless run log of the latest send into the current segment
                                 if extra:
+                                    run_meta = {"log": extra, "offset": last_sent_entry.get("offset") or 0,
+                                                "text": last_sent_entry.get("text") or ""}
                                     live_text = _eng._strip_cli_noise(_eng._log_tail(extra, last_sent_entry.get("offset") or 0))
                                     data["live"] = {"text": live_text, "user": last_sent_entry.get("text") or ""}
                     except Exception:
                         pass
+                    if not extra:
+                        # No swapped-transcript segment to tail: fall back to the newest recorded headless run.
+                        try:
+                            import provider_lines as _fml
+                            _meta = _fml.latest_run(chat_id)
+                            if _meta:
+                                extra = _meta["log"]
+                                run_meta = _meta
+                                data["live"] = {**(data.get("live") or {}), **_fml.live_from_run(_meta)}
+                        except Exception:
+                            pass
+                    if extra and run_meta and "running" not in run_meta:
+                        # Swap-branch meta has no proc of its own; take the running flag from the recorded run.
+                        try:
+                            import provider_lines as _fml
+                            _m = _fml.latest_run(chat_id)
+                            if _m:
+                                run_meta["running"] = _m.get("running")
+                        except Exception:
+                            pass
                     path = str(data.get("path") or "")
                     if path:
                         last_sig = _sig(path)
                     last_extra_sig = _sig(extra)
+                    live_key = os.path.basename(extra)[:-4] if extra and str(extra).endswith(".log") else ""
+                    if live_key:
+                        try:
+                            last_live_v = live_relay.version(live_key) if live_relay else 0
+                            last_live_running = live_relay.running(live_key) if live_relay else None
+                        except Exception:
+                            last_live_v = 0
+                            last_live_running = None
+                    else:
+                        last_live_v = 0
+                        last_live_running = None
                     payload = json.dumps(data, ensure_ascii=False, default=str)
                     if payload != last_json:
                         last_json = payload
@@ -1036,6 +1418,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last_sent = time.monotonic()
                 sleep_s = 0.1 if extra else 0.3
+                if live_key and live_relay and live_relay.running(live_key) is not None:
+                    v = live_relay.wait(live_key, last_live_v, 0.5)
+                    if v != last_live_v:
+                        last_live_v = v
+                        rnow = bool(live_relay.running(live_key))
+                        if last_live_running is True and rnow is False:
+                            due = True
+                        last_live_running = rnow
+                        msg = f"event: delta\ndata: {json.dumps({'text': live_relay.text(live_key), 'running': rnow}, ensure_ascii=False)}\n\n"
+                        self.wfile.write(msg.encode("utf-8"))
+                        self.wfile.flush()
+                        last_sent = time.monotonic()
+                        continue
                 if path and os.path.exists(path) and hasattr(select, "kqueue"):
                     kq = None
                     fd = -1
@@ -1044,7 +1439,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                         kq = select.kqueue()
                         kq.control([select.kevent(fd, select.KQ_FILTER_VNODE,
                             select.KQ_EV_ADD | select.KQ_EV_CLEAR | select.KQ_EV_ONESHOT,
-                            select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_ATTRIB | select.KQ_NOTE_RENAME)], None)
+                            select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_ATTRIB | select.KQ_NOTE_RENAME)], 0)
                         woke = bool(kq.control(None, 1, sleep_s))
                         if not woke:
                             stop.wait(max(0.0, sleep_s - (time.monotonic() - now)))
@@ -1242,7 +1637,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if not self._gate(api=True):
                 return
             import mcp_connect_api
-            status, body = mcp_connect_api.handle_get((query.get("project") or [""])[0])
+            _mc_proj = (query.get("project") or [""])[0]
+            if str(_mc_proj).strip() and not _project_allowed(_mc_proj):
+                self._deny(403, "project folder is not a known station project")
+                return
+            status, body = mcp_connect_api.handle_get(_mc_proj)
             self.send_json(body, status=status)
             return
         if path == "/api/mcp/hub/servers":
@@ -1277,7 +1676,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if path != "/" and not path.startswith("/api/"):
             # hud_next static files at root and allowed subdirs
             if re.fullmatch(r"/[A-Za-z0-9._-]+\.(?:js|css|svg|png|jpg|jpeg|webp|woff2)", path) or \
-               re.fullmatch(r"/(?:icons|wallpaper)/[A-Za-z0-9._-]+\.(?:js|css|svg|png|jpg|jpeg|webp|woff2)", path):
+               re.fullmatch(r"/(?:icons|wallpaper|logo)/[A-Za-z0-9._-]+\.(?:js|css|svg|png|jpg|jpeg|webp|woff2)", path):
                 if self._gate(api=False):
                     self._serve_hud_next_asset(path)
                 return
@@ -1373,6 +1772,10 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             import vfs
             rel = (query.get("path") or query.get("p") or [""])[0]
             sha = (query.get("sha") or [""])[0]
+            proj = query.get("project", [""])[0]
+            if str(proj).strip() and not _project_allowed(proj):
+                self._deny(403, "project folder is not a known station project")
+                return
             try:
                 self.send_json(vfs.blob(
                     project_dir=query.get("project", [""])[0],
@@ -1425,6 +1828,44 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(_wake.status())
             return
 
+        if path == "/api/ship/preflight":
+            if not self._gate(api=True):
+                return
+            project = (query.get("project") or [""])[0]
+            lane = (query.get("lane") or [""])[0]
+            tests_param = (query.get("tests") or ["0"])[0]
+            run_tests = tests_param in ("1", "true", "yes")
+            worktree = None
+            if lane:
+                try:
+                    import lanes
+                    worktree = lanes.get(project, lane)["worktree"]
+                except Exception:
+                    worktree = None
+            if not worktree:
+                worktree = _default_git_repo()
+            import ship_preflight
+            res = ship_preflight.run(worktree, run_tests=run_tests)
+            self.send_json(res)
+            return
+
+        if path == "/api/ship/state":
+            if not self._gate(api=True):
+                return
+            project = (query.get("project") or [""])[0]
+            lane = (query.get("lane") or [""])[0]
+            if not lane:
+                self.send_json({"error": "lane is required"}, 400)
+                return
+            import ship_flow
+            try:
+                self.send_json(ship_flow.state(project or _default_git_repo(), lane))
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
         if path == "/api/pair/list":
             self.send_json({"requests": pairing.list_requests(include_done=False), "devices": pairing.list_devices()})
             return
@@ -1438,6 +1879,23 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(data)
             return
 
+        if path == "/api/conversation/preview":
+            chat_id = (query.get("chat_id") or query.get("id") or [""])[0].strip()
+            to_provider = (query.get("to_provider") or query.get("provider") or [""])[0].strip().lower()
+            if not chat_id:
+                self._deny(400, "Missing chat_id")
+                return
+            import conversation_swap
+            self.send_json(conversation_swap.preview_swap(chat_id, to_provider))
+            return
+
+        if path == "/api/chat_context":
+            cid = query.get("id", [""])[0]
+            if not cid:
+                self._deny(400, "Missing chat id")
+                return
+            self.send_json(_chat_context_info(cid))
+            return
         if path == "/api/chat_read":
             from cli_tools import chats as _chats
             chat_wanted = query.get("id", [""])[0]
@@ -1454,7 +1912,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 payload = _chats.chat_turns(chat_wanted, source=source_wanted, turns=turns_wanted)
                 try:
                     from transplant import engine as _eng
-                    _merged, _conv = _eng.merge_conversation_turns(chat_wanted, payload.get("turns") or [])
+                    _merged, _conv = _eng.merge_conversation_turns(chat_wanted, payload.get("turns") or [], turns_limit=turns_wanted)
                     if _conv:
                         payload["turns"], payload["conversation"] = _merged, _conv
                 except Exception:
@@ -1462,8 +1920,14 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 payload["checkpoints"] = _principal_checkpoints(chat_wanted)
                 self.send_json(payload)
             except ValueError as e:
+                if _is_starting_chat(chat_wanted):
+                    self.send_json({"ok": True, "starting": True, "turns": []})
+                    return
                 self._deny(400, str(e))
             except (LookupError, OSError, KeyError) as e:
+                if _is_starting_chat(chat_wanted):
+                    self.send_json({"ok": True, "starting": True, "turns": []})
+                    return
                 self._deny(404, str(e))
             return
 
@@ -1487,6 +1951,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/composer/project_files":
             q = query.get("q", [""])[0]
             project_dir = query.get("project_dir", [""])[0]
+            if str(project_dir).strip() and not _project_allowed(project_dir):
+                self._deny(403, "project folder is not a known station project")
+                return
             limit_raw = query.get("limit", ["50"])[0]
             try:
                 import composer_context
@@ -1528,8 +1995,8 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/delivery_coverage":
             try:
-                import fastmail_lines
-                self.send_json(fastmail_lines.delivery_coverage())
+                import provider_lines
+                self.send_json(provider_lines.delivery_coverage())
             except Exception as e:
                 self._deny(500, str(e))
             return
@@ -1650,6 +2117,8 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     return "unknown"
                 return ", ".join(p for p, _ in sorted(counts.items(), key=lambda kv: -kv[1]))
 
+            _cfg = _s._load_json("config.json")
+            prices = (_cfg.get("model_prices") if isinstance(_cfg, dict) else None) or {}
             def _thread_cost(w_list, chat=None):
                 """USD for this thread's workers, or None when no price is known.
 
@@ -1660,7 +2129,6 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 code edit. Subscription-only providers report no price and stay
                 None rather than showing a made-up number.
                 """
-                prices = _s._load_json("config.json").get("model_prices") or {}
                 total = 0.0
                 seen = False
                 for w in w_list:
@@ -1864,6 +2332,21 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
+        if path == "/api/lanes":
+            import lanes as _lanes
+            p = str((query.get("project") or [""])[0] or "").strip() or _default_git_repo()
+            try:
+                data = _lanes.load(p)
+                self.send_json({
+                    "lanes": _lanes.status(p),
+                    "default": data.get("default", ""),
+                    "limit": _lanes.limit(),
+                    "recommend": _lanes.recommend(p),
+                })
+            except ValueError as exc:
+                self.send_json({"lanes": [], "default": "", "limit": {}, "recommend": {}, "error": str(exc)}, 400)
+            return
+
         if path == "/api/exclusions":
             self.send_json({"exclusions": threads.load_exclusions(_s.SUBWAY_DIR)})
             return
@@ -1897,6 +2380,53 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"providers": out})
             except Exception as exc:
                 self.send_json({"providers": [], "error": str(exc)})
+            return
+
+        if path == "/api/acp_pump":
+            if not self._gate(api=True):
+                return
+            import acp_pump as _ap
+            self.send_json({"ok": True, "active_sessions": _ap.get_pump().get_session_count()})
+            return
+
+        if path == "/api/provider_profiles":
+            try:
+                import provider_profiles as _pp
+                self.send_json({"profiles": _pp.list_profiles()})
+            except Exception as exc:
+                self.send_json({"profiles": [], "error": str(exc)})
+            return
+
+        if path == "/api/deepai_tunnel":
+            if not self._gate(api=True):
+                return
+            import deepai_tunnel as _dt
+            from hud_server import settings_api as _sa
+            st = _dt.status()
+            st["setting"] = _sa.value("deepai_tunnel")
+            self.send_json(st)
+            return
+
+        if path == "/api/vms":
+            if not self._gate(api=True):
+                return
+            import vm_station as _vm
+            import peers
+            vms = _vm.list_vms()
+            plist = peers.list_peers()
+            for v in vms:
+                match = next(
+                    (
+                        p
+                        for p in plist
+                        if p.get("device_id") == f"vm:{v.get('backend')}:{v.get('name')}"
+                        or p.get("name") == v.get("name")
+                    ),
+                    None,
+                )
+                v["linked"] = bool(match)
+                v["peer_id"] = (match or {}).get("peer_id", "")
+            self.send_json({"ok": True, "vms": vms})
             return
 
         if path == "/api/models":
@@ -1998,6 +2528,38 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"peers": peers.list_peers(), "grant_schema": peers.grant_schema()})
             return
 
+        if path == "/api/peers/activity":
+            # HUD-side proxy for a linked station's activity (Devices page frame screen).
+            # Reuses the peer grant-checked routes; no new grant.
+            if not self._gate(api=True):
+                return
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "pairing needs a full-access device")
+                return
+            import peers as _peers
+            peer_id = (query.get("peer_id") or [""])[0]
+            track = (query.get("track") or ["main"])[0] or "main"
+            target = next((p for p in _peers.list_peers() if p.get("peer_id") == peer_id), None)
+            if not target:
+                self.send_json({"error": "no such peer"}, status=404)
+                return
+            qs = urllib.parse.urlencode({"track": track})
+            st = _peers.call(peer_id, "GET", "/api/peer/station", timeout=8)
+            coord = _peers.call(peer_id, "GET", "/api/peer/coordination?" + qs, timeout=8)
+            out = {"peer_id": peer_id, "ok": False}
+            if st.get("status") == 200 and isinstance(st.get("data"), dict):
+                out["station"] = st["data"].get("station") or st["data"]
+            else:
+                out["station_error"] = st.get("error") or f"status {st.get('status')}"
+            if coord.get("status") == 200 and isinstance(coord.get("data"), dict):
+                out["coordination"] = coord["data"]
+                out["ok"] = True
+            else:
+                out["coordination_error"] = coord.get("error") or f"status {coord.get('status')}"
+                out["ok"] = bool(out.get("station"))
+            self.send_json(out)
+            return
+
         if path == "/api/skills":
             if not self._gate(api=True):
                 return
@@ -2006,6 +2568,20 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             want_all = (q.get("all") or ["0"])[0] in ("1", "true")
             rows = _skills.skills_rows(_skills.index_skills(all=want_all), (q.get("q") or [""])[0])
             self.send_json({"skills": rows, "count": len(rows)})
+            return
+
+        if path == "/api/apps":
+            if not self._gate(api=True):
+                return
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            st = (q.get("station") or [""])[0].strip()
+            if st and st != "here":
+                import peers as _peers
+                res = _peers.remote_apps(st)
+                self.send_json({"ok": not res.get("error"), **res})
+                return
+            from hud_server import app_connectors
+            self.send_json({"ok": True, "apps": app_connectors.list_apps()})
             return
 
         if path == "/api/usage/ledger":
@@ -2049,7 +2625,25 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     info = json.load(fh)
             except (OSError, ValueError):
                 info = {}
-            self.send_json({"ok": True, "station": socket.gethostname(), "sid": (info.get("sid") if isinstance(info, dict) else None)})
+            import station
+            payload = {
+                "ok": True,
+                "station": socket.gethostname(),
+                "display_name": station.get_display_name(),
+                "sid": (info.get("sid") if isinstance(info, dict) else None),
+            }
+            lan_addr = (os.environ.get("SUBWAY_LAN_LISTEN") or "").strip()
+            if lan_addr:
+                payload["lan_addr"] = lan_addr
+            try:
+                import reachability
+                _ms = reachability.get_primary_mac_and_subnet()
+                for _k in ("mac", "subnet"):
+                    if _ms.get(_k):
+                        payload[_k] = _ms[_k]
+            except Exception:
+                pass
+            self.send_json(payload)
             return
 
         if path in ("/api/peer/chats", "/api/peer/read_chat", "/api/peer/search_chat"):
@@ -2101,6 +2695,90 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"text": text})
             return
 
+        if path == "/api/peer/thread_export":
+            if not self._gate(api=True):
+                return
+            import hashlib
+            import peers as _peers
+            from transplant import ir as _ir
+
+            tid = query.get("id", [""])[0].strip()
+            if not tid:
+                self.send_json({"error": "missing thread id"}, status=400)
+                return
+
+            chat = None
+            for c in _s.all_chats("all"):
+                if str(c.get("id") or "") == tid:
+                    chat = c
+                    break
+
+            if not chat:
+                self.send_json({"error": "thread not found"}, status=404)
+                return
+
+            try:
+                ir_conv = _ir.from_chat(chat)
+            except Exception as e:
+                self.send_json({"error": f"failed to export ir: {e}"}, status=500)
+                return
+
+            seen_files = set()
+            for f in chat.get("files") or []:
+                if f:
+                    seen_files.add(f)
+            for turn in ir_conv.get("turns", []):
+                for f in turn.get("files", []):
+                    if f:
+                        seen_files.add(f)
+            for turn in chat.get("turns", []):
+                for f in turn.get("files", []):
+                    if f:
+                        seen_files.add(f)
+            attachments = [{"path": f} for f in sorted(seen_files)]
+
+            raw_bytes = json.dumps(ir_conv, sort_keys=True).encode("utf-8")
+            content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+            q_archive = query.get("archive", ["0"])[0].strip() in ("1", "true", "yes")
+            archived = False
+            if q_archive:
+                allowed_archive = True
+                if pairing._normalise_scope(getattr(self, "_scope", "full")) == pairing.SCOPE_PEER:
+                    me = _peers.by_device(getattr(self, "_device_id", "") or "")
+                    if not me or _peers.effective_grants(me).get("threads") != "pen":
+                        allowed_archive = False
+                if allowed_archive:
+                    try:
+                        thread_state.apply_action(_s.SUBWAY_DIR, tid, "archive")
+                        archived = True
+                        _s.mark_hud_cache_stale()
+                    except Exception:
+                        archived = False
+
+            payload = {"ok": True, "id": tid, "ir": ir_conv, "attachments": attachments, "sha256": content_hash, "archived": archived}
+            self.send_json(payload)
+            return
+
+        if path == "/api/peer/permissions":
+            if not self._gate(api=True):
+                return
+            import peers as _peers
+            me = _peers.by_device(getattr(self, "_device_id", "") or "")
+            if me and str(me.get("relation") or "partner") != "own":
+                self.send_json({"error": "permission fan-out requires an own station link"}, status=403)
+                return
+            try:
+                # Metadata only: command payloads (detail/raw_input) are never exposed here.
+                pending = [{"id": p.get("id"), "worker_id": p.get("worker_id"),
+                            "role": p.get("role"), "tool": p.get("tool"),
+                            "created_at": p.get("created_at"), "expires_at": p.get("expires_at")}
+                           for p in _s._pending_permissions()]
+            except Exception:
+                pending = []
+            self.send_json({"permissions": pending})
+            return
+
         if path == "/api/peer/worker":
             if not self._gate(api=True):
                 return
@@ -2121,8 +2799,28 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
             report = str(meta.get("report") or meta.get("final_report") or "")[:4000]
+            try:
+                pending = [{"id": p.get("id"), "tool": p.get("tool"),
+                            "detail": str(p.get("detail") or "")[:300],
+                            "created_at": p.get("created_at")}
+                           for p in _s._pending_permissions() if p.get("worker_id") == wid]
+            except Exception:
+                pending = []
+            reason = ""
+            if str(meta.get("status") or "") in ("failed", "stopped", "timeout"):
+                try:
+                    tail = _s._log_tail(_s._log_file(wid), 400)
+                    for line in reversed(tail.splitlines()):
+                        line = line.strip()
+                        if line and line.startswith("["):
+                            reason = line[:200]
+                            break
+                except Exception:
+                    reason = ""
             self.send_json({k: meta.get(k) for k in ("id", "status", "role", "provider", "model", "spent", "created_at",
-                                                     "started_at", "finished_at", "origin")} | {"report": report} | {"has_patch": bool(meta.get("remote_patch"))})
+                                                     "started_at", "finished_at", "origin")} | {"report": report,
+                                                                                              "pending_permissions": pending,
+                                                                                              "reason": reason} | {"has_patch": bool(meta.get("remote_patch"))})
             return
 
         if path == "/api/peer/patch":
@@ -2169,20 +2867,140 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     return
                 self.send_json({"path": real, "entries": _peers.list_dir(real)})
                 return
+            cap = _peers.file_cap_for(me)
+            if not os.path.isfile(real) or os.path.getsize(real) > cap:
+                self.send_json({"error": "not a file, or over the {}-byte file cap".format(cap)}, status=400)
+                return
+            try:
+                off = max(0, int(query.get("offset", ["0"])[0]))
+            except (ValueError, TypeError):
+                off = 0
+            # H6: a receiver asks for the sha256 of a prefix to verify a resume.
+            verify = None
+            if "verify" in query:
+                try:
+                    verify = max(0, int(query.get("verify", ["0"])[0]))
+                except (ValueError, TypeError):
+                    verify = None
+            if off == 0:
+                try:
+                    import audit as _audit
+                    _audit.record({"peer_id": me.get("peer_id"), "name": me.get("name")}, "peer.file.read", {"path": real}, peer_station=me.get("name"))
+                except Exception:
+                    pass
+            self.send_json(_peers.read_chunk(real, off, verify_prefix=verify))
+            return
+
+        if path == "/api/peer/vfs_read":
+            if not self._gate(api=True):
+                return
+            import peers as _peers
+            import vfs as _vfs
+            me = _peers.by_device(getattr(self, "_device_id", "") or "")
+            if not me:
+                self._deny(403, "only linked stations use this route")
+                return
+            if str(me.get("relation") or "partner") != "own" or _peers.effective_grants(me).get("files") not in ("read", "send"):
+                self._deny(403, "remote vfs_read requires an own station link")
+                return
+            raw_path = str(query.get("path", [""])[0] or "").strip()
+            if not raw_path:
+                self._deny(400, "path is required")
+                return
+            try:
+                s_line = int(query.get("start_line", ["1"])[0] or "1")
+            except (TypeError, ValueError):
+                self._deny(400, "invalid start_line")
+                return
+            if s_line < 1:
+                self._deny(400, "start_line must be >= 1")
+                return
+            raw_end = query.get("end_line", [""])[0]
+            if raw_end != "":
+                try:
+                    e_line = int(raw_end)
+                except (TypeError, ValueError):
+                    self._deny(400, "invalid end_line")
+                    return
+                if e_line < s_line:
+                    self._deny(400, "end_line must be >= start_line")
+                    return
+            else:
+                e_line = s_line + 500 - 1
+            defaults = sorted({str(c.get("project") or "") for c in _s.all_chats("all") if c.get("project")})
+            roots = _peers.roots_for(me, defaults)
+            real = _peers.safe_path(raw_path, roots, must_exist=True)
+            if not real:
+                self._deny(403, "outside the folders this station shares")
+                return
             if not os.path.isfile(real) or os.path.getsize(real) > _peers.MAX_FILE:
                 self.send_json({"error": "not a file, or too large"}, status=400)
                 return
+            with open(real, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines(keepends=True)
+            total_lines = len(lines)
+            sliced = lines[s_line - 1:e_line]
+            max_bytes = 65536
+            selected = []
+            used_bytes = 0
+            hit_cap = False
+            for ln in sliced:
+                ln_bytes = ln.encode("utf-8", errors="replace")
+                if used_bytes + len(ln_bytes) > max_bytes:
+                    if not selected:
+                        selected.append(ln_bytes[:max_bytes].decode("utf-8", errors="replace"))
+                    hit_cap = True
+                    break
+                selected.append(ln)
+                used_bytes += len(ln_bytes)
+            text = "".join(selected)
+            actual_end = (s_line + len(selected) - 1) if selected else (s_line - 1)
+            truncated = hit_cap or (actual_end < total_lines)
+            sha = _vfs._sha_file(real)
+            try:
+                import audit as _audit
+                _audit.record(
+                    {"kind": "peer", "id": str(me.get("peer_id") or ""), "name": str(me.get("name") or "")},
+                    "peer.remote_read",
+                    {"path": real, "lines": f"{s_line}-{actual_end}"},
+                    peer_station=me.get("name"),
+                )
+            except Exception:
+                pass
+            self.send_json({
+                "ok": True,
+                "path": real,
+                "content": text,
+                "sha256": sha,
+                "total_lines": total_lines,
+                "start_line": s_line,
+                "end_line": actual_end,
+                "truncated": truncated,
+            })
+            return
+
+        if path == "/api/peer/term/read":
+            if not self._gate(api=True):
+                return
+            import peers as _peers
+            import term_remote as _term_remote
+            me = _peers.by_device(getattr(self, "_device_id", "") or "")
+            if not me:
+                self._deny(403, "only linked stations use this route")
+                return
+            if str(me.get("relation") or "partner") != "own" or _peers.effective_grants(me).get("terminal") != "on":
+                self._deny(403, "terminal grant requires an own station link")
+                return
+            jid = query.get("id", [""])[0]
             try:
                 off = max(0, int(query.get("offset", ["0"])[0]))
             except ValueError:
                 off = 0
-            if off == 0:
-                try:
-                    import audit as _audit
-                    _audit.record({"peer_id": me.get("peer_id"), "name": me.get("name")}, "peer.file.read", {"path": real})
-                except Exception:
-                    pass
-            self.send_json(_peers.read_chunk(real, off))
+            res = _term_remote.read(jid, off, peer_id=str(me.get("peer_id") or ""))
+            if res.get("error"):
+                self.send_json(res, status=404)
+                return
+            self.send_json(res)
             return
 
         if path == "/api/peer/media":
@@ -2254,7 +3072,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 status, body = _peers.swarm_manifest(me, repo, _s.load_locks() or {}, req)
                 try:
                     import audit as _audit
-                    _audit.record({"peer_id": me.get("peer_id"), "name": me.get("name")}, "peer.swarm.checkout", {"repo": repo})
+                    _audit.record({"peer_id": me.get("peer_id"), "name": me.get("name")}, "peer.swarm.checkout", {"repo": repo}, peer_station=me.get("name"))
                 except Exception:
                     pass
                 self.send_json(body, status=status)
@@ -2412,6 +3230,16 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json(_peers.remote_allowance(station))
                 return
             pid = (q.get("peer_id") or [""])[0]
+            if not pid:
+                stale_raw = (q.get("stale_after_seconds") or [""])[0]
+                kwargs = {}
+                if stale_raw:
+                    try:
+                        kwargs["stale_after_seconds"] = max(0.0, float(stale_raw))
+                    except (TypeError, ValueError):
+                        pass
+                self.send_json(_peers.combined_allowance(**kwargs))
+                return
             if not _peers.get(pid):
                 self._deny(404, "unknown peer")
                 return
@@ -2434,11 +3262,30 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                             "history": _peers.allowance_history_snapshot(pid, (q.get("days") or ["14"])[0])})
             return
 
+        if path == "/api/peer/apps":
+            if not self._gate(api=True):
+                return
+            from hud_server import app_connectors
+            self.send_json({"ok": True, "apps": app_connectors.list_apps()})
+            return
+
         if path == "/api/peer/models":
             if not self._gate(api=True):
                 return
             import peers as _peers
             self.send_json({"models": _peers.share_models(_s.model_catalog())})
+            return
+
+        if path == "/api/peer/thread/pen":
+            if not self._gate(api=True):
+                return
+            tid = (query.get("thread_id") or [""])[0].strip()
+            if not tid:
+                self.send_json({"error": "thread_id is required"}, status=400)
+                return
+            import thread_pen
+            pen = thread_pen.get_pen(tid)
+            self.send_json(pen or {"thread_id": tid, "holder": None})
             return
 
         if path == "/api/peer/station":
@@ -2451,7 +3298,25 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 self._deny(403, "events grant required")
                 return
             import station
-            self.send_json({"station": station.get_station_card()})
+            card = station.get_station_card()
+            if me.get("relation") == "own" or not station.telemetry_valid(card.get("telemetry")):
+                if not station.telemetry_valid(card.get("telemetry")):
+                    card["telemetry"] = station.collect_host_telemetry()
+            self.send_json({"station": card})
+            return
+
+        if path == "/api/peer/mcp":
+            if not self._gate(api=True):
+                return
+            import peers as _peers
+            me = _peers.by_device(getattr(self, "_device_id", ""))
+            if not me or str(me.get("relation") or "partner") != "own":
+                self._deny(403, "own station relation required")
+                return
+            if _peers.effective_grants(me).get("mcp", "off") != "on":
+                self._deny(403, "mcp grant required")
+                return
+            self.send_json({"mcps": _peers.local_mcp_signins()})
             return
 
         if path == "/api/peers/models":
@@ -2462,8 +3327,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 return
             import peers as _peers
             st = query.get("station", [""])[0]
-            names = [st] if st else [_peers.slug(p) for p in _peers.list_peers()]
-            self.send_json({"stations": [_peers.remote_models(n) for n in names]})
+            pl = [p for p in _peers.list_peers() if not st or _peers.slug(p) == st]  # peer_id lets the HUD match rows
+            out = [dict(_peers.remote_models(_peers.slug(p)), peer_id=p.get("peer_id")) for p in pl]
+            self.send_json({"stations": out if (out or not st) else [_peers.remote_models(st)]})
+            return
+
+        if path == "/api/peers/mcp":
+            if not self._gate(api=True):
+                return
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "pairing needs a full-access device")
+                return
+            import peers as _peers
+            self.send_json({"peers": _peers.remote_mcps()})
             return
 
         if path in ("/api/peers/chats", "/api/peers/read_chat"):
@@ -2534,6 +3410,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/station":
             import station
             card = station.get_station_card()
+            try:
+                import reachability
+                card = {**card, "subnet": reachability.get_primary_mac_and_subnet().get("subnet")}
+            except Exception:
+                pass
             self.send_json(card)
             return
 
@@ -2704,6 +3585,12 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"entries": page, "total": len(history)})
             return
 
+        if path == "/api/mail/triggers":
+            if not self._gate(api=True):
+                return
+            from hud_server import trigger_catalog
+            self.send_json({"ok": True, "triggers": trigger_catalog.trigger_catalog(query.get("project_dir", [""])[0])})
+            return
         if path == "/api/mail":
             if not self._gate(api=True):
                 return
@@ -2723,14 +3610,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             import landing_queue
             cfg = _s._load_json("config.json") or {}
             dirty = 0
+            live_branches = None
             with contextlib.suppress(Exception):
                 st = subprocess.run(["git", "-C", _default_git_repo(), "status", "--porcelain"], capture_output=True, timeout=3)
                 if st.returncode == 0:
                     dirty = len([ln for ln in st.stdout.decode("utf-8", "replace").splitlines() if ln.strip()])
+                br = subprocess.run(["git", "-C", _default_git_repo(), "for-each-ref", "--format=%(refname:short)", "refs/heads/subway/"], capture_output=True, timeout=3)
+                if br.returncode == 0:
+                    live_branches = [ln.strip() for ln in br.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
             self.send_json({"queue": landing_queue.list_queue(),
                             "conflicts": land_conflicts.list_conflicts(_s.SUBWAY_DIR),
                             "land_mode": str(cfg.get("land_mode") or "merge"),
-                            "working_changes": dirty})
+                            "working_changes": dirty,
+                            "live_branches": live_branches})
             return
 
         if path == "/api/landing/diff":
@@ -2783,6 +3675,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             with _s._state_lock("terminals"):
                 runs = terminals.list_pending_runs(_s._terminals_dir(), terminal_id=tid)
             self.send_json({"runs": runs})
+            return
+
+        if path == "/api/peer/approve/list":
+            if not self._gate(api=True):
+                return
+            import device_approval
+            self.send_json({"requests": device_approval.list_requests()})
             return
 
         self._deny(404, "Not found")
@@ -2868,6 +3767,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 st = payload.get("station") if isinstance(payload.get("station"), dict) else {}
                 their_token = str(payload.get("peer_token") or "")
                 if not qr or not pairing.consume_qr_code(str(qr)):
+                    pairing.alert_failed_pair("station", f"ip={self.client_address[0] if self.client_address else ''}")
                     self.send_json({"error": "pairing code invalid or used"}, status=403)
                     return
                 if not their_token or not st.get("sid") or not st.get("pk"):
@@ -2881,11 +3781,14 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     return
                 ap = pairing.approve(res["request_id"], scope=pairing.SCOPE_PEER)
                 import peers
-                peers.add(str(st.get("name") or "Station"), st, their_token, ap.get("device_id", ""), "personal")
+                rel = str(payload.get("relation") or "").strip().lower()
+                peers.add(str(st.get("name") or "Station"), st, their_token, ap.get("device_id", ""), "personal",
+                          rel if rel in ("own", "partner") else "partner")
                 self.send_json(res)
                 return
             qr = payload.get("qr_code")
             if qr and not pairing.consume_qr_code(str(qr)):
+                pairing.alert_failed_pair("device", f"ip={self.client_address[0] if self.client_address else ''}")
                 self.send_json({"error": "pairing code invalid or used"}, status=403)
                 return
             res = pairing.create_request(
@@ -2930,6 +3833,34 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
         if not self._gate(api=True):
             return
         if self._idem_guard(path):
+            return
+
+        if path == "/api/peer/approve/request":
+            # Reachable even before approval: this is the handshake itself.
+            import device_approval
+            import peers
+            dev = str(getattr(self, "_device_id", "") or "")
+            peer = peers.by_device(dev) if dev else None
+            pid = str((peer or {}).get("peer_id") or "") or dev
+            if not pid:
+                self._deny(400, "unknown peer")
+                return
+            self.send_json({"code": device_approval.request(pid), "peer": pid})
+            return
+
+        if path in ("/api/peer/approve/approve", "/api/peer/approve/deny"):
+            import device_approval
+            payload = self._read_payload()
+            if payload is None:
+                return
+            code = str(payload.get("code") or "").strip().upper()
+            try:
+                res = (device_approval.approve(code) if path.endswith("/approve")
+                       else device_approval.deny(code))
+            except (KeyError, ValueError) as exc:
+                self.send_json({"error": str(exc) or "invalid or expired code"}, status=403)
+                return
+            self.send_json(res)
             return
 
         if path == "/api/mcp/connect":
@@ -3087,6 +4018,52 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(res, status=400 if "error" in res else 200)
             return
 
+        if path == "/api/devices/grant":
+            caller_id = getattr(self, "_device_id", "")
+            grant = str(payload.get("grant", ""))
+            target_id = str(payload.get("device_id", ""))
+            on = bool(payload.get("on"))
+            allowed_grants = ("terminal.run", "settings.write", "chat.send", "files.write")
+            if grant not in allowed_grants:
+                self._deny(400, "unknown grant")
+                return
+            if caller_id:
+                caller = next((d for d in pairing.list_devices() if isinstance(d, dict) and d.get("device_id") == caller_id), None)
+                caller_grants = (caller or {}).get("grants") or []
+                has_grant = grant in caller_grants and grant in ("settings.write", "chat.send", "files.write")
+                if not has_grant:
+                    self._deny(403, "grants are set on the Mac")
+                    return
+            if target_id == "self":
+                target_id = caller_id
+            if target_id == "*" and grant in ("settings.write", "chat.send", "files.write"):
+                cfg_key = {
+                    "settings.write": "remote_settings_all",
+                    "chat.send": "remote_chat_all",
+                    "files.write": "remote_files_all",
+                }[grant]
+                cfg = _s._load_json("config.json") or {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg[cfg_key] = on
+                _s._save_json("config.json", cfg)
+                self.send_json({"ok": True, "all": on})
+                return
+            data = pairing._load("devices.json")
+            devices = data.get("devices")
+            devices = devices if isinstance(devices, list) else []
+            target = next((d for d in devices if isinstance(d, dict) and d.get("device_id") == target_id), None)
+            if target is None:
+                self.send_json({"ok": False, "error": "unknown device"}, status=400)
+                return
+            grants = [g for g in (target.get("grants") or []) if g != grant]
+            if on:
+                grants.append(grant)
+            target["grants"] = grants
+            pairing._save("devices.json", {"devices": devices})
+            self.send_json({"ok": True, "device_id": target_id, "grants": grants})
+            return
+
         if path == "/api/peer/collab/couple":
             import peers as _peers
             from hud_server import collab_api
@@ -3126,12 +4103,52 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(res, status=st)
             return
 
+        if path in ("/api/peer/screen/input", "/api/peer/screen/control/stop"):
+            import peers as _peers
+            import screen_share
+            import screen_input
+            import audit
+            me = _peers.by_device(getattr(self, "_device_id", "") or "")
+            if (not me or str(me.get("relation") or "partner") != "own"
+                    or _peers.effective_grants(me).get("control") != "on"):
+                self._deny(403, "remote control needs an own station link with control on")
+                return
+            vid = str(me.get("peer_id") or "")
+            sid = str(payload.get("session_id") or "")
+            actor = {"kind": "peer", "id": vid, "name": str(me.get("name") or "")}
+            if path == "/api/peer/screen/control/stop":
+                was = screen_input.is_active(sid)
+                res = screen_input.stop_control(sid)
+                if was:
+                    audit.record(actor, "screen.control.stop", {"session_id": sid})
+                self.send_json(res)
+                return
+            ok, why, owner = screen_share.input_allowed(sid)
+            if not ok or owner != vid:
+                self._deny(403, why or "not your session")
+                return
+            if not screen_input.is_active(sid):
+                screen_input.start_control(sid, vid)
+                audit.record(actor, "screen.control.start", {"session_id": sid})
+            res = screen_input.inject(sid, payload)
+            st = res.pop("status", 400) if "error" in res else 200
+            self.send_json(res, status=st)
+            return
+
         if path == "/api/peer/hub_call":
             import peers as _peers
             me = _peers.by_device(getattr(self, "_device_id", "") or "")
             if not me or _peers.effective_grants(me).get("mcp") != "on":
                 self._deny(403, "this station has not lent its MCP tools")
                 return
+            wid = str(payload.get("worker_id") or "").strip()
+            if wid:
+                wmeta = _s._load_worker(wid)
+                if wmeta:
+                    ok_c, why_c = _peers.check_link_ceiling(wmeta, "mcp", ("on",))
+                    if not ok_c:
+                        self._deny(403, why_c)
+                        return
             import hub_tools
             server, tool = str(payload.get("server") or ""), str(payload.get("tool") or "")
             if not server or not tool:
@@ -3160,6 +4177,50 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(result[1], status=result[0])
             return
 
+        if path == "/api/peer/thread/pen":
+            action = str(payload.get("action") or "").strip().lower()
+            if action not in ("claim", "release", "handover"):
+                self.send_json({"error": "action must be 'claim', 'release', or 'handover'"}, status=400)
+                return
+            tid = str(payload.get("thread_id") or "").strip()
+            if not tid:
+                self.send_json({"error": "thread_id is required"}, status=400)
+                return
+            import thread_pen
+            import peers as _peers
+            me = _peers.by_device(getattr(self, "_device_id", "") or "") or {}
+            caller_name = str(me.get("name") or getattr(self, "_device_id", "") or "")
+            holder = str(payload.get("holder") or caller_name or "").strip()
+            ttl = payload.get("ttl")
+
+            if action == "claim":
+                res = thread_pen.acquire(tid, holder=holder, ttl=ttl if ttl is not None else 120.0)
+            elif action == "release":
+                res = thread_pen.release(tid, holder=holder)
+            elif action == "handover":
+                to_holder = str(payload.get("to_holder") or "").strip()
+                res = thread_pen.handover(tid, from_holder=holder, to_holder=to_holder, ttl=ttl if ttl is not None else 120.0)
+
+            err_code = res.get("code") or (res.get("error") if isinstance(res.get("error"), str) else None)
+            if not res.get("ok"):
+                st = 409 if err_code == "held" else 403 if err_code == "not_holder" else 400
+                self.send_json(res, status=st)
+                return
+
+            target = {"thread_id": tid, "holder": holder, "to_holder": payload.get("to_holder")}
+            try:
+                import audit as _audit
+                _audit.record(
+                    self._audit_actor(),
+                    action=f"thread.pen.{action}",
+                    target=target,
+                    peer_station=me.get("name") or None,
+                )
+            except Exception:
+                pass
+            self.send_json(res)
+            return
+
         if path == "/api/peer/prepare":
             if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
                 self._deny(403, "pairing needs a full-access device")
@@ -3182,7 +4243,11 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 self._deny(403, "pairing needs a full-access device")
                 return
             import peers
-            res = peers.link_add(str(payload.get("link") or ""), payload.get("preset") or "personal")
+            relation = str(payload.get("relation") or "").strip().lower()
+            if relation not in ("own", "partner"):
+                preset = str(payload.get("preset") or "personal")
+                relation = "own" if preset == "personal" else "partner"
+            res = peers.link_add(str(payload.get("link") or ""), payload.get("preset") or "personal", relation)
             self.send_json(res, status=400 if "error" in res else 200)
             return
 
@@ -3313,6 +4378,23 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(peers.my_train())
             return
 
+        if path == "/api/peers/rotate_keys":
+            # Local-only: never from a peer scope, nor from a tunnel-forwarded request.
+            if (pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL
+                    or str((self.client_address or ("", 0))[0]).startswith("tunnel:")):
+                self._deny(403, "key rotation is local-only")
+                return
+            import peers
+            try:
+                res = peers.rotate_keys()
+            except Exception:
+                self.send_json({"pk_rotated": False, "error": "rotate failed", "results": {}}, status=500)
+                return
+            if not isinstance(res, dict):
+                res = {"pk_rotated": False, "error": "rotate failed", "results": {}}
+            self.send_json(res, status=200 if res.get("pk_rotated") else 500)
+            return
+
         if path == "/api/peers/controller":
             if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
                 self._deny(403, "pairing needs a full-access device")
@@ -3320,6 +4402,32 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             import peers
             res = peers.set_controller(payload.get("peer_id") or None)
             self.send_json(res, status=400 if "error" in res else 200)
+            return
+
+        if path == "/api/peer/wake":
+            import peers
+            import reachability
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "pairing needs a full-access device")
+                return
+            p = (peers._data().get("peers") or {}).get(str(payload.get("peer_id") or ""))
+            if not p:
+                self.send_json({"error": "unknown peer"}, status=400)
+                return
+            mac = str(p.get("mac") or "")
+            mine = reachability.get_primary_mac_and_subnet().get("subnet")
+            if not mac:
+                self.send_json({"error": "peer has no known MAC"}, status=400)
+                return
+            if not mine or p.get("subnet") != mine:
+                self.send_json({"error": "peer is not on this LAN"}, status=400)
+                return
+            try:
+                reachability.send_wol(mac)
+            except (OSError, ValueError) as e:
+                self.send_json({"error": "wake failed: " + type(e).__name__}, status=400)
+                return
+            self.send_json({"ok": True, "peer_id": p.get("peer_id")})
             return
 
         if path == "/api/peer/unlink":
@@ -3336,6 +4444,19 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     return
                 res = peers.unlink(str(payload.get("peer_id") or ""))
             self.send_json(res, status=400 if "error" in res else 200)
+            return
+
+        if path == "/api/peer/pk_rotate":
+            import peers
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_PEER:
+                self._deny(403, "linked station required")
+                return
+            p = peers.by_device(getattr(self, "_device_id", "") or "")
+            if not p:
+                self._deny(403, "unknown peer")
+                return
+            status, res = peers.handle_pk_rotate(str(p.get("peer_id") or ""), payload)
+            self.send_json(res, status=status)
             return
 
         if path == "/api/outbox/sync":
@@ -3510,6 +4631,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                                role=str(payload.get("role", "implementer")), peer_id=claim_peer)
         elif path == "/api/run_concurrent":
             tasks = payload.get("tasks")
+            if isinstance(tasks, list):
+                for _t in tasks:
+                    if isinstance(_t, dict) and isinstance(_t.get("apps"), list) and _t["apps"]:
+                        _labels = [f"{a.get('name') or a.get('id')} ({a.get('station') or 'here'})" if isinstance(a, dict) else str(a) for a in _t["apps"] if a]
+                        if _labels:
+                            _t["prompt"] = str(_t.get("prompt", "")) + "\n\n[Attached apps: " + ", ".join(_labels) + "]"
+                        _t.pop("apps", None)
             track = str(payload.get("track", "main"))
             from concurrency import run_concurrent
             res = run_concurrent(tasks=tasks, track=track)
@@ -3644,7 +4772,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 isolate=bool(payload.get("isolate")) or _peers.effective_grants(me).get("land") != "edits",
                 code=[str(c) for c in code] if isinstance(code, list) else None,
                 capabilities=caps or None,
-                route_reason=f"Started from linked station {_peers.slug(me)}", from_link=True)
+                route_reason=f"Started from linked station {_peers.slug(me)}", from_link=True,
+                peer_sandbox=str(_peers.effective_grants(me).get("sandbox") or "os"),
+                peer_relation=str(me.get("relation") or "partner"))
             m = re.search(r"worker_[0-9a-f]{6,}", str(res))
             wid = m.group(0) if m else ""
             if not wid or str(res).startswith(("Error", "Refused")):
@@ -3658,6 +4788,10 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                                   "requested_by": _peers.slug(me),
                                   "session_id": _dm.get("session_id") or "",
                                   "paid_by": _dm.get("paid_by") or "this station"}
+                meta["link_origin"] = {
+                    "peer": me["peer_id"],
+                    "grants_at_spawn": dict(_peers.effective_grants(me)),
+                }
                 if _dm.get("review"):
                     meta["awaiting_local_initiator"] = True
                     meta["local_initiator_chat"] = _dm.get("local_initiator_chat") or "principal"
@@ -3712,6 +4846,70 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 return
             self.send_json({"ok": True, "result": out})
             return
+        elif path == "/api/peers/alias":
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "pairing needs a full-access device")
+                return
+            import peers as _peers
+            res = _peers.set_alias(str(payload.get("peer_id") or ""), str(payload.get("alias") or ""))
+            if isinstance(res, dict) and res.get("error"):
+                self._deny(400, res["error"])
+                return
+            self.send_json(res)
+            return
+        elif path == "/api/peer/permissions":
+            if not self._gate(api=True):
+                return
+            import peers as _peers
+            me = _peers.by_device(getattr(self, "_device_id", "") or "")
+            if me and str(me.get("relation") or "partner") != "own":
+                self._deny(403, "permission fan-out requires an own station link")
+                return
+            decision = str(payload.get("decision") or "")
+            if decision not in ("allow", "allow_always", "deny"):
+                self._deny(400, "decision must be allow, allow_always or deny")
+                return
+            res = _s._answer_permission(str(payload.get("id", "")), decision, "linked station")
+            if res in ("already answered", "expired"):
+                self._deny(409, res)
+                return
+            self.send_json({"ok": True, "result": res})
+            return
+        elif path == "/api/peers/answer_permission":
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "pairing needs a full-access device")
+                return
+            import peers as _peers
+            decision = str(payload.get("decision") or "")
+            if decision not in ("allow", "allow_always", "deny"):
+                self._deny(400, "decision must be allow, allow_always or deny")
+                return
+            wid = str(payload.get("worker_id") or "")
+            rid = str(payload.get("id") or "")
+            peer = None
+            r = _peers.split_worker(wid)
+            if r:
+                peer = r[1]
+            else:
+                stub = (_peers._data().get("remote_workers") or {}).get(wid)
+                if stub:
+                    peer = _peers.get(stub.get("peer_id") or "")
+            if not peer:
+                self._deny(404, "no linked station for this worker")
+                return
+            res = _peers.call(peer["peer_id"], "POST", "/api/answer_permission", {"id": rid, "decision": decision})
+            if res.get("status") == 200:
+                self.send_json({"ok": True})
+                return
+            if res.get("status") == 409:
+                self._deny(409, (res.get("data") or {}).get("error") or "already answered")
+                return
+            if res.get("status") == 403:
+                self._deny(403, "that station has not granted approving permissions")
+                return
+            err = (res.get("data") or {}).get("error") if res.get("status") else res.get("error")
+            self._deny(res.get("status") or 502, str(err or "the linked station refused"))
+            return
         elif path == "/api/approve_worker":
             approve_id = str(payload.get("id", ""))
             import peers as _peers
@@ -3732,6 +4930,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(res, str) and (res.startswith("Error") or res.startswith("Refused")):
                 self._deny(400, res)
                 return
+            m_wid = re.search(r"worker_[0-9a-f]{6,}", str(res))
+            if m_wid:
+                meta = _s._load_worker(m_wid.group(0))
+                if meta:
+                    meta["launched_by"] = "hud"
+                    meta["requester"] = str(payload.get("requester") or "")
+                    _s._save_worker(meta)
         elif path == "/api/reject_worker":
             rid = str(payload.get("id", ""))
             reason = str(payload.get("reason", ""))
@@ -3805,6 +5010,12 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             return
         elif path == "/api/settings":
             res = {}
+            raw_payload = dict(payload) if isinstance(payload, dict) else {}
+            _scope = getattr(self, "_scope", "full")
+            rejected_keys = []
+            if _scope != "full":
+                from hud_server import cross_device_settings
+                payload, rejected_keys = cross_device_settings.filter_remote_settings_patch(raw_payload)
             # Managed schema keys are validated and written by settings_api (all-or-nothing);
             # whatever it does not own stays in the payload for the legacy per-key handlers below.
             try:
@@ -3829,6 +5040,16 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                     if not (2 <= _nv <= 50):
                         self._deny(400, f"{_nk} must be between 2 and 50")
                         return
+            if "station_name" in payload:
+                sn = str(payload.get("station_name") or "").strip()[:60]
+                with _s._state_lock("config"):
+                    cfg = _s._load_json("config.json") or {}
+                    if sn:
+                        cfg["station_name"] = sn
+                    else:
+                        cfg.pop("station_name", None)
+                    _s._save_json("config.json", cfg)
+                res["station_name"] = sn
             if "caffeinate" in payload:
                 c_val = str(payload.get("caffeinate", "")).lower().strip()
                 if c_val not in ("off", "workers", "always"):
@@ -4257,6 +5478,45 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if res.get("protected_reset"):
                 said.append("Protected commands: back to defaults")
             res = "Saved. " + "; ".join(said) if said else "Nothing to change."
+            cross_device_res = None
+            target_val = str(raw_payload.get("target") or "").strip()
+            if target_val and target_val != "self":
+                import peers as _peers
+                can_fanout = _scope == "full"
+                if not can_fanout:
+                    me = _peers.by_device(getattr(self, "_device_id", "") or "")
+                    can_fanout = bool(me and str(me.get("relation") or "partner").strip().lower() == "own")
+                if can_fanout:
+                    from hud_server import cross_device_settings
+
+                    def _forward_to_peer(peer, safe_patch):
+                        pid = str(peer.get("peer_id") or "")
+                        out = _peers.call(pid, "POST", "/api/settings", safe_patch, timeout=10)
+                        if not isinstance(out, dict):
+                            return False, "invalid response"
+                        if "error" in out:
+                            return False, str(out["error"])
+                        st_code = int(out.get("status") or 0)
+                        if 200 <= st_code < 300:
+                            return True, ""
+                        data = out.get("data")
+                        err = data.get("error") if isinstance(data, dict) else None
+                        return False, str(err or f"HTTP {st_code}")
+
+                    cross_device_res = cross_device_settings.fanout_settings(
+                        raw_payload,
+                        target_val,
+                        _peers.list_peers(),
+                        forward_fn=_forward_to_peer,
+                    )
+            if rejected_keys or cross_device_res is not None:
+                out_body = {"result": res}
+                if rejected_keys:
+                    out_body["rejected_keys"] = rejected_keys
+                if cross_device_res is not None:
+                    out_body["cross_device"] = cross_device_res
+                self.send_json(out_body)
+                return
         elif path == "/api/verify":
             wid = str(payload.get("id") or payload.get("worker_id") or "")
             if not wid:
@@ -4282,6 +5542,9 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             res = _s.set_model_rankings(payload.get("models"))
         elif path == "/api/answer_permission":
             res = _s._answer_permission(str(payload.get("id", "")), str(payload.get("decision", "")), "hud-user")
+            if res in ("already answered", "expired"):
+                self._deny(409, res)
+                return
         elif path == "/api/landing/resolve":
             import land_resolver
             self.send_json({"result": land_resolver.t_resolve_conflict(str(payload.get("id", "")),
@@ -4291,6 +5554,65 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             import land_conflicts
             ok = land_conflicts.resolve(_s.SUBWAY_DIR, str(payload.get("id", "")), "dropped", note="dropped in the HUD")
             self.send_json({"result": "Dropped. The branch is kept." if ok else "Error: unknown overlap"})
+            return
+        elif path == "/api/lanes":
+            import lanes as _lanes
+            p = str(payload.get("project") or "").strip() or _default_git_repo()
+            action = str(payload.get("action") or "").strip()
+            try:
+                if action == "create":
+                    lane_obj = _lanes.create(
+                        p,
+                        str(payload.get("name") or ""),
+                        branch=payload.get("branch") or None,
+                        base=payload.get("base") or None,
+                        role=str(payload.get("role") or "dev"),
+                        version=str(payload.get("version") or ""),
+                    )
+                    self.send_json({"ok": True, "lane": lane_obj})
+                elif action == "remove":
+                    removed = _lanes.remove(p, str(payload.get("name") or ""), force=bool(payload.get("force", False)))
+                    self.send_json({"ok": True, "lane": removed})
+                elif action == "default":
+                    default_name = _lanes.set_default(p, str(payload.get("name") or ""))
+                    self.send_json({"ok": True, "default": default_name})
+                elif action == "freeze":
+                    lane_obj = _lanes.set_frozen(p, str(payload.get("name") or ""), bool(payload.get("frozen", True)))
+                    self.send_json({"ok": True, "lane": lane_obj})
+                else:
+                    raise ValueError(f"Unknown lanes action: {action}")
+            except ValueError as e:
+                self.send_json({"error": str(e)}, 400)
+            return
+        elif path == "/api/ship/start":
+            import ship_flow
+            p = str(payload.get("project") or "").strip() or _default_git_repo()
+            lane = str(payload.get("lane") or "").strip()
+            if not lane:
+                self.send_json({"error": "lane is required"}, 400)
+                return
+            try:
+                self.send_json(ship_flow.start(p, lane))
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+        elif path == "/api/ship/advance":
+            import ship_flow
+            p = str(payload.get("project") or "").strip() or _default_git_repo()
+            lane = str(payload.get("lane") or "").strip()
+            step = str(payload.get("step") or "").strip()
+            confirm = bool(payload.get("confirm", False))
+            if not lane or not step:
+                self.send_json({"error": "lane and step are required"}, 400)
+                return
+            try:
+                self.send_json(ship_flow.advance(p, lane, step, confirm=confirm))
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
             return
         elif path in ("/api/landing/merge", "/api/landing/discard"):
             act = "merge" if path.endswith("/merge") else "discard"
@@ -4307,8 +5629,14 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             return
         elif path == "/api/spawn":
             caps = payload.get("capabilities")
+            _spawn_prompt = str(payload.get("prompt", ""))
+            _apps = payload.get("apps")
+            if isinstance(_apps, list) and _apps:
+                _labels = [f"{a.get('name') or a.get('id')} ({a.get('station') or 'here'})" if isinstance(a, dict) else str(a) for a in _apps if a]
+                if _labels:
+                    _spawn_prompt += "\n\n[Attached apps: " + ", ".join(_labels) + "]"
             res = _s.t_spin_worker(
-                role=str(payload.get("role", "")), prompt=str(payload.get("prompt", "")),
+                role=str(payload.get("role", "")), prompt=_spawn_prompt,
                 provider=str(payload.get("provider", "auto")), model=str(payload.get("model", "")),
                 effort=str(payload.get("effort", "auto")), mode=str(payload.get("mode", "standard")),
                 track=str(payload.get("track", "main")), project_dir=str(payload.get("project_dir") or os.environ.get("SUBWAY_PROJECT_DIR", "")),
@@ -4316,6 +5644,10 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 timeout_seconds=int(payload.get("timeout_seconds") or 0),
                 max_tokens=int(payload.get("max_tokens") or 0), private=bool(payload.get("private")),
                 capabilities=[str(c) for c in caps] if isinstance(caps, list) else None,
+                isolate=bool(payload.get("isolate")),
+                skills=[str(x) for x in (payload.get("skills") or []) if str(x).strip()] or None,
+                code=[str(x) for x in (payload.get("code") or []) if str(x).strip()] or None,
+                needs=[str(x) for x in (payload.get("needs") or []) if str(x).strip()] or None,
                 budget_session_pct=payload.get("budget_session_pct"),
                 budget_weekly_pct=payload.get("budget_weekly_pct"),
                 max_budget_usd=payload.get("max_budget_usd"),
@@ -4325,6 +5657,13 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(res, str) and (res.startswith("Error") or res.startswith("Refused")):
                 self._deny(400, res)
                 return
+            m_wid = re.search(r"worker_[0-9a-f]{6,}", str(res))
+            if m_wid:
+                meta = _s._load_worker(m_wid.group(0))
+                if meta:
+                    meta["launched_by"] = "hud"
+                    meta["requester"] = str(payload.get("requester") or "")
+                    _s._save_worker(meta)
         elif path == "/api/clear_history":
             res = _s.archive_history()
         elif path == "/api/terminal_sharing":
@@ -4508,6 +5847,103 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             res = _tlearn.prepare(pid)
             self.send_json({"ok": bool(res.get("ok")), "reason": res.get("reason", ""), "brief_path": res.get("brief_path", "")})
             return
+        elif path == "/api/deepai_tunnel":
+            if not self._gate(api=True):
+                return
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "deepai tunnel control requires full-access")
+                return
+            import deepai_tunnel as _dt
+            action = str((payload or {}).get("action") or "").strip()
+            st = _dt.status()
+            st["setting"] = None
+            if action == "prepare":
+                st.update(_dt.prepare())
+            elif action == "command_off":
+                st.update(_dt.command_off())
+            else:
+                self._deny(400, "action must be prepare or command_off")
+                return
+            self.send_json(st)
+            return
+        elif path == "/api/vms/action":
+            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+                self._deny(403, "vm actions require full-access")
+                return
+            import vm_station as _vm
+            action = str(payload.get("action") or "").strip().lower()
+            name = str(payload.get("name") or "").strip() or ("subway-vm" if action == "create" else "")
+            backend = str(payload.get("backend") or "lima").strip().lower()
+            if not name or action not in ("start", "stop", "create", "link", "unlink", "bootstrap_screen"):
+                self._deny(
+                    400,
+                    "name and action ('start', 'stop', 'create', 'link', 'unlink', or 'bootstrap_screen') are required",
+                )
+                return
+            if action == "link":
+                res = _vm.link_vm(
+                    name,
+                    backend,
+                    bootstrap_screen=bool(payload.get("bootstrap_screen", True)),
+                )
+            elif action == "unlink":
+                res = _vm.unlink_vm(name, backend)
+            elif action == "bootstrap_screen":
+                res = _vm.bootstrap_vdisplay_vm(name, backend)
+            else:
+                fn = _vm.create_vm if action == "create" else (_vm.start_vm if action == "start" else _vm.stop_vm)
+                res = fn(name, backend)
+            self.send_json({"ok": bool(res.get("ok")), **res})
+            return
+        elif path == "/api/provider_profiles":
+            import provider_profiles as _pp
+            if not isinstance(payload, dict):
+                self._deny(400, "JSON body must be an object")
+                return
+            action = str(payload.get("action") or "").strip().lower()
+            raw_data = payload.get("profile") if isinstance(payload.get("profile"), dict) else {
+                k: v for k, v in payload.items() if k != "action"
+            }
+            data = dict(raw_data)
+            try:
+                if action == "add":
+                    prof = _pp.add_profile(data)
+                elif action == "update":
+                    pid = str(data.get("id") or payload.get("id") or "").strip()
+                    if not pid:
+                        self._deny(400, "missing profile id")
+                        return
+                    prof = _pp.update_profile(pid, data)
+                elif action == "toggle":
+                    pid = str(data.get("id") or payload.get("id") or "").strip()
+                    if not pid:
+                        self._deny(400, "missing profile id")
+                        return
+                    enabled = payload.get("enabled") if "enabled" in payload else data.get("enabled")
+                    prof = _pp.toggle_profile(pid, enabled=enabled)
+                elif action == "delete":
+                    pid = str(data.get("id") or payload.get("id") or "").strip()
+                    if not pid:
+                        self._deny(400, "missing profile id")
+                        return
+                    if not _pp.delete_profile(pid):
+                        self._deny(404, f"profile not found: {pid}")
+                        return
+                    prof = None
+                elif action in ("", "upsert"):
+                    if not str(data.get("id") or "").strip() and not str(data.get("name") or "").strip():
+                        self._deny(400, "missing profile id or name")
+                        return
+                    prof = _pp.upsert_profile(data)
+                else:
+                    self._deny(400, f"unknown action: {action}")
+                    return
+                self.send_json({"ok": True, "profile": prof, "profiles": _pp.list_profiles()})
+            except KeyError as exc:
+                self._deny(404, str(exc).strip("'\""))
+            except ValueError as exc:
+                self._deny(400, str(exc))
+            return
         elif path == "/api/wake_rules":
             rules = payload.get("rules")
             err = _wake_rules_error(rules)
@@ -4653,8 +6089,124 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             except ValueError as e:
                 self._deny(400, str(e))
                 return
+            try:
+                out.update(_provider_archive_or_delete(tid, action, payload.get("value")))
+            except Exception:
+                pass
             _s.mark_hud_cache_stale()
             self.send_json(out)
+            return
+        elif path == "/api/peer/thread/send":
+            import thread_pen
+            tid = str(payload.get("thread_id") or payload.get("id") or "").strip()
+            text = payload.get("text")
+            if not tid:
+                self._deny(400, "Missing required 'thread_id'")
+                return
+            if text is None or not str(text).strip():
+                self._deny(400, "Empty message")
+                return
+
+            try:
+                active_pen = thread_pen.get_pen(tid)
+            except Exception:
+                active_pen = None
+
+            actor = str(getattr(self, "_device_id", "") or "").strip()
+            if active_pen is not None:
+                pen_holder = str(active_pen.get("holder") or "").strip()
+                if pen_holder and actor and pen_holder != actor:
+                    self._deny(403, f"Pen held by another holder: {pen_holder}")
+                    return
+                elif pen_holder and not actor:
+                    self._deny(403, f"Pen held by another holder: {pen_holder}")
+                    return
+
+            try:
+                res = thread_state.queue_thread_message(
+                    base_dir=_s.SUBWAY_DIR,
+                    thread_id=tid,
+                    text=str(text),
+                    sender=actor,
+                )
+                self.send_json(res, status=200)
+                return
+            except KeyError as e:
+                self._deny(404, str(e))
+                return
+            except ValueError as e:
+                msg = str(e)
+                if "archived" in msg:
+                    self._deny(409, "Thread is archived")
+                else:
+                    self._deny(400, msg)
+                return
+        elif path == "/api/chat_compact":
+            cid = str(payload.get("id") or "").strip()
+            if not cid:
+                self._deny(400, "Missing required 'id'")
+                return
+            status, body = _chat_compact(cid)
+            if status == 200:
+                self.send_json(body)
+            else:
+                self._deny(status, body.get("error") or "compaction failed")
+            return
+        elif path in ("/api/thread_cut", "/api/thread_fork"):
+            # Revert/fork a chat at a turn. Only Subway's own record changes; transcripts are never edited.
+            from transplant import engine as _eng
+            from cli_tools import chats as _chats
+            cid = str(payload.get("id") or "").strip()
+            turn = str(payload.get("tid") or "").strip()
+            if not cid:
+                self._deny(400, "Missing required 'id'")
+                return
+            if path == "/api/thread_cut" and not turn:
+                try:
+                    self.send_json({"ok": True, "cleared": _eng.clear_cut(cid)})
+                except ValueError as e:
+                    self._deny(409, str(e))
+                return
+            try:
+                live = _chats.chat_live(cid, turns=2)
+            except Exception:
+                live = {}
+            if ((live or {}).get("live") or {}).get("working"):
+                self._deny(409, "turn running")
+                return
+            rows = (_chats.chat_turns(cid, turns=100, apply_cut=False) or {}).get("turns") or []
+            if turn not in {r.get("tid") for r in rows}:
+                self._deny(404, "turn not found")
+                return
+            if path == "/api/thread_cut":
+                cut = _eng.set_cut(cid, turn, provider=str(payload.get("provider") or ""))
+                _s.mark_hud_cache_stale()
+                self.send_json({"ok": True, "cut": cut})
+                return
+
+            import conversation_swap
+            text = str(payload.get("text") or "").strip() or "Continue from here."
+            provider = str(payload.get("provider") or "").strip()
+            try:
+                c = _s.resolve(cid, strict=True)
+            except Exception:
+                c = {}
+            resolved_source = str((c or {}).get("source") or provider or "")
+            project_dir = str((c or {}).get("project_dir") or (c or {}).get("_project_path") or (c or {}).get("cwd") or (c or {}).get("project") or "")
+            target = provider or resolved_source
+            row = next((r for r in rows if r.get("tid") == turn), None)
+            cut_ts = float((row or {}).get("ts") or 0)
+            if not cut_ts:
+                self._deny(409, "that turn has no timestamp")
+                return
+            res = conversation_swap.fork_chat(c, cid, resolved_source, target, text, cut_ts, tid=turn,
+                                              model=str(payload.get("model") or ""), effort=str(payload.get("effort") or ""),
+                                              project_dir=project_dir)
+            if res.get("ok"):
+                _s.mark_hud_cache_stale()
+                self.send_json(res)
+            else:
+                self._deny(502, res.get("error") or "fork failed")
             return
         elif path == "/api/home_prefs":
             prefs = _s._load_json("home_prefs.json")
@@ -4686,38 +6238,167 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 off = max(0, int(payload.get("offset") or 0))
             except (TypeError, ValueError):
                 off = 0
-            res = _peers.write_chunk(real, str(payload.get("data") or ""), off, bool(payload.get("final")), bool(payload.get("overwrite")))
+            res = _peers.write_chunk(real, str(payload.get("data") or ""), off, bool(payload.get("final")),
+                                     bool(payload.get("overwrite")), cap=_peers.file_cap_for(me))
+            if res.get("error"):
+                self._deny(400, res["error"])
+                return
+            self.send_json(res)
+            return
+        elif path == "/api/peer/vfs_write":
+            import peers as _peers
+            import vfs as _vfs
+            me = _peers.by_device(getattr(self, "_device_id", "") or "") if pairing._normalise_scope(getattr(self, "_scope", "full")) == pairing.SCOPE_PEER else None
+            if not me:
+                self._deny(403, "only linked stations use this route")
+                return
+            if str(me.get("relation") or "partner") != "own" or _peers.effective_grants(me).get("files") != "send":
+                self._deny(403, "remote vfs_write requires an own station link")
+                return
+            raw_path = str(payload.get("path") or "").strip()
+            if not raw_path:
+                self._deny(400, "path is required")
+                return
+            content = payload.get("content")
+            if not isinstance(content, str):
+                self._deny(400, "content must be a string")
+                return
+            if len(content.encode("utf-8")) > _peers.MAX_FILE:
+                self._deny(400, "content too large")
+                return
+            base_sha = payload.get("base_sha")
+            defaults = sorted({str(c.get("project") or "") for c in _s.all_chats("all") if c.get("project")})
+            roots = _peers.roots_for(me, defaults)
+            real = _peers.safe_path(raw_path, roots, must_exist=False)
+            if not real:
+                self._deny(403, "outside the folders this station shares")
+                return
+            matched_root = ""
+            for r in roots:
+                try:
+                    if os.path.commonpath([r, real]) == r:
+                        matched_root = r
+                        break
+                except ValueError:
+                    continue
+            holder = _vfs._claimed_by_someone_else(matched_root, real)
+            if holder:
+                self.send_json({"error": f"file locked by {holder}", "holder": holder}, status=409)
+                return
+            if os.path.exists(real):
+                if not os.path.isfile(real):
+                    self._deny(400, "target is not a file")
+                    return
+                disk_sha = _vfs._sha_file(real)
+                if base_sha is not None and str(base_sha) != disk_sha:
+                    self.send_json({"error": "sha mismatch; base_sha does not match disk", "disk_sha": disk_sha}, status=409)
+                    return
+            else:
+                if base_sha:
+                    self.send_json({"error": "file does not exist for base_sha"}, status=409)
+                    return
+            parent = os.path.dirname(real)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            _vfs._atomic_write(real, content.encode("utf-8"))
+            new_sha = _vfs._sha_file(real)
+            size = os.path.getsize(real)
+            try:
+                import audit as _audit
+                _audit.record(
+                    {"kind": "peer", "id": str(me.get("peer_id") or ""), "name": str(me.get("name") or "")},
+                    "peer.remote_write",
+                    {"path": real, "sha256": new_sha},
+                    peer_station=me.get("name"),
+                )
+            except Exception:
+                pass
+            self.send_json({"ok": True, "path": real, "sha256": new_sha, "size": size})
+            return
+        elif path == "/api/peer/term/run":
+            import peers as _peers
+            import sandbox
+            import term_remote as _term_remote
+            me = _peers.by_device(getattr(self, "_device_id", "") or "") if pairing._normalise_scope(getattr(self, "_scope", "full")) == pairing.SCOPE_PEER else None
+            if not me:
+                self._deny(403, "only linked stations use this route")
+                return
+            if str(me.get("relation") or "partner") != "own" or _peers.effective_grants(me).get("terminal") != "on":
+                self._deny(403, "terminal grant requires an own station link")
+                return
+            cmd = str(payload.get("cmd") or "")
+            if not cmd.strip():
+                self._deny(400, "cmd is required")
+                return
+            defaults = sorted({str(c.get("project") or "") for c in _s.all_chats("all") if c.get("project")})
+            roots = _peers.roots_for(me, defaults)
+            raw_cwd = str(payload.get("cwd") or "").strip()
+            if raw_cwd:
+                real_cwd = _peers.safe_path(raw_cwd, roots, must_exist=True)
+                if not real_cwd or not os.path.isdir(real_cwd):
+                    self._deny(403, "cwd outside the folders this station shares")
+                    return
+            else:
+                if not roots:
+                    self._deny(403, "no shared folders for cwd")
+                    return
+                real_cwd = roots[0]
+            try:
+                timeout = float(payload.get("timeout") if payload.get("timeout") is not None else 60.0)
+            except (TypeError, ValueError):
+                timeout = 60.0
+            kind = str(payload.get("kind") or "exec").strip().lower()
+            action = "peer.remote_test" if kind == "test" else "peer.remote_exec"
+            peer_sb = _peers.effective_grants(me).get("sandbox") or "os"
+            peer_rel = str(me.get("relation") or "partner")
+            host_floor = sandbox.SandboxPolicy(
+                exec_sandbox=peer_sb,
+                net_policy="off",
+                state_mode="live",
+                writable_roots=(real_cwd,) if real_cwd else (),
+                strict_reads=True,
+            )
+            clamped = sandbox.clamp_policy(host_floor, relation=peer_rel, is_remote=True)
+            res = _term_remote.run(
+                cmd,
+                cwd=real_cwd,
+                timeout=timeout,
+                peer_id=str(me.get("peer_id") or ""),
+                peer_name=str(me.get("name") or ""),
+                audit_action=action,
+                sandbox_policy=clamped,
+            )
             if res.get("error"):
                 self._deny(400, res["error"])
                 return
             self.send_json(res)
             return
         elif path == "/api/chat":
-            if pairing._normalise_scope(getattr(self, "_scope", "full")) != pairing.SCOPE_FULL:
+            scope = pairing._normalise_scope(getattr(self, "_scope", "full"))
+            allowed = scope == pairing.SCOPE_FULL
+            if not allowed:
+                caller_id = getattr(self, "_device_id", "")
+                if caller_id:
+                    caller = next((d for d in pairing.list_devices() if isinstance(d, dict) and d.get("device_id") == caller_id), None)
+                    caller_grants = (caller or {}).get("grants") or []
+                    if "chat.send" in caller_grants:
+                        allowed = True
+            if not allowed:
+                cfg = _s._load_json("config.json") or {}
+                if isinstance(cfg, dict) and cfg.get("remote_chat_all"):
+                    allowed = True
+            if not allowed:
                 self._deny(403, "sending to a chat needs a full-access device")
                 return
-            chat_id = str(payload.get("chat_id") or "").strip()
-            text = str(payload.get("text") or "").strip()
-            source = str(payload.get("source") or "").strip().lower()
-            model = str(payload.get("model") or "").strip()
-            effort = str(payload.get("effort") or "").strip()
-            provider = str(payload.get("provider") or "").strip().lower()
-            if not chat_id or not text:
-                self._deny(400, "chat_id and text are required")
+            from hud_server import chat_send
+            status, body = chat_send.send(payload)
+            if status != 200:
+                self._deny(status, str(body.get("error") or "not delivered"))
                 return
-            import fastmail_lines
-            res = fastmail_lines.send_to_chat(
-                chat_id, text, source=source, model=model, effort=effort, target_provider=provider,
-                swap=bool(payload.get("swap"))
-            )
-            if not res.get("delivered") and not res.get("ok"):
-                self._deny(409 if res.get("method") == "unsupported" else 502, str(res.get("detail") or "not delivered"))
-                return
-            _s.mark_hud_cache_stale()
-            self.send_json(res)
+            self.send_json(body)
             return
         elif path == "/api/chat/new":
-            import fastmail_lines
+            import provider_lines
             provider = str(payload.get("provider") or "").strip().lower()
             text = str(payload.get("text") or "").strip()
             if not provider or not text:
@@ -4726,9 +6407,15 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             model = str(payload.get("model") or "").strip()
             effort = str(payload.get("effort") or "").strip()
             project_dir = str(payload.get("project_dir") or "").strip()
-            if not project_dir or not os.path.isdir(project_dir):
-                project_dir = str(getattr(_s, "HUD_PROJECT_DIR", "") or getattr(_s, "PROJECT_DIR", "") or os.getcwd())
-            ok, detail, info = fastmail_lines._launch_handoff_session(
+            # A chat either belongs to a project folder the caller names, or to no folder at all; then it
+            # starts in a fresh empty folder. Never fall back to the HUD's own cwd (that is often $HOME).
+            no_folder = bool(payload.get("no_folder")) or not project_dir
+            if no_folder:
+                project_dir = provider_lines.loose_chat_dir()
+            elif not os.path.isdir(project_dir):
+                self._deny(400, f"folder not found: {project_dir}")
+                return
+            ok, detail, info = provider_lines._launch_handoff_session(
                 provider, target_model=model, project_dir=project_dir, seed_prompt=text, effort=effort
             )
             if not ok:
@@ -4736,7 +6423,7 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 return
             info = dict(info or {})
             chat_id = str(info.pop("chat_id", "") or info.pop("session_id", "") or info.get("sid") or "")
-            res = {"ok": True, "detail": detail, "chat_id": chat_id}
+            res = {"ok": True, "detail": detail, "chat_id": chat_id, "project_dir": project_dir, "no_folder": no_folder}
             for k, v in info.items():
                 try:
                     json.dumps(v)
@@ -4756,7 +6443,24 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
             if not chat_id or not to_provider:
                 self._deny(400, "chat_id and to_provider are required")
                 return
-            res = conversation_swap.swap(chat_id, to_provider, text=str(payload.get("text") or ""),
+            _swap_text = str(payload.get("text") or "")
+            _atts_in = payload.get("attachments")
+            if _atts_in is not None and not isinstance(_atts_in, list):
+                self._deny(400, "attachments must be a list of file paths")
+                return
+            _att_paths = [str(p) for p in (_atts_in or []) if str(p or "").strip()]
+            _valid_atts, _att_err = attachments.validate(_att_paths or None)
+            if _att_err:
+                self._deny(400, _att_err)
+                return
+            if _valid_atts:
+                _swap_text += attachments.section(_valid_atts)
+            _swap_apps = payload.get("apps")
+            if isinstance(_swap_apps, list) and _swap_apps:
+                _labels = [f"{a.get('name') or a.get('id')} ({a.get('station') or 'here'})" if isinstance(a, dict) else str(a) for a in _swap_apps if a]
+                if _labels:
+                    _swap_text += "\n\n[Attached apps: " + ", ".join(_labels) + " — use Subway MCP tool app_action]"
+            res = conversation_swap.swap(chat_id, to_provider, text=_swap_text,
                                          model=str(payload.get("model") or ""), effort=str(payload.get("effort") or ""))
             if not res.get("delivered") and not res.get("ok"):
                 self._deny(502, str(res.get("detail") or res.get("error") or "swap failed"))
@@ -4786,6 +6490,42 @@ class SubwayHUDHandler(http.server.BaseHTTPRequestHandler):
                 return
             _s.mark_hud_cache_stale()
             self.send_json({"ok": True, "result": result})
+            return
+        elif path == "/api/worker/instruct":
+            # Steer a running worker from the composer: "stack" lands at its next tool call, "recall" interrupts now.
+            from cli_tools.notes import t_instruct_worker
+            wid = str(payload.get("worker_id") or "").strip()
+            text = str(payload.get("text") or "").strip()
+            mode = str(payload.get("mode") or "stack").strip().lower()
+            if not wid or not text:
+                self._deny(400, "worker_id and text are required")
+                return
+            if mode not in ("stack", "recall"):
+                self._deny(400, "mode must be stack or recall")
+                return
+            atts = [str(a) for a in (payload.get("attachments") or []) if a]
+            out = str(t_instruct_worker(wid, text, now=(mode == "recall"), attachments=atts or None))
+            if out.startswith("Error: worker") and "not found" in out:
+                self._deny(404, out)
+                return
+            if not out.startswith("[INSTRUCT]"):
+                self._deny(409, out)
+                return
+            _s.mark_hud_cache_stale()
+            self.send_json({"ok": True, "worker_id": wid, "mode": mode, "result": out})
+            return
+        elif path in ("/api/apps/connect", "/api/apps/disconnect"):
+            from hud_server import app_connectors
+            app_id = str(payload.get("id") or "").strip()
+            if path.endswith("/connect"):
+                res = app_connectors.connect(app_id)
+            else:
+                res = app_connectors.disconnect(app_id)
+            if not res.get("ok"):
+                self.send_json(res, status=409)
+                return
+            _s.mark_hud_cache_stale()
+            self.send_json(res)
             return
         elif path == "/api/mail":
             status, res = postmail.http_post_mail(payload)
@@ -4858,11 +6598,6 @@ def _tunnel_secret_ok(presented: str, peer_ip: str) -> bool:
     return bool(expected) and hmac.compare_digest(presented.strip(), expected)
 
 
-def _query_token_allowed(path: str) -> bool:
-    """Tokens in URLs leak into logs and proxies; only the phone's event stream may still use one."""
-    return path in ("/api/events", "/api/chat_stream", "/api/landing/diff/stream", "/api/worker_log/stream", "/api/diagnostics/stream")
-
-
 def _replay_gap(since: int, oldest) -> bool:
     """True when a resuming client missed frames that are no longer kept, so it must refetch state."""
     return since >= 0 and oldest is not None and since < oldest - 1
@@ -4870,6 +6605,7 @@ def _replay_gap(since: int, oldest) -> bool:
 
 class SubwayHUDServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128
     max_threads: Optional[int] = None  # None: SUBWAY_HUD_MAX_THREADS, else 128
 
     def _thread_cap(self):

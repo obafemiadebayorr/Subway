@@ -6,7 +6,13 @@
   let es = null, timer = 0, types = new Set(), last = 0;
   const fire = () => { timer = 0; const t = [...types]; types = new Set(); window.dispatchEvent(new CustomEvent("subway:push", { detail: { types: t } })); };
   const hit = (type) => { last = Date.now(); types.add(type); if (!timer) timer = setTimeout(fire, 120); };
-  const NAMES = ["worker", "workers", "worker_update", "worker_status", "worker_media", "permission", "approval", "audit", "status", "lock", "landing", "usage", "message", "screen_request", "screen_signal"];
+  const NAMES = ["worker", "workers", "worker_update", "worker_status", "worker_media", "permission", "approval", "audit", "status", "lock", "landing", "usage", "message", "screen_request", "screen_signal", "mail", "apps"];
+  // Re-emit every stream event on window so other modules (chatcore's queue) share this one EventSource.
+  const emit = (name, ev) => {
+    let data = null;
+    try { data = ev && ev.data ? JSON.parse(ev.data) : null; } catch (_) {}
+    try { window.dispatchEvent(new CustomEvent("subway:event", { detail: { name, data } })); } catch (_) {}
+  };
 
   async function postJson(url, body) {
     const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -82,8 +88,9 @@
 
   function open() {
     try { es = new EventSource("/api/events"); } catch (_) { return; }
-    NAMES.forEach((n) => es.addEventListener(n, () => {
+    NAMES.forEach((n) => es.addEventListener(n, (ev) => {
       hit(n);
+      emit(n, ev);
       if (["permission", "approval", "notification", "status"].includes(n)) queueSync();
     }));
     es.addEventListener("worker", (ev) => {
@@ -95,7 +102,7 @@
       hit("worker");
     });
     es.onmessage = () => hit("message");
-    es.onopen = () => { hit("connect"); syncPendingToasts(); };
+    es.onopen = () => { hit("connect"); emit("connect", null); syncPendingToasts(); };
   }
   open();
   document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - last > 5000) hit("visible"); });

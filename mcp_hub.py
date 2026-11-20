@@ -593,7 +593,7 @@ class HttpServer:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         h.update(self.spec.get("headers") or {})
         if not any(k.lower() == "authorization" for k in h):
-            h.update(_oauth_header(self.url))
+            h.update(_oauth_header(self.url, self.key))
         if self.session_id:
             h["Mcp-Session-Id"] = self.session_id
         return h
@@ -905,29 +905,53 @@ def hub_call(server, tool, arguments=None, timeout=120, project_dir=""):
     return call(server, tool, arguments=arguments, timeout=timeout, project_dir=project_dir)
 
 
-def _oauth_header(url):
-    """Bearer header for a remote server, from Claude Code's own OAuth store. Never logged."""
-    import json, subprocess, sys, time
-    if sys.platform != "darwin" or not url:
-        return {}
+def _claude_credential_blobs():
+    """Claude Code's credential JSON from every store it uses: macOS Keychain, then the plaintext file Claude Code
+    uses on Linux and Windows (<CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json). Yields parsed dicts; never logs."""
+    import json, os, subprocess, sys
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                yield json.loads(out.stdout)
+        except Exception:
+            pass
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
     try:
-        out = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                             capture_output=True, text=True, timeout=10)
-        if out.returncode != 0:
-            return {}
-        entries = json.loads(out.stdout).get("mcpOAuth") or {}
+        with open(os.path.join(base, ".credentials.json"), encoding="utf-8") as fh:
+            yield json.load(fh)
     except Exception:
+        pass
+
+def _oauth_header(url, server_key=""):
+    """Bearer header for a remote server. Subway's own sign-in (HUD MCP list, any OS, refreshed when due) wins;
+    then Claude Code's OAuth store, freshest valid entry. Never logged."""
+    import time
+    if not url:
         return {}
+    if server_key:
+        try:
+            import oauth_tokens
+            rec = oauth_tokens.ensure_fresh(server_key)
+            res = str(rec.get("resource") or "").rstrip("/")
+            if rec.get("access_token") and rec.get("status") != "disconnected" and (not res or res == url.rstrip("/")):
+                return {"Authorization": f"Bearer {rec['access_token']}"}
+        except Exception:
+            pass
     want = url.rstrip("/")
-    for v in entries.values():
-        if not isinstance(v, dict) or str(v.get("serverUrl") or "").rstrip("/") != want:
-            continue
-        tok = v.get("accessToken")
-        exp = v.get("expiresAt")
-        if not tok or (isinstance(exp, (int, float)) and exp and exp / 1000 < time.time()):
-            continue
-        return {"Authorization": f"Bearer {tok}"}
-    return {}
+    best = None  # (expires_sort_key, token)
+    for blob in _claude_credential_blobs():
+        for v in ((blob or {}).get("mcpOAuth") or {}).values():
+            if not isinstance(v, dict) or str(v.get("serverUrl") or "").rstrip("/") != want:
+                continue
+            tok, exp = v.get("accessToken"), v.get("expiresAt")
+            if not tok or (isinstance(exp, (int, float)) and exp and exp / 1000 < time.time()):
+                continue
+            key = exp if isinstance(exp, (int, float)) and exp else float("inf")
+            if best is None or key > best[0]:
+                best = (key, tok)
+    return {"Authorization": f"Bearer {best[1]}"} if best else {}
 
 
 _PROXY_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
@@ -946,9 +970,10 @@ def _proxy_spec(key, spec, worker_id, project_dir, ttl):
     The worker never sees the real bearer; the proxy adds it and applies the publish/delete gate."""
     import hud_server.lifecycle as lifecycle
     import mcp_grants
+    real_url = str(spec.get("url") or "")
     out = dict(spec)
     out["url"] = f"{lifecycle._hud_url(lifecycle._hud_port())}/api/mcp/proxy/{key}"
-    out["headers"] = {"Authorization": "Bearer " + mcp_grants.issue_grant(worker_id, key, project_dir or "", ttl)}
+    out["headers"] = {"Authorization": "Bearer " + mcp_grants.issue_grant(worker_id, key, project_dir or "", ttl, url=real_url)}
     return out
 
 
@@ -977,7 +1002,7 @@ def worker_servers(needs, project_dir="", worker_id="", ttl=3900):
         if spec.get("transport") != "stdio":
             hdr = dict(spec.get("headers") or {})
             if not any(k.lower() == "authorization" for k in hdr):
-                hdr.update(_oauth_header(spec.get("url")))
+                hdr.update(_oauth_header(spec.get("url"), key))
             spec["headers"] = hdr
         out.append(spec)
     return out

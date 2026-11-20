@@ -15,6 +15,7 @@ import wake_driver
 INTERVAL = float(os.environ.get("SUBWAY_WAKE_WAIT_INTERVAL", "0.5"))
 MAX_SECONDS = float(os.environ.get("SUBWAY_WAKE_WAIT_MAX", str(23 * 60 * 60)))
 COALESCE_SECONDS = 1.5
+STARTUP_HOLD_SECONDS = float(os.environ.get("SUBWAY_WAKE_STARTUP_HOLD", "12"))
 MAX_LINES = 20
 CURSOR_GRACE = 0.001
 
@@ -196,7 +197,10 @@ def _collect_new(chat_id: str, cursor: float):
 
 
 def _emit(events) -> int:
-    lines = [f"[SUBWAY EVENT] {str(ev.get('text', ''))}" for _, ev in events]
+    # Panel/fast-mail messages are the user's words; worker notices are events. The chat reader shows
+    # [SUBWAY MESSAGE] lines as the user turn they started and keeps [SUBWAY EVENT] as a reply break.
+    lines = [f"[SUBWAY {'MESSAGE' if ev.get('kind') == 'fastmail' else 'EVENT'}] {str(ev.get('text', ''))}"
+             for _, ev in events]
     if len(lines) > MAX_LINES:
         more = len(lines) - MAX_LINES
         lines = lines[:MAX_LINES] + [f"... and {more} more"]
@@ -208,6 +212,9 @@ def _emit(events) -> int:
 def main() -> int:
     try:
         if os.environ.get("SUBWAY_WORKER_ID") or os.environ.get("SUBWAY_WORKER"):
+            return 0
+        # Subway's own headless runs: `claude -p` waits for this hook, so a waiter would hold it open.
+        if os.environ.get("SUBWAY_HEADLESS"):
             return 0
         try:
             hook = json.load(sys.stdin)
@@ -233,6 +240,14 @@ def main() -> int:
         cursor_path = os.path.join(spool, f"{safe}.cursor")
         pid = os.getpid()
         _write_waiter(waiter_path, pid)
+
+        # A SessionStart waiter starts while a prompt may be starting the turn; a rewake fired then is
+        # logged as a hook error and never reaches the model. Hold off so the turn's Stop waiter (which
+        # takes over the .waiter file) delivers anything already pending.
+        if hook.get("hook_event_name") == "SessionStart":
+            time.sleep(STARTUP_HOLD_SECONDS)
+            if not _owns_waiter(waiter_path, pid):
+                return 0
 
         cursor = _read_cursor(cursor_path)
         if cursor is None:

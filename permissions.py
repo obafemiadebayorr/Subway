@@ -213,14 +213,18 @@ def _perm_file(request_id: str) -> str:
     return os.path.join(_s._perm_dir(), f"{request_id}.json")
 
 
-def _pending_permissions(worker_id: str = "", station: str = "") -> List[Dict[str, Any]]:
+def _pending_permissions(worker_id: str = "", station: str = "", now: Optional[float] = None) -> List[Dict[str, Any]]:
     out = []
+    now_val = time.time() if now is None else now
     for fp in glob.glob(os.path.join(_s._perm_dir(), "perm_*.json")):
         with contextlib.suppress(OSError, ValueError):
             with open(fp, "r", encoding="utf-8") as f:
                 r = json.load(f)
             if r.get("status") == "pending" and (not worker_id or r.get("worker_id") == worker_id) \
                     and (not station or r.get("launched_by") == station):
+                expires_at = r.get("expires_at")
+                if expires_at is not None and now_val >= expires_at:
+                    continue
                 out.append(r)
     return sorted(out, key=lambda r: r.get("created_at", 0))
 
@@ -500,7 +504,7 @@ def _packet_reread_denial(meta: Dict[str, Any], tool: str, detail: Any, kind: st
 
 
 def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Optional[List[str]] = None,
-                       raw_input: Any = None) -> str:
+                       raw_input: Any = None, expires_at: Optional[float] = None) -> str:
     """Queue a question for the user, and tell the window that launched this worker."""
     rid = f"perm_{uuid.uuid4().hex[:8]}"
     denial = (_readonly_terminal_denial(meta, tool, raw_input or detail)
@@ -508,10 +512,10 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
               or _s._large_file_read_denial(meta, tool, raw_input or detail))
     rec = {"id": rid, "worker_id": meta["id"], "role": meta.get("role"), "provider": meta.get("provider"),
            "tool": tool, "detail": detail, "rules": rules or [], "status": "pending",
-           "launched_by": meta.get("launched_by"), "created_at": time.time()}
+           "launched_by": meta.get("launched_by"), "created_at": time.time(), "expires_at": expires_at}
     _s._write_json_atomic(_s._perm_file(rid), rec)
     _s._thread_record(meta.get("thread_root") or _s._thread_root_for_caller(meta["id"]), "permission_asked", meta["id"],
-                   data={"request_id": rid, "tool": tool, "detail": _s.one_line(str(detail or ""), 300)})
+                   data={"request_id": rid, "tool": tool, "detail": "[redacted]"})
     if denial:
         _s._answer_permission(rid, "deny", "Subway large-file read guard", denial_reason=denial)
         return rid
@@ -555,17 +559,19 @@ def request_permission(meta: Dict[str, Any], tool: str, detail: str, rules: Opti
                 with open(os.path.join(_s.SUBWAY_DIR, "inbox", f"{launcher}.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps({"ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
                                         "from": meta["id"], "shared_chat": None,
-                                        "text": f"Permission needed ({rid}): {tool}: {detail}"}) + "\n")
-    _s._broadcast_track_internal(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}: {_s.one_line(detail, 200)}",
+                                        "text": f"Permission needed ({rid}): {tool}"}) + "\n")
+    _s._broadcast_track_internal(f"[PERMISSION REQUEST] `{meta['id']}` ({meta.get('role')}) asks to use {tool}",
                               track=meta.get("track", "main"), station_id=meta["id"])
     _s.notify_if_still_waiting(f"permission_request|{meta['id']}|{rid}", f"Permission needed ({meta['id']}): {tool}",
                             lambda: rid in {r["id"] for r in _s._pending_permissions()}, route="workers")
     return rid
 
 
-def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason: str = "") -> str:
+def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason: str = "", *,
+                       now: Optional[float] = None) -> str:
     if decision not in ("allow", "allow_always", "deny"):
         return "Error: decision must be 'allow', 'allow_always', or 'deny'."
+    now_val = time.time() if now is None else now
     with _s._state_lock("permissions"):
         try:
             with open(_s._perm_file(rid), "r", encoding="utf-8") as f:
@@ -573,7 +579,12 @@ def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason:
         except (OSError, ValueError):
             return f"Error: permission request `{rid}` not found."
         if rec.get("status") != "pending":
-            return f"Permission request `{rid}` was already answered ({rec.get('decision')})."
+            return "already answered"
+        expires_at = rec.get("expires_at")
+        if expires_at is not None and now_val >= expires_at:
+            rec.update({"status": "expired", "expired_at": now_val})
+            _s._write_json_atomic(_s._perm_file(rid), rec)
+            return "expired"
         rec.update({"status": "answered", "decision": decision, "answered_by": answered_by, "answered_at": time.time()})
         if denial_reason:
             rec["denial_reason"] = denial_reason
@@ -581,7 +592,7 @@ def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason:
     _perm_node = str(rec.get("worker_id") or rec.get("launched_by") or "")
     _s._thread_record(_s._thread_root_for_caller(_perm_node), "permission_answered", _perm_node, data={
         "request_id": rid, "decision": decision, "answered_by": answered_by})
-    _s._broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']}: {_s.one_line(rec['detail'], 160)} "
+    _s._broadcast_track_internal(f"[PERMISSION {decision.upper()}] `{rec['worker_id']}`: {rec['tool']} "
                               f"(by {answered_by})", track="main", station_id="guard")
     if rec.get("kind") == "fastmail_offline":
         try:
@@ -597,7 +608,7 @@ def _answer_permission(rid: str, decision: str, answered_by: str, denial_reason:
                     fastmail.set_state(msg["id"], "queued", "resume declined")
         except Exception as e:
             _s.log(f"fastmail_offline approval handling failed for {rid}: {e}")
-    return f"[{decision.upper()}] `{rid}`: {rec['tool']}: {_s.one_line(rec['detail'], 160)}"
+    return f"[{decision.upper()}] `{rid}`: {rec['tool']}"
 
 
 def permission_text(requests: List[Dict[str, Any]]) -> str:

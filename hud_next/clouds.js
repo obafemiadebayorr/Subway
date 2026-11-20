@@ -1,6 +1,12 @@
 /* Home clouds: flat painted cumulus in the Mononoke sky palette (deep #296A7F, sky #2692A6, shade #74A5A9,
    lit white). Placed at random on each load, drifting slowly; behind the map, Home only. */
 (function(){
+/* Colours are CSS variables so a theme switch repaints the clouds without a rebuild. */
+if(!document.getElementById("cl-theme")){const st=document.createElement("style");st.id="cl-theme";
+  const D="--cl-shade:#26343B;--cl-base:#1E3138;--cl-lit:#222D35;--cl-mid:#1A242B";
+  st.textContent=`.clouds{--cl-shade:#9EC3C6;--cl-base:#74A5A9;--cl-lit:#FFFFFF;--cl-mid:#D6E7E7}
+:root[data-theme="dark"] .clouds{${D}}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .clouds{${D}}}`;document.head.append(st);}
 const NS="http://www.w3.org/2000/svg";
 const R=(a,b)=>a+Math.random()*(b-a);
 const box=document.createElement("div");box.className="clouds";box.setAttribute("aria-hidden","true");
@@ -17,10 +23,10 @@ function cloud(w){const h=w*.5,base=h*.92,puffs=[];
   const id="cb"+Math.random().toString(36).slice(2,8);
   svg.innerHTML=`<defs><clipPath id="${id}"><rect x="0" y="${-h}" width="${w}" height="${base+h}"/></clipPath></defs>
    <g clip-path="url(#${id})">
-    <g fill="#9EC3C6">${puffs.map(([x,y,r])=>`<circle cx="${x}" cy="${y}" r="${r}"/>`).join("")}</g>
-    <rect x="0" y="${base-h*.06}" width="${w}" height="${h*.06}" fill="#74A5A9" opacity=".55"/>
-    <g fill="#FFFFFF">${puffs.map(([x,y,r])=>`<circle cx="${x-r*.08}" cy="${y-r*.2}" r="${r*.86}"/>`).join("")}</g>
-    <g fill="#D6E7E7">${puffs.filter(()=>Math.random()<.45).map(([x,y,r])=>`<circle cx="${x+r*.35}" cy="${y+r*.25}" r="${r*.42}"/>`).join("")}</g>
+    <g style="fill:var(--cl-shade)">${puffs.map(([x,y,r])=>`<circle cx="${x}" cy="${y}" r="${r}"/>`).join("")}</g>
+    <rect x="0" y="${base-h*.06}" width="${w}" height="${h*.06}" style="fill:var(--cl-base)" opacity=".55"/>
+    <g style="fill:var(--cl-lit)">${puffs.map(([x,y,r])=>`<circle cx="${x-r*.08}" cy="${y-r*.2}" r="${r*.86}"/>`).join("")}</g>
+    <g style="fill:var(--cl-mid)">${puffs.filter(()=>Math.random()<.45).map(([x,y,r])=>`<circle cx="${x+r*.35}" cy="${y+r*.25}" r="${r*.42}"/>`).join("")}</g>
    </g>`;
   return svg;}
 

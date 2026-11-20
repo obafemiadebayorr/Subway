@@ -335,6 +335,11 @@ def _handle(handler, method):
     spec = _find_server_spec(grant.get("project") or "", server)
     if spec is None:
         raise _ProxyError(404, {"error": "not found"})
+    # The spec URL was pinned when the grant was issued; a .mcp.json rewritten under the
+    # project mid-grant must not redirect the station's real bearer (F5).
+    granted_url = str(grant.get("url") or "")
+    if granted_url and str(spec.get("url") or "") != granted_url:
+        raise _ProxyError(403, {"error": "server spec changed since the grant was issued; reconnect the server"})
 
     body = _read_body(handler, method)
     parsed = _parse_json_body(body) if method == "POST" else None

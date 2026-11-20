@@ -112,14 +112,14 @@ class SegmentInfo(tuple):
         self.note = note
 
 
-def chat_segments_info(chat: Dict[str, Any], segment: Union[str, int] = "all") -> Tuple[List[Dict[str, Any]], str, int]:
+def chat_segments_info(chat: Dict[str, Any], segment: Union[str, int] = "all", tail_bytes: Optional[int] = None) -> Tuple[List[Dict[str, Any]], str, int]:
     source = (chat.get("source") or "").lower()
     note = None
 
     try:
         if source == "claude":
             is_sub = "/subagents/" in chat.get("path", "")
-            segs = _s.claude_read_segments(chat.get("path", ""), is_sub=is_sub)
+            segs = _s.claude_read_segments(chat.get("path", ""), is_sub=is_sub, **({"tail_bytes": tail_bytes} if tail_bytes else {}))
         elif source == "opencode":
             segs = _s.opencode_read_segments(chat.get("id", ""))
         elif source == "antigravity":

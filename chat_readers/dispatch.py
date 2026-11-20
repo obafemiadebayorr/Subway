@@ -361,6 +361,67 @@ def _detect_self_uncached() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _pi_session_freshest_live() -> str:
+    """Caller session for IDE-hosted pi chats, where ancestry cannot reach them.
+
+    A chat running inside an IDE spawns its extension host as a SIBLING of the
+    MCP server, never an ancestor, so the pid-mapping walk above always misses it
+    and the newest-transcript fallback attributes the call to whichever other
+    chat spoke last (A12: worker launched_by misattribution). Instead, resolve
+    the caller as the live session that is active right now.
+    Candidates come only from the pi_sessions registry entries whose pid is still
+    alive, so closed chats can never win by being the most recent writer.
+
+    Ranking uses the per-session liveness marker ~/.subway/pi_live/<sid>, touched
+    by the wake extension at turn start and before EVERY tool call — so the chat
+    making an MCP call has the freshest marker at the moment the server resolves,
+    and a sibling chat that is merely idle or thinking cannot steal attribution.
+    Transcript mtime is the tie-breaker for chats whose marker is missing.
+    """
+    subway_dir = getattr(_s, "SUBWAY_DIR", os.path.join(os.path.expanduser("~"), ".subway"))
+    mapping_dir = os.path.join(subway_dir, "pi_sessions")
+    live_dir = os.path.join(subway_dir, "pi_live")
+    live_sids: set = set()
+    try:
+        for name in os.listdir(mapping_dir):
+            try:
+                pid = int(name)
+                os.kill(pid, 0)
+                with open(os.path.join(mapping_dir, name), "r", encoding="utf-8", errors="replace") as f:
+                    sid = f.read().strip()
+                if sid:
+                    live_sids.add(sid)
+            except (ValueError, OSError):
+                continue
+    except OSError:
+        return ""
+    if not live_sids:
+        return ""
+    if len(live_sids) == 1:
+        return next(iter(live_sids))
+    marker_mtime = {}
+    for sid in live_sids:
+        try:
+            marker_mtime[sid] = os.path.getmtime(os.path.join(live_dir, sid))
+        except OSError:
+            marker_mtime[sid] = -1.0
+    if max(marker_mtime.values(), default=-1.0) >= 0:
+        return max(live_sids, key=lambda s: (marker_mtime.get(s, -1.0), s))
+    best_sid, best_mtime = "", -1.0
+    for path in _s.pi_files() or []:
+        base = os.path.basename(path)
+        sid = base.rsplit("_", 1)[-1].split(".")[0] if "_" in base else base.split(".")[0]
+        if sid not in live_sids:
+            continue
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            continue
+        if m > best_mtime:
+            best_mtime, best_sid = m, sid
+    return best_sid
+
+
 def _pi_session_from_ancestry() -> str:
     """This pi chat's session id, found via the process that spawned this server.
 
@@ -389,6 +450,12 @@ def _pi_session_from_ancestry() -> str:
                     return sid
         except OSError:
             continue
+    try:
+        freshest = _pi_session_freshest_live()
+        if freshest:
+            return freshest
+    except Exception:
+        pass
     try:
         files = _s.pi_files()
         if files:

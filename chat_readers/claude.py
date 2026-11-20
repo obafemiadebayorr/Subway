@@ -10,6 +10,7 @@ import glob
 import hashlib
 import hmac
 import http.server
+import io
 import json
 import math
 import os
@@ -86,8 +87,13 @@ def _claude_is_human(o: Dict[str, Any], is_subagent: bool = False) -> bool:
     origin = o.get("origin")
     if isinstance(origin, dict):
         return origin.get("kind") == "human"
-    if o.get("turnOrigin"):
-        return o.get("turnOrigin") == "human"
+    # VS Code tabs and Subway's own sends submit prompts through the SDK ("sdk"); those are user turns too.
+    # Other origins (task notifications, hooks) are not. "sdk" still goes through the content checks below.
+    turn_origin = o.get("turnOrigin")
+    if turn_origin == "human":
+        return True
+    if turn_origin and turn_origin != "sdk":
+        return False
     if isinstance(c, list):
         if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
             return False
@@ -126,6 +132,30 @@ def claude_parse_lines(lines: List[str], is_subagent: bool = False) -> List[Dict
                 turns.append({"role": "summary", "text": txt, "ts": ts})
                 continue
             if not _claude_is_human(o, is_subagent=is_subagent):
+                # Hook/Subway event injections end the agent's reply and start a new one; tool results don't.
+                if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                    continue
+                if isinstance(content, str):
+                    ev = content
+                elif isinstance(content, list):
+                    ev = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    ev = ""
+                if any(k in ev for k in ("<task-notification>", "Stop hook", "[SUBWAY EVENT]", "[SUBWAY MESSAGE]", "[SUBWAY:")):
+                    relayed = None
+                    if "[SUBWAY:" in ev and "\nUser message: " in ev:
+                        relayed = ev.rsplit("\nUser message: ", 1)[1]
+                        for cut in ("</system-reminder>", "&lt;/system-reminder&gt;", "<system-reminder>"):
+                            relayed = relayed.split(cut, 1)[0]
+                        relayed = relayed.strip() or None
+                    if not relayed and "[SUBWAY MESSAGE] " in ev:
+                        # A panel message woken into an idle window: show it as the user turn it started.
+                        relayed = "\n".join(ln.split("[SUBWAY MESSAGE] ", 1)[1] for ln in ev.splitlines()
+                                             if "[SUBWAY MESSAGE] " in ln).strip() or None
+                    if relayed:
+                        turns.append({"role": "user", "text": relayed, "ts": ts, "relayed": True})
+                    else:
+                        turns.append({"role": "assistant", "text": "", "boundary": True, "ts": ts})
                 continue
             txt_parts = []
             if isinstance(content, str):
@@ -354,13 +384,32 @@ def claude_rewound_lines(lines: List[str]) -> Set[int]:
     return drop
 
 
-def claude_read_segments(path: str, is_sub: bool = False) -> List[List[Dict[str, Any]]]:
+_SEG_CACHE: Dict[tuple, List[List[Dict[str, Any]]]] = {}
+
+
+def claude_read_segments(path: str, is_sub: bool = False, tail_bytes: Optional[int] = None) -> List[List[Dict[str, Any]]]:
     """Read a transcript and split turns into segments at compact_boundary lines.
-    Branches abandoned by a rewind are left out (main transcripts only)."""
+    Branches abandoned by a rewind are left out (main transcripts only).
+    tail_bytes: read only the last N bytes (HUD live views of huge transcripts); results are cached by size+mtime."""
+    key = None
+    if tail_bytes:
+        try:
+            st = os.stat(path)
+            key = (path, is_sub, int(tail_bytes), st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = None
+        if key is not None and key in _SEG_CACHE:
+            return [[dict(t) for t in s] for s in _SEG_CACHE[key]]
     segments_raw: List[List[str]] = [[]]
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+        if key is not None and key[3] > key[2]:
+            with open(path, "rb") as fb:
+                fb.seek(key[3] - key[2])
+                fb.readline()  # drop the partial first line
+                all_lines = io.StringIO(fb.read().decode("utf-8", errors="replace")).readlines()
+        else:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
         dropped = set() if is_sub else claude_rewound_lines(all_lines)
         for idx, line in enumerate(all_lines):
             if idx in dropped:
@@ -375,4 +424,12 @@ def claude_read_segments(path: str, is_sub: bool = False) -> List[List[Dict[str,
                     pass
             segments_raw[-1].append(line)
     parsed = [claude_parse_lines(s_lines, is_subagent=is_sub) for s_lines in segments_raw]
-    return parsed if parsed else [[]]
+    result = parsed if parsed else [[]]
+    if key is not None:
+        for k in [k for k in _SEG_CACHE if k[0] == path and k[3:] != key[3:]]:
+            _SEG_CACHE.pop(k, None)
+        _SEG_CACHE[key] = result
+        while len(_SEG_CACHE) > 4:
+            _SEG_CACHE.pop(next(iter(_SEG_CACHE)))
+        return [[dict(t) for t in s] for s in result]
+    return result

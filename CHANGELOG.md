@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.9 - 2026-11-20
+
+### Fixed (regression audit: 20 findings, all high-severity closed)
+- **Budget caps could silently disarm** (`B3b`): `budget_stop` skipped whenever a worker response existed, so multi-turn workers ran past every token/tool cap (validated: a 1.5M-token runaway is now stopped at its cap). Caps now skip only on finished workers.
+- **Dead pi sessions looked online** (`A11`): delivery into closed sessions was faked with a "Delivered via spool" receipt that no one would ever read. Liveness now checks the specific chat's session mapping + its process, and closed chats refuse delivery loudly ("chat is closed").
+- **Worker milestones routed to the wrong chat** (`A12`): IDE-hosted pi chats share MCP servers whose ancestry never reaches them, so `launched_by` resolved to whichever chat spoke last — false history in the Workers panel and misrouted alerts. Caller identity now resolves by per-session liveness markers (`pi_live/`), touched by the wake extension before every tool call.
+- **HUD-started chats died silently** (`A13`): "New Pi chat" spawned a bare pi CLI that lacks the app-managed deepai provider and exits 0 after the /login banner — the HUD reported success, then the panel matched the dead tab to a wrong chat. Headless spawns now fail loudly with the cause, and a new **DeepAI models in HUD-started chats** setting (default off) opts into the app's own local-proxy path (identical billing to in-app).
+- **Spool graveyards**: dead chats' undelivered wake spools accumulated for weeks (322 files, 156 with events). `archive_orphaned_spools()` now archives them (never deletes) and the registries were swept (3,312 stale pi sessions, 31 stale window files).
+- **Wake spool cross-process corruption** (`A2`), **mute semantics** (`A3`), **guard crashes on Antigravity** (`B2` additionalContext), **pi edit-tool gating** (`B1` lowercase edit/write), **fastmail alias/self-send guards** (`A5/A6`), **dual-format agy wake incl. UUID chat ids** (`B4`), **log-read UTF-8 boundary + mid-flush cache guard** (`A7/A8`), **alias spool resolution + VM honesty** (`A4`), **auditor-role classification** (`B3c`), **remote-weakening settings guard** (`B5`), **failure-doctor hint** (`B6`), **composer model inheritance** (`F1`), and unit-verify pinning (`F6`).
+
+### Added
+- **DeepAI tunnel (carrier-restricted networks)**: Settings → Startup → `deepai_tunnel` — a pure IPv4 TCP forwarder to the same api.deepai.org servers (zero TLS termination, billing byte-identical) for networks where direct TLS fails; one-command arm/teardown, status card, hosts backup.
+- **Spool hygiene API**: `wake_driver.archive_orphaned_spools(min_age_days)`.
+
+### Known residuals (ledger: `plan/1.3.9-regression-audit.md`)
+- ~24 test failures are assertion drift from concurrent feature merges (none from this release's fixes; verified by stash-testing); repair queued for 1.3.10.
+- OpenCode worker shutdown may SIGTERM the child before the final report (F0-family).
+- Threads page: the tested canvas atlas implementation is retained; the older shadow-root wrapper was not merged.
+
 ## 1.3.8 - 2026-11-15
 
 ### Added / Changed

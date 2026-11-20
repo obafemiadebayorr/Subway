@@ -57,7 +57,69 @@ def redact_text(text: str) -> str:
         line = _BEARER_RE.sub(lambda mo: f"{mo.group(1)}***REDACTED***", line)
         line = _KV_SECRET_RE.sub(lambda mo: f"{mo.group(1)}{mo.group(2)}***REDACTED***", line)
         out_lines.append(line)
-    return "\n".join(out_lines)
+    return redact_secret_values("\n".join(out_lines))
+
+
+_SECRET_HANDLE_RE = re.compile(r"\{\{secret:([A-Za-z0-9_.\-]+)\}\}")
+
+
+class UnknownSecretHandleError(ValueError):
+    """Raised when a command references an unknown {{secret:NAME}} handle."""
+
+
+def _active_session_secrets(session_id: Optional[str] = None) -> Dict[str, str]:
+    try:
+        from hud_server import collab_api  # type: ignore
+        session = collab_api._load()
+        if not session:
+            return {}
+        if session_id and session.get("id") != session_id:
+            return {}
+        payload = collab_api.open_session_payload(session)
+        handles = payload.get("handles") or {}
+        return {str(k): str(v["value"]) for k, v in handles.items()
+                if isinstance(v, dict) and v.get("value") is not None}
+    except Exception:
+        return {}
+
+
+def redact_secret_values(text: str, extra_values: Optional[List[str]] = None) -> str:
+    """Replace any active session secret values (and extra_values) in text with ***REDACTED***."""
+    if not text:
+        return text
+    vals = set(_active_session_secrets().values())
+    if extra_values:
+        vals.update(str(v) for v in extra_values if v)
+    out = text
+    for val in sorted((v for v in vals if v), key=len, reverse=True):
+        out = out.replace(val, "***REDACTED***")
+    return out
+
+
+def substitute_secret_handles(command: str, session_id: Optional[str] = None):
+    """Resolve {{secret:NAME}} handles at exec time only; raises UnknownSecretHandleError on missing."""
+    cmd = command or ""
+    handles = _SECRET_HANDLE_RE.findall(cmd)
+    if not handles:
+        return cmd, []
+    secrets_map = _active_session_secrets(session_id)
+    resolved: List[str] = []
+    def _replace(match):
+        name = match.group(1)
+        if name not in secrets_map:
+            raise UnknownSecretHandleError(f"unknown secret handle: {name}")
+        val = secrets_map[name]
+        resolved.append(val)
+        return val
+    return _SECRET_HANDLE_RE.sub(_replace, cmd), resolved
+
+
+def run_command_with_secrets(command: str, runner: Any, session_id: Optional[str] = None):
+    """Substitute {{secret:NAME}} for runner(exec_cmd), then redact secret values from output."""
+    exec_cmd, vals = substitute_secret_handles(command, session_id=session_id)
+    code, output = runner(exec_cmd)
+    cleaned = redact_secret_values(redact_text(strip_ansi(output or "")), vals)
+    return code, cleaned
 
 
 def _write_json_atomic(path: str, data: Any) -> None:

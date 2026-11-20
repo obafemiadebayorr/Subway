@@ -6,7 +6,9 @@ other station uses to call us (scope "peer"), and the grants the user gave that 
 is checked against its grants on THIS station; nothing the caller sends widens them.
 """
 import base64
+import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -14,12 +16,16 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import pairing
 import subway_home
+
+_log = logging.getLogger(__name__)
+_PK_ROTATE_LOCK = threading.Lock()
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "subway-peer.mjs")
 
@@ -49,14 +55,18 @@ GRANT_CHOICES = {
     "skills": ("off", "read"),
     "screen": ("off", "snapshot", "live"),
     "control": ("off", "on"),
+    "terminal": ("off", "on"),
+    "threads": ("off", "read", "pen"),
+    "usage": ("off", "read"),
+    "sandbox": ("off", "worktree", "os", "vm"),
 }
 PRESETS = {
     "personal": {"chats": "full", "mail": "on", "spawn": "direct", "approve": "on", "land": "edits",
-                 "claims": "claim", "events": "all", "files": "send", "apps": "off", "collab": "on", "swarm": "on", "skills": "off", "screen": "off", "mcp": "off", "control": "off"},
+                 "claims": "claim", "events": "all", "files": "send", "apps": "off", "collab": "on", "swarm": "on", "skills": "off", "screen": "off", "mcp": "off", "control": "off", "ide": "off", "terminal": "off", "threads": "pen", "usage": "read", "sandbox": "worktree"},
     "collaborator": {"chats": "decisions", "mail": "on", "spawn": "pending", "approve": "off", "land": "patch",
-                     "claims": "claim", "events": "own", "files": "read", "apps": "off", "collab": "on", "swarm": "off", "skills": "off", "screen": "off", "mcp": "off", "control": "off"},
+                     "claims": "claim", "events": "own", "files": "read", "apps": "off", "collab": "on", "swarm": "off", "skills": "off", "screen": "off", "mcp": "off", "control": "off", "ide": "off", "terminal": "off", "threads": "off", "usage": "off", "sandbox": "os"},
     "observer": {"chats": "titles", "mail": "off", "spawn": "off", "approve": "off", "land": "off",
-                 "claims": "read", "events": "own", "files": "off", "apps": "off", "collab": "off", "swarm": "off", "skills": "off", "screen": "off", "mcp": "off", "control": "off"},
+                 "claims": "read", "events": "own", "files": "off", "apps": "off", "collab": "off", "swarm": "off", "skills": "off", "screen": "off", "mcp": "off", "control": "off", "ide": "off", "terminal": "off", "threads": "off", "usage": "off", "sandbox": "os"},
 }
 # Grants that only the designated controller keeps when one is set.
 CONTROL_GRANTS = ("spawn", "approve", "land")
@@ -80,21 +90,30 @@ _GET_ROUTES = {
     "/api/peer/read_chat": ("chats", ("decisions", "full")),
     "/api/peer/search_chat": ("chats", ("decisions", "full")),
     "/api/peer/worker": ("events", ("own", "all")),
+    "/api/peer/permissions": ("events", ("own", "all")),
+    "/api/peer/approve/list": ("approve", ("on",)),
     "/api/peer/claims": ("claims", ("read", "claim")),
     "/api/peer/station": ("events", ("own", "all")),
+    "/api/peer/ide": ("ide", ("read",)),
     "/api/peer/coordination": ("claims", ("read", "claim")),
     "/api/peer/models": ("spawn", ("pending", "direct")),
     "/api/peer/allowance": ("spawn", ("pending", "direct")),
     "/api/peer/skills": ("skills", ("read",)),
+    "/api/peer/apps": ("events", ("own", "all")),
     "/api/peer/skill": ("skills", ("read",)),
     "/api/peer/screen": ("screen", ("snapshot", "live")),
     "/api/peer/screen/session": ("screen", ("live",)),
     "/api/peer/patch": ("events", ("own", "all")),
     "/api/peer/files": ("files", ("read", "send")),
     "/api/peer/file": ("files", ("read", "send")),
+    "/api/peer/vfs_read": ("files", ("read", "send")),
     "/api/peer/media": ("events", ("own", "all")),
     "/api/peer/swarm/manifest": ("swarm", ("on",)),
     "/api/peer/swarm/bundle": ("swarm", ("on",)),
+    "/api/peer/term/read": ("terminal", ("on",)),
+    "/api/peer/mcp": ("mcp", ("on",)),
+    "/api/peer/thread_export": ("chats", ("full",)),
+    "/api/peer/thread/pen": ("threads", ("read", "pen")),
 }
 _POST_ROUTES = {
     "/api/mail": ("mail", ("on",)),
@@ -102,12 +121,17 @@ _POST_ROUTES = {
     "/api/peer/hub_call": ("mcp", ("on",)),
     "/api/peer/screen/request": ("screen", ("live",)),
     "/api/peer/screen/signal": ("screen", ("live",)),
+    "/api/peer/screen/input": ("control", ("on",)),
+    "/api/peer/screen/control/stop": ("control", ("on",)),
     "/api/spawn": ("spawn", ("pending", "direct")),
     "/api/peer/spawn": ("spawn", ("pending", "direct")),
     "/api/peer/approve_worker": ("approve", ("on",)),
     "/api/approve_worker": ("approve", ("on",)),
     "/api/reject_worker": ("approve", ("on",)),
     "/api/answer_permission": ("approve", ("on",)),
+    "/api/peer/permissions": ("approve", ("on",)),
+    "/api/peer/approve/approve": ("approve", ("on",)),
+    "/api/peer/approve/deny": ("approve", ("on",)),
     "/api/claim": ("claims", ("claim",)),
     "/api/peer/collab/sync": ("collab", ("on",)),
     "/api/peer/collab/couple": ("collab", ("on",)),
@@ -115,9 +139,14 @@ _POST_ROUTES = {
     "/api/peer/collab/plan": ("collab", ("on",)),
     "/api/release": ("claims", ("claim",)),
     "/api/peer/file": ("files", ("send",)),
+    "/api/peer/vfs_write": ("files", ("send",)),
     "/api/peer/swarm/submit": ("swarm", ("on",)),
+    "/api/peer/term/run": ("terminal", ("on",)),
+    "/api/peer/thread/pen": ("threads", ("pen",)),
+    "/api/peer/thread/send": ("threads", ("pen",)),
 }
-ALWAYS = {("GET", "/api/status"), ("GET", "/api/peer/hello"), ("POST", "/api/peer/unlink")}
+ALWAYS = {("GET", "/api/status"), ("GET", "/api/peer/hello"), ("POST", "/api/peer/unlink"),
+          ("POST", "/api/peer/pk_rotate"), ("POST", "/api/peer/approve/request")}
 
 
 def _data() -> Dict[str, Any]:
@@ -142,17 +171,32 @@ def normalise_grants(grants: Any, base: str = "observer") -> Dict[str, str]:
     return out
 
 
+def _sync_inhibit(d: Dict[str, Any]) -> None:
+    try:
+        import reachability
+        reachability.sync_inhibitor(len(d.get("peers") or {}))
+    except Exception:
+        pass
+
+
 def public(peer: Dict[str, Any]) -> Dict[str, Any]:
     """A peer without its token, for lists and the HUD."""
     return {k: v for k, v in peer.items() if k != "token"}
 
 
 def add(name: str, station: Dict[str, Any], token: str, device_id: str, grants: Any = None,
-        relation: str = "partner") -> Dict[str, Any]:
+        relation: str = "partner", lan: Optional[str] = None,
+        mac: Optional[str] = None, subnet: Optional[str] = None) -> Dict[str, Any]:
     if grants is None:
         grants = _setting("link_default_preset", "personal")
     d = _data()
     new_station = {k: str(station.get(k) or "")[:300] for k in ("sid", "pk", "relay", "name")}
+    lan_addr = _lan_addr(station)
+    if lan_addr:
+        new_station["lan"] = lan_addr[:300]
+    lan_val = lan.strip()[:300] if isinstance(lan, str) else ""
+    mac_val = mac.strip()[:40] if isinstance(mac, str) else ""
+    subnet_val = subnet.strip()[:60] if isinstance(subnet, str) else ""
     new_pk = str(new_station.get("pk") or "")
     if _b64_len(new_pk) == 32:  # only a real station key identifies a station
         for p in d["peers"].values():
@@ -163,11 +207,17 @@ def add(name: str, station: Dict[str, Any], token: str, device_id: str, grants: 
                 if not p.get("token") and token:
                     p["token"] = str(token or "")
                 p["station"] = new_station
+                if lan_val:
+                    p["lan"] = lan_val
+                if mac_val:
+                    p["mac"] = mac_val
+                if subnet_val:
+                    p["subnet"] = subnet_val
                 _save(d)
                 return public(p)
     peer_id = "peer_" + secrets.token_hex(5)
     rel = str(relation or "partner").strip().lower()
-    d["peers"][peer_id] = {
+    rec: Dict[str, Any] = {
         "peer_id": peer_id,
         "name": str(name or "Station")[:60],
         "station": new_station,
@@ -177,7 +227,15 @@ def add(name: str, station: Dict[str, Any], token: str, device_id: str, grants: 
         "relation": rel if rel in RELATIONS else "partner",
         "created_at": time.time(),
     }
+    if lan_val:
+        rec["lan"] = lan_val
+    if mac_val:
+        rec["mac"] = mac_val
+    if subnet_val:
+        rec["subnet"] = subnet_val
+    d["peers"][peer_id] = rec
     _save(d)
+    _sync_inhibit(d)
     allow = _setting("link_default_allowance", None)
     if allow:
         set_allowance(peer_id, int(allow))
@@ -247,14 +305,36 @@ def by_device(device_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clamp_sandbox_grant(peer: Dict[str, Any], g: Dict[str, str]) -> Dict[str, str]:
+    """Enforce host-side floor: non-'own' peers cannot weaken sandbox below 'os'."""
+    if str(peer.get("relation") or "partner") != "own" and g.get("sandbox") in ("off", "worktree"):
+        g["sandbox"] = "os"
+    return g
+
+
 def set_grants(peer_id: str, grants: Any) -> Dict[str, Any]:
     d = _data()
     p = d["peers"].get(peer_id)
     if not p:
         return {"error": "unknown peer"}
-    p["grants"] = normalise_grants(grants, "observer") if not isinstance(grants, dict) else \
+    g = normalise_grants(grants, "observer") if not isinstance(grants, dict) else \
         normalise_grants({**p.get("grants", {}), **grants}, "observer")
+    if str(p.get("relation") or "partner") != "own" and g.get("control") == "on":
+        g["control"] = "off"
+    p["grants"] = _clamp_sandbox_grant(p, g)
     _save(d)
+    if p["grants"].get("terminal") != "on":
+        try:
+            import term_remote
+            term_remote.kill_all_for(peer_id)
+        except Exception:
+            pass
+    if p["grants"].get("control") != "on":
+        try:
+            import screen_input
+            screen_input.stop_all(peer_id)
+        except Exception:
+            pass
     return public(p)
 
 
@@ -408,8 +488,14 @@ def remove(peer_id: str) -> Dict[str, Any]:
             stub["archive_reason"] = "station unlinked"
             archived += 1
     _save(d)
+    _sync_inhibit(d)
     if p.get("device_id"):
         pairing.revoke(p["device_id"])
+    try:
+        import term_remote
+        term_remote.kill_all_for(peer_id)
+    except Exception:
+        pass
     released = 0
     try:
         from cli_tools import locks as _locks
@@ -425,7 +511,7 @@ def effective_grants(peer: Dict[str, Any]) -> Dict[str, str]:
     if ctl and ctl != peer.get("peer_id"):
         for k in CONTROL_GRANTS:
             g[k] = "off"
-    return g
+    return _clamp_sandbox_grant(peer, g)
 
 
 def allows(device_id: str, path: str, method: str) -> Tuple[bool, str]:
@@ -437,14 +523,45 @@ def allows(device_id: str, path: str, method: str) -> Tuple[bool, str]:
     m = method.upper()
     if (m if m != "HEAD" else "GET", route) in ALWAYS:
         return True, ""
+    # M6 T1: with require_approval on, a linked station may only use the pairing/approval
+    # handshake (the ALWAYS routes, including /api/peer/approve/request) until a code is approved.
+    if _setting("require_approval", False):
+        import device_approval
+        if not device_approval.is_peer_approved(str(peer.get("peer_id") or "")):
+            return False, "device approval required"
     table = _GET_ROUTES if m in ("GET", "HEAD") else _POST_ROUTES if m == "POST" else {}
     rule = table.get(route)
     if not rule:
         return False, "linked stations cannot use this route"
     grant, ok_values = rule
+    if grant == "terminal" and str(peer.get("relation") or "partner") != "own":
+        return False, "terminal grant requires an own station link"
+    if grant == "control" and str(peer.get("relation") or "partner") != "own":
+        return False, "control grant requires an own station link"
+    if grant == "threads" and str(peer.get("relation") or "partner") != "own":
+        return False, "threads grant requires an own station link"
+    if route == "/api/peer/permissions" and str(peer.get("relation") or "partner") != "own":
+        return False, "permission fan-out requires an own station link"
+    if route == "/api/peer/mcp" and str(peer.get("relation") or "partner") != "own":
+        return False, "mcp discovery requires an own station link"
     if effective_grants(peer).get(grant) in ok_values:
         return True, ""
     return False, f"this link is not granted {grant}"
+
+
+def check_link_ceiling(worker_meta: Dict[str, Any], grant: str, ok_values: Tuple[str, ...]) -> Tuple[bool, str]:
+    """Enforce link grant ceiling: grants at spawn and current grants must both allow."""
+    lo = (worker_meta or {}).get("link_origin")
+    if not isinstance(lo, dict):
+        return True, ""
+    grants_at_spawn = lo.get("grants_at_spawn") or {}
+    if grants_at_spawn.get(grant) not in ok_values:
+        return False, "grant revoked or narrowed since spawn"
+    peer_id = str(lo.get("peer") or "")
+    peer = get(peer_id) if peer_id else None
+    if not peer or effective_grants(peer).get(grant) not in ok_values:
+        return False, "grant revoked or narrowed since spawn"
+    return True, ""
 
 
 def my_station() -> dict | None:
@@ -462,7 +579,105 @@ def my_station() -> dict | None:
     relay = str(info.get("url") or info.get("relay") or "")
     if not sid or not pk or not relay:
         return None
-    return {"sid": sid, "pk": pk, "relay": relay, "name": socket.gethostname()}
+    try:
+        import station as _station
+        name = _station.get_display_name()
+    except Exception:
+        name = socket.gethostname()
+    return {"sid": sid, "pk": pk, "relay": relay, "name": name}
+
+
+def rotate_keys() -> dict:
+    """Rotate this station's tunnel keys and re-announce the new x25519 pub to all peers."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(repo, "tunnel", "connector", "station.mjs")
+    node = shutil.which("node")
+    if not node:
+        return {"pk_rotated": False, "error": "node not found", "results": {}}
+    try:
+        proc = subprocess.run([node, script, "--rotate-keys"],
+                              capture_output=True, text=True, timeout=30)
+        out_text = (proc.stdout or "").strip()
+        out = json.loads(out_text.splitlines()[-1]) if out_text else {}
+        new_pub = str(out.get("x25519_pub") or "") if isinstance(out, dict) else ""
+    except Exception:
+        return {"pk_rotated": False, "error": "rotate failed", "results": {}}
+    if not new_pub:
+        return {"pk_rotated": False, "error": "rotate failed", "results": {}}
+    # update this station's own station.json
+    sp = os.path.join(subway_home.subway_dir(), "tunnel", "station.json")
+    sid = ""
+    try:
+        with open(sp, "r", encoding="utf-8") as fh:
+            info = json.load(fh)
+        if not isinstance(info, dict):
+            info = {}
+        sid = str(info.get("sid") or "")
+        info["x25519_pub"] = new_pub
+        tmp = sp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(info, fh)
+        os.replace(tmp, sp)
+    except Exception:
+        return {"pk_rotated": False, "error": "failed to update station.json", "results": {}}
+    if not sid:
+        mine = my_station()
+        sid = str((mine or {}).get("sid") or "")
+    results = {}
+    for peer_id in list(_data()["peers"].keys()):
+        try:
+            r = call(peer_id, "POST", "/api/peer/pk_rotate", {"sid": sid, "pk": new_pub})
+            ok = isinstance(r, dict) and int(r.get("status") or 0) == 200
+        except Exception:
+            ok = False
+        # never include keys or raw error text in results
+        results[peer_id] = "ok" if ok else "error"
+    return {"pk_rotated": True, "results": results}
+
+
+def handle_pk_rotate(peer_id: str, body: Any) -> Tuple[int, Dict[str, Any]]:
+    """Verify and pin a new x25519 public key announced by an authenticated linked peer."""
+    pid = str(peer_id or "").strip()
+    if not isinstance(body, dict):
+        _log.warning("pk_rotate rejected for peer=%r: invalid payload", pid[:64])
+        return 400, {"error": "invalid payload"}
+    req_sid = str(body.get("sid") or "").strip()
+    new_pk = body.get("pk")
+
+    with _PK_ROTATE_LOCK:
+        d = _data()
+        peers_map = d.get("peers") or {}
+        peer = peers_map.get(pid) if pid else None
+        if not peer and pid:
+            for rec in peers_map.values():
+                if pid in (rec.get("merged_ids") or []):
+                    peer = rec
+                    break
+        if not isinstance(peer, dict):
+            _log.warning("pk_rotate rejected: unknown peer=%r", pid[:64])
+            return 403, {"error": "unknown peer"}
+        station = peer.get("station")
+        if not isinstance(station, dict):
+            _log.warning("pk_rotate rejected for peer=%r: missing station record", pid[:64])
+            return 403, {"error": "sid mismatch"}
+        peer_sid = str(station.get("sid") or "").strip()
+        if not peer_sid or not req_sid or not hmac.compare_digest(req_sid, peer_sid):
+            _log.warning("pk_rotate rejected for peer=%r: sid mismatch", pid[:64])
+            return 403, {"error": "sid mismatch"}
+        if not isinstance(new_pk, str) or _b64_len(new_pk) != 32:
+            _log.warning("pk_rotate rejected for peer=%r: invalid public key", pid[:64])
+            return 400, {"error": "invalid public key"}
+        try:
+            raw_pk = base64.b64decode(new_pk, validate=True)
+        except Exception:
+            _log.warning("pk_rotate rejected for peer=%r: invalid public key", pid[:64])
+            return 400, {"error": "invalid public key"}
+        if len(raw_pk) != 32:
+            _log.warning("pk_rotate rejected for peer=%r: invalid public key", pid[:64])
+            return 400, {"error": "invalid public key"}
+        station["pk"] = new_pk
+        _save(d)
+    return 200, {"ok": True}
 
 
 _SID_RE = re.compile(r"^[a-z2-7]{26}$")
@@ -498,53 +713,49 @@ def parse_link(link: str) -> dict | None:
     return out
 
 
+_OFFLINE: Dict[str, float] = {}
+OFFLINE_TTL = 45
+
+
 def _node_call(station: dict, token: str, method: str, path: str, body=None, timeout: int = 30) -> tuple[int, dict]:
     """One request over the tunnel, retried once when the relay socket drops before an answer."""
+    t0 = time.time()
     status, data = _node_call_once(station, token, method, path, body, timeout)
-    if status == 0 and "socket" in str((data or {}).get("error", "")):
+    if status == 0 and time.time() - t0 < 5:
         time.sleep(1)
         status, data = _node_call_once(station, token, method, path, body, timeout)
     return status, data
 
 
-def _node_call_once(station: dict, token: str, method: str, path: str, body=None, timeout: int = 30) -> tuple[int, dict]:
-    """One request over the tunnel to another station. (0, {"error":...}) when it can't be reached."""
-    node = shutil.which("node")
-    if not node:
-        return 0, {"error": "node not found"}
-    env = dict(os.environ)
-    cmd = [node, SCRIPT, "call",
-           "--sid", str(station.get("sid") or ""),
-           "--pk", str(station.get("pk") or ""),
-           "--relay", str(station.get("relay") or ""),
-           "--method", str(method or "GET").upper(),
-           "--path", str(path or "/"),
-           "--timeout-ms", str(max(1000, timeout * 1000 - 500))]
-    body_path = None
-    if body is not None:
-        fd, body_path = tempfile.mkstemp(prefix=".subway-peer-", suffix=".json")
-        try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                if isinstance(body, str):
-                    fh.write(body)
-                else:
-                    json.dump(body, fh)
-        except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            try:
-                os.unlink(body_path)
-            except Exception:
-                pass
-            return 0, {"error": "failed to write request body"}
-        cmd.extend(["--body-file", body_path])
-    if token:
-        env["SUBWAY_PEER_TOKEN"] = str(token)
-        cmd.extend(["--token-env", "SUBWAY_PEER_TOKEN"])
+def _lan_addr(station: Any) -> str:
+    """Normalise station['lan'] ('host:port' or {'host', 'port'}) for --direct."""
+    lan = station.get("lan") if isinstance(station, dict) else None
+    if not lan:
+        return ""
+    if isinstance(lan, str):
+        return lan.strip()
+    if isinstance(lan, dict):
+        host = str(lan.get("host") or "").strip()
+        port = lan.get("port")
+    elif isinstance(lan, (list, tuple)) and len(lan) == 2:
+        host = str(lan[0] or "").strip()
+        port = lan[1]
+    else:
+        return ""
+    if not host or port in (None, "", False) or isinstance(port, bool):
+        return ""
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        return ""
+    if p < 1 or p > 65535:
+        return ""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{p}"
+    return f"{host}:{p}"
+
+
+def _run_node_cmd(cmd: list[str], env: dict[str, str], timeout: int) -> tuple[int, dict]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
         out_text = (proc.stdout or "").strip()
@@ -571,6 +782,61 @@ def _node_call_once(station: dict, token: str, method: str, path: str, body=None
         return 0, {"error": "timeout"}
     except Exception as e:
         return 0, {"error": str(e)}
+
+
+def _node_call_once(station: dict, token: str, method: str, path: str, body=None, timeout: int = 30) -> tuple[int, dict]:
+    """One request over the tunnel to another station. (0, {"error":...}) when it can't be reached."""
+    node = shutil.which("node")
+    if not node:
+        return 0, {"error": "node not found"}
+    env = dict(os.environ)
+
+    def _build_cmd(route_flag: str, route_val: str, extra_args: list[str]) -> list[str]:
+        return [
+            node, SCRIPT, "call",
+            "--sid", str(station.get("sid") or ""),
+            "--pk", str(station.get("pk") or ""),
+            route_flag, route_val,
+            "--method", str(method or "GET").upper(),
+            "--path", str(path or "/"),
+            "--timeout-ms", str(max(1000, timeout * 1000 - 500)),
+            *extra_args,
+        ]
+
+    extra_args: list[str] = []
+    body_path = None
+    if body is not None:
+        fd, body_path = tempfile.mkstemp(prefix=".subway-peer-", suffix=".json")
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                if isinstance(body, str):
+                    fh.write(body)
+                else:
+                    json.dump(body, fh)
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                os.unlink(body_path)
+            except Exception:
+                pass
+            return 0, {"error": "failed to write request body"}
+        extra_args.extend(["--body-file", body_path])
+    if token:
+        env["SUBWAY_PEER_TOKEN"] = str(token)
+        extra_args.extend(["--token-env", "SUBWAY_PEER_TOKEN"])
+    try:
+        lan_addr = _lan_addr(station)
+        relay_url = str(station.get("relay") or "")
+        if lan_addr:
+            status, data = _run_node_cmd(_build_cmd("--direct", lan_addr, extra_args), env, timeout)
+            if status == 200 or not relay_url.strip():
+                return status, data
+        return _run_node_cmd(_build_cmd("--relay", relay_url, extra_args), env, timeout)
     finally:
         if body_path:
             try:
@@ -579,28 +845,44 @@ def _node_call_once(station: dict, token: str, method: str, path: str, body=None
                 pass
 
 
-def call(peer_id: str, method: str, path: str, body=None, timeout: int = 30) -> dict:
+def call(peer_id: str, method: str, path: str, body=None, timeout: int = 30, *, fresh: bool = False) -> dict:
     """{"status": n, "data": {...}} or {"error": "offline: ..."}; updates last_seen on success."""
+    if not fresh and peer_id in _OFFLINE and time.time() - _OFFLINE[peer_id] < OFFLINE_TTL:
+        return {"error": "offline: unreachable (cached)"}
     p = get(peer_id)
     if not p:
         return {"error": "unknown peer"}
     station = p.get("station") or {}
+    if isinstance(station, dict) and p.get("lan") and not station.get("lan"):
+        station = {**station, "lan": p.get("lan")}
+    t0 = time.time()
     status, res = _node_call(station, str(p.get("token") or ""), method, path, body, timeout=timeout)
-    if status == 0 and isinstance(res, dict) and "error" in res:
-        return {"error": "offline: " + str(res.get("error") or "unreachable")}
-    # update last_seen on success (any HTTP response received)
-    try:
-        d = _data()
-        peer = d["peers"].get(peer_id)
-        if peer:
-            peer["last_seen"] = time.time()
-            _save(d)
-    except Exception:
-        pass
+    elapsed = time.time() - t0
+    if status == 0:
+        if elapsed < 5:
+            _OFFLINE[peer_id] = time.time()
+        err = res.get("error") if isinstance(res, dict) else None
+        return {"error": "offline: " + str(err or "unreachable")}
+    _OFFLINE.pop(peer_id, None)
+    # update last_seen only on HTTP 2xx success
+    if 200 <= status < 300:
+        try:
+            d = _data()
+            peer = d["peers"].get(peer_id)
+            if peer:
+                peer["last_seen"] = time.time()
+                _save(d)
+        except Exception:
+            pass
     return {"status": status, "data": res}
 
 
-def link_add(link: str, grants="personal") -> dict:
+def link_add(link: str, grants="personal", relation: str = None) -> dict:
+    if not relation:
+        relation = "own" if str(grants or "personal") == "personal" else "partner"
+    relation = str(relation).strip().lower()
+    if relation not in ("own", "partner"):
+        relation = "partner"
     l = parse_link(link)
     if not l:
         return {"error": "not a Subway pairing link"}
@@ -612,7 +894,7 @@ def link_add(link: str, grants="personal") -> dict:
     m = pairing.mint_device("Linked station", "station", pairing.SCOPE_PEER)
     st = {"sid": l["sid"], "pk": l["pk"], "relay": l["relay"]}
     status, res = _node_call(st, "", "POST", "/api/pair/request",
-                             {"kind": "station", "qr_code": l["code"], "station": mine, "peer_token": m["token"]})
+                             {"kind": "station", "qr_code": l["code"], "station": mine, "peer_token": m["token"], "relation": relation})
     if status != 200 or not isinstance(res, dict) or not res.get("request_id"):
         pairing.revoke(m["device_id"])
         err = res.get("error") if isinstance(res, dict) else None
@@ -637,10 +919,18 @@ def link_add(link: str, grants="personal") -> dict:
         return {"error": final_status or "link failed (timeout)"}
     h_status, hello = _node_call(st, approved_token, "GET", "/api/peer/hello")
     name = "Station"
-    if h_status == 200 and isinstance(hello, dict) and hello.get("station"):
-        name = str(hello.get("station") or "Station")
+    lan_addr = None
+    hello_mac = hello_subnet = None
+    if h_status == 200 and isinstance(hello, dict):
+        hello_mac, hello_subnet = hello.get("mac"), hello.get("subnet")
+        if hello.get("display_name") or hello.get("station"):
+            name = str(hello.get("display_name") or hello.get("station") or "Station")
+        raw_lan = hello.get("lan_addr")
+        if isinstance(raw_lan, str) and raw_lan.strip():
+            lan_addr = raw_lan.strip()
     st_named = {**st, "name": name}
-    peer = add(name, st_named, approved_token, m["device_id"], grants)
+    peer = add(name, st_named, approved_token, m["device_id"], grants, relation, lan=lan_addr,
+                mac=hello_mac, subnet=hello_subnet)
     try:
         pairing.rename(m["device_id"], name)
     except Exception:
@@ -650,6 +940,16 @@ def link_add(link: str, grants="personal") -> dict:
 
 def unlink(peer_id: str) -> dict:
     """Tell the other side (best effort), then drop our half and revoke its token."""
+    try:
+        import term_remote
+        term_remote.kill_all_for(peer_id)
+    except Exception:
+        pass
+    try:
+        import screen_input
+        screen_input.stop_all(peer_id)
+    except Exception:
+        pass
     call(peer_id, "POST", "/api/peer/unlink", {})
     return remove(peer_id)
 
@@ -797,6 +1097,10 @@ def set_alias(peer_id: str, alias: str) -> Dict[str, Any]:
     p = d["peers"].get(peer_id)
     if not p:
         return {"error": "unknown peer"}
+    if not str(alias or "").strip():
+        p.pop("alias", None)
+        _save(d)
+        return public(p)
     clean = slug({"alias": alias})
     for other in d["peers"].values():
         if other.get("peer_id") != peer_id and slug(other) == clean:
@@ -879,7 +1183,8 @@ def _remember_remote(worker_id: str, peer: Dict[str, Any], role: str, launched_b
     d = _data()
     rw = d.setdefault("remote_workers", {})
     rw[worker_id] = {"worker_id": worker_id, "peer_id": peer["peer_id"], "station": slug(peer),
-                     "role": str(role)[:80], "launched_by": str(launched_by or "")[:120], "created_at": time.time()}
+                     "role": str(role)[:80], "launched_by": str(launched_by or "")[:120], "created_at": time.time(),
+                     "link_origin": {"peer": peer["peer_id"], "grants_at_spawn": dict(effective_grants(peer))}}
     if len(rw) > 500:
         for k in sorted(rw, key=lambda k: rw[k].get("created_at", 0))[:-500]:
             rw.pop(k, None)
@@ -920,11 +1225,350 @@ def remote_workers(archived: bool = False) -> List[Dict[str, Any]]:
 SPAWN_FIELDS = ("role", "prompt", "provider", "model", "effort", "track", "max_tokens", "max_seconds",
                 "max_tool_calls", "timeout_seconds", "code", "project", "isolate", "capabilities")
 
+TELEMETRY_STALE_SECONDS = 120.0
+
+
+def _peer_allows_placement(peer: Any) -> Tuple[bool, str]:
+    """Return (allowed, reason) checking relation=='own', spawn grant allowed, and control=='off'."""
+    if not isinstance(peer, dict) or not str(peer.get("peer_id") or "").strip():
+        return False, "invalid_peer"
+    if str(peer.get("relation") or "partner").strip().lower() != "own":
+        return False, "not_own"
+    grants = peer.get("grants") if isinstance(peer.get("grants"), dict) else {}
+    ctl_raw = grants.get("control") if "control" in grants else peer.get("control")
+    if ctl_raw is True or str(ctl_raw or "off").strip().lower() not in ("off", "false", "0", ""):
+        return False, "control_on"
+    spawn_raw = grants.get("spawn")
+    if spawn_raw is True:
+        return True, ""
+    if str(spawn_raw or "off").strip().lower() not in ("direct", "pending", "on", "true"):
+        return False, "spawn_denied"
+    return True, ""
+
+
+def _validate_telemetry_for_placement(
+    telemetry: Any,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: float = TELEMETRY_STALE_SECONDS,
+) -> Tuple[bool, float, str]:
+    """Validate peer telemetry for placement; returns (ok, free_ram_mb, reason)."""
+    import math
+
+    if not isinstance(telemetry, dict) or not telemetry:
+        return False, 0.0, "missing_telemetry"
+    if telemetry.get("corrupt") is True or telemetry.get("ok") is False:
+        return False, 0.0, "corrupt_telemetry"
+    if telemetry.get("stale") is True:
+        return False, 0.0, "stale_telemetry"
+    if telemetry.get("eligible") is False or telemetry.get("edge_eligible") is False:
+        return False, 0.0, "ineligible_telemetry"
+    if telemetry.get("busy") is True or telemetry.get("full") is True:
+        return False, 0.0, "busy"
+
+    now_ts = float(time.time() if now is None else now)
+    for key in ("updated_at", "ts", "timestamp", "recorded_at"):
+        if key in telemetry:
+            raw_ts = telemetry.get(key)
+            if isinstance(raw_ts, bool) or raw_ts is None:
+                return False, 0.0, "stale_telemetry"
+            try:
+                ts_val = float(raw_ts)
+            except (TypeError, ValueError):
+                return False, 0.0, "stale_telemetry"
+            if not math.isfinite(ts_val) or ts_val <= 0 or (now_ts - ts_val) > float(max_age_seconds):
+                return False, 0.0, "stale_telemetry"
+            break
+
+    if "age_seconds" in telemetry:
+        raw_age = telemetry.get("age_seconds")
+        if isinstance(raw_age, bool) or raw_age is None:
+            return False, 0.0, "stale_telemetry"
+        try:
+            age_val = float(raw_age)
+        except (TypeError, ValueError):
+            return False, 0.0, "stale_telemetry"
+        if not math.isfinite(age_val) or age_val < 0 or age_val > float(max_age_seconds):
+            return False, 0.0, "stale_telemetry"
+
+    cap = telemetry.get("capacity") if isinstance(telemetry.get("capacity"), dict) else {}
+    if cap.get("busy") is True or cap.get("full") is True:
+        return False, 0.0, "busy"
+
+    running = telemetry.get("running_workers")
+    if running is None:
+        running = telemetry.get("running")
+    if running is None:
+        running = cap.get("running")
+    limit = telemetry.get("max_workers")
+    if limit is None:
+        limit = telemetry.get("limit")
+    if limit is None:
+        limit = telemetry.get("worker_limit")
+    if limit is None:
+        limit = cap.get("limit") if cap.get("limit") is not None else cap.get("max")
+    if running is not None and limit is not None and not isinstance(running, bool) and not isinstance(limit, bool):
+        try:
+            if float(limit) >= 0 and float(running) >= float(limit):
+                return False, 0.0, "busy"
+        except (TypeError, ValueError):
+            return False, 0.0, "corrupt_telemetry"
+
+    for slot_key in ("free_slots", "available_slots"):
+        slots = telemetry.get(slot_key) if slot_key in telemetry else cap.get(slot_key)
+        if slots is not None and not isinstance(slots, bool):
+            try:
+                if float(slots) <= 0:
+                    return False, 0.0, "busy"
+            except (TypeError, ValueError):
+                return False, 0.0, "corrupt_telemetry"
+
+    raw_ram = telemetry.get("free_ram_mb")
+    if raw_ram is None or isinstance(raw_ram, bool):
+        return False, 0.0, "invalid_free_ram_mb"
+    try:
+        free_ram_mb = float(raw_ram)
+    except (TypeError, ValueError):
+        return False, 0.0, "invalid_free_ram_mb"
+    if not math.isfinite(free_ram_mb) or free_ram_mb <= 0:
+        return False, 0.0, "invalid_free_ram_mb"
+    return True, free_ram_mb, ""
+
+
+def _peer_supported_providers(peer: Dict[str, Any], telemetry: Dict[str, Any]) -> set:
+    supported = set()
+    for src in (telemetry, peer):
+        if not isinstance(src, dict):
+            continue
+        provs = src.get("providers")
+        if isinstance(provs, (list, tuple, set)):
+            for p in provs:
+                s = str(p or "").strip().lower()
+                if s:
+                    supported.add(s)
+        models = src.get("models")
+        if isinstance(models, list):
+            for m in models:
+                if isinstance(m, dict):
+                    s = str(m.get("provider") or "").strip().lower()
+                    if s:
+                        supported.add(s)
+    return supported
+
+
+def _allowance_headroom_score(allowance: Any) -> Tuple[bool, float, str]:
+    """Return (allowed, headroom_score, reason). Exhausted allowance excludes the peer."""
+    if not isinstance(allowance, dict) or allowance.get("error"):
+        return True, 0.0, ""
+    cap = allowance.get("tokens_per_day")
+    left = allowance.get("left")
+    if cap is not None and not isinstance(cap, bool):
+        try:
+            cap_f = float(cap)
+        except (TypeError, ValueError):
+            return True, 0.0, ""
+        if cap_f > 0:
+            if left is None and allowance.get("used_today") is not None and not isinstance(allowance.get("used_today"), bool):
+                try:
+                    left = max(0.0, cap_f - float(allowance["used_today"]))
+                except (TypeError, ValueError):
+                    left = None
+            if left is not None and not isinstance(left, bool):
+                try:
+                    left_f = float(left)
+                except (TypeError, ValueError):
+                    return True, 0.0, ""
+                if left_f <= 0:
+                    return False, 0.0, "allowance_exhausted"
+                return True, max(0.0, min(1.0, left_f / cap_f)) * 4.0, ""
+            return True, 0.0, ""
+        return True, 4.0, ""
+    if left is not None and not isinstance(left, bool):
+        try:
+            if float(left) <= 0:
+                return False, 0.0, "allowance_exhausted"
+        except (TypeError, ValueError):
+            pass
+    return True, 0.0, ""
+
+
+def score_peer_for_placement(
+    peer: Dict[str, Any],
+    telemetry: Any,
+    allowance: Any = None,
+    provider: str = "",
+    pref: Any = None,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: float = TELEMETRY_STALE_SECONDS,
+) -> Optional[float]:
+    """Score an `own` peer for remote placement; returns None when excluded."""
+    import station as _station
+
+    allowed, _ = _peer_allows_placement(peer)
+    if not allowed:
+        return None
+    pid = str(peer.get("peer_id") or "").strip()
+    pref_val = _station.get_placement_preference(pid) if pref is None else pref
+    weight = _station.placement_weight(pref_val)
+    if weight is None or weight <= 0:
+        return None
+
+    tel_ok, free_ram_mb, _ = _validate_telemetry_for_placement(
+        telemetry, now=now, max_age_seconds=max_age_seconds
+    )
+    if not tel_ok:
+        return None
+
+    allow_ok, allowance_score, _ = _allowance_headroom_score(allowance)
+    if not allow_ok:
+        return None
+
+    want_prov = str(provider or "").strip().lower()
+    provider_score = 0.0
+    if want_prov and want_prov != "auto":
+        if want_prov in _peer_supported_providers(peer, telemetry):
+            provider_score = 6.0
+
+    ram_score = free_ram_mb / 1024.0
+    base_score = ram_score + allowance_score + provider_score
+    return round(base_score * float(weight), 6)
+
+
+def _fetch_peer_telemetry(peer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    res = remote_get(peer, "/api/peer/station", {})
+    if res.get("status") != 200 or not isinstance(res.get("data"), dict):
+        return None
+    card = res["data"]
+    tel = card.get("telemetry")
+    if not isinstance(tel, dict):
+        return None
+    merged = dict(tel)
+    if "providers" not in merged and isinstance(card.get("providers"), list):
+        merged["providers"] = card["providers"]
+    if "models" not in merged and isinstance(card.get("models"), list):
+        merged["models"] = card["models"]
+    if "capacity" not in merged:
+        cap = card.get("capacity") or card.get("worker_capacity")
+        if isinstance(cap, dict):
+            merged["capacity"] = cap
+    return merged
+
+
+def pick_best_station(
+    provider: str = "",
+    peers_list: Optional[List[Dict[str, Any]]] = None,
+    telemetry_by_peer: Optional[Dict[str, Any]] = None,
+    allowance_by_peer: Optional[Dict[str, Any]] = None,
+    prefs_by_peer: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: float = TELEMETRY_STALE_SECONDS,
+) -> Dict[str, Any]:
+    """Select the highest-scoring own peer for placement, or signal local fallback."""
+    import station as _station
+
+    rows = list(peers_list) if peers_list is not None else list((_data().get("peers") or {}).values())
+    candidates: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, str]] = []
+
+    for peer in rows:
+        if not isinstance(peer, dict):
+            continue
+        pid = str(peer.get("peer_id") or "").strip()
+        st = slug(peer) if pid else "station"
+        allowed, allow_reason = _peer_allows_placement(peer)
+        if not allowed:
+            excluded.append({"peer_id": pid, "station": st, "reason": allow_reason})
+            continue
+
+        if prefs_by_peer is not None:
+            pref_val = prefs_by_peer.get(pid) if pid in prefs_by_peer else prefs_by_peer.get(st)
+        else:
+            pref_val = None
+        if pref_val is None:
+            pref_val = _station.get_placement_preference(pid)
+        weight = _station.placement_weight(pref_val)
+        if weight is None or weight <= 0:
+            excluded.append({"peer_id": pid, "station": st, "reason": "manual_only"})
+            continue
+
+        if telemetry_by_peer is not None:
+            telemetry = telemetry_by_peer[pid] if pid in telemetry_by_peer else telemetry_by_peer.get(st)
+        else:
+            telemetry = _fetch_peer_telemetry(peer)
+
+        tel_ok, free_ram_mb, tel_reason = _validate_telemetry_for_placement(
+            telemetry, now=now, max_age_seconds=max_age_seconds
+        )
+        if not tel_ok:
+            excluded.append({"peer_id": pid, "station": st, "reason": tel_reason})
+            continue
+
+        if allowance_by_peer is not None:
+            allowance = allowance_by_peer[pid] if pid in allowance_by_peer else allowance_by_peer.get(st)
+        else:
+            allowance = remote_allowance(st)
+
+        score = score_peer_for_placement(
+            peer,
+            telemetry,
+            allowance=allowance,
+            provider=provider,
+            pref=pref_val,
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+        if score is None:
+            excluded.append({"peer_id": pid, "station": st, "reason": "allowance_exhausted"})
+            continue
+
+        candidates.append({
+            "peer_id": pid,
+            "station": st,
+            "peer": peer,
+            "score": score,
+            "free_ram_mb": free_ram_mb,
+            "weight": weight,
+        })
+
+    if not candidates:
+        reasons = ", ".join(f"{e['station']}:{e['reason']}" for e in excluded) if excluded else "no linked own stations"
+        return {
+            "local": True,
+            "station": "local",
+            "peer_id": None,
+            "peer": None,
+            "score": None,
+            "reason": reasons,
+            "candidates": [],
+            "excluded": excluded,
+        }
+
+    candidates.sort(key=lambda c: (-float(c["score"]), -float(c["free_ram_mb"]), str(c["station"])))
+    best = candidates[0]
+    return {
+        "local": False,
+        "station": best["station"],
+        "peer_id": best["peer_id"],
+        "peer": best["peer"],
+        "score": best["score"],
+        "candidates": candidates,
+        "excluded": excluded,
+    }
+
 
 def spawn_remote(station: str, fields: Dict[str, Any], launched_by: str = "") -> str:
-    peer = by_slug(station)
-    if not peer:
-        return f"Error: no linked station called {station}."
+    if str(station or "").strip().lower() == "auto":
+        pick = pick_best_station(provider=str((fields or {}).get("provider") or ""))
+        if pick.get("local") or not pick.get("peer"):
+            reason = str(pick.get("reason") or "no eligible own station")
+            return f"Error: local fallback — no eligible remote station for auto placement ({reason})."
+        peer = pick["peer"]
+    else:
+        peer = by_slug(station)
+        if not peer:
+            return f"Error: no linked station called {station}."
     st = slug(peer)
     body = {k: fields[k] for k in SPAWN_FIELDS if fields.get(k) not in (None, "", [], 0)}
     body["origin_chat"] = str(launched_by or "")[:120]
@@ -971,6 +1615,15 @@ def remote_worker_status(ref: str) -> str:
     res = call(peer["peer_id"], "GET", "/api/peer/worker?id=" + urllib.parse.quote(wid))
     if res.get("status") == 200:
         w = res.get("data") or {}
+        try:
+            d = _data()
+            stub = d.get("remote_workers", {}).get(wid)
+            if stub is not None:
+                stub["pending_permissions"] = w.get("pending_permissions") or []
+                stub["reason"] = str(w.get("reason") or "")
+                _save(d)
+        except Exception:
+            pass
         lines = [f"Worker `{wid}@{st}` on {st}: {w.get('status')}",
                  f"role: {w.get('role') or ''} · {w.get('provider') or ''} {w.get('model') or ''} · tokens: {w.get('spent') or 0}"]
         if w.get("report"):
@@ -1025,7 +1678,7 @@ def resolve_project(project: str, known_dirs: List[str], default: str) -> Option
         return p
     if p:
         name = os.path.basename(p.rstrip("/")).lower()
-        for k in known_dirs:
+        for k in list(known_dirs) + [default]:  # the station's own project counts even before it has chats
             if k and os.path.isdir(k) and os.path.basename(k.rstrip("/")).lower() == name:
                 return k
         return None
@@ -1231,6 +1884,21 @@ def remote_models(station: str, fresh: bool = False) -> Dict[str, Any]:
     return {"station": st, "models": models}
 
 
+def remote_apps(station: str) -> Dict[str, Any]:
+    """{"station", "apps": [...]} or {"station", "error"}."""
+    peer = by_slug(station)
+    if not peer:
+        return {"station": station, "error": f"no linked station called {station}"}
+    st = slug(peer)
+    res = call(peer["peer_id"], "GET", "/api/peer/apps", timeout=10)
+    if res.get("status") == 403:
+        return {"station": st, "error": f"{st} has not granted app discovery to this station"}
+    if res.get("status") != 200:
+        return {"station": st, "error": f"{st} is offline" if not res.get("status") else f"{st} answered {res.get('status')}"}
+    apps = [a for a in ((res.get("data") or {}).get("apps") or []) if isinstance(a, dict) and a.get("id")]
+    return {"station": st, "apps": apps}
+
+
 def models_text(station: str, provider: str = "") -> str:
     """One line per provider: 'opencode: a, b (exhausted: c)'. '' when unknown."""
     r = remote_models(station)
@@ -1250,6 +1918,85 @@ def share_models(catalog: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """What a station tells a linked station about its models (no rankings, paths or benchmarks)."""
     return [{"provider": m.get("provider"), "model": m.get("model"), "exhausted": bool(m.get("exhausted")),
              "vision": bool(m.get("vision"))} for m in catalog or [] if m.get("provider") and m.get("model")]
+
+
+def local_mcp_signins() -> List[str]:
+    """Return sorted local MCP server names/keys only (never tokens, env, headers, or secrets)."""
+    try:
+        import mcp_hub
+        servers = mcp_hub.list_servers()
+    except Exception:
+        return []
+    names = set()
+    for item in servers or []:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            raw = item.get("key") or item.get("name") or ""
+            name = raw.strip() if isinstance(raw, str) else ""
+        else:
+            continue
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
+def remote_mcps() -> List[Dict[str, Any]]:
+    """Query own peers with mcp == 'on' via GET /api/peer/mcp; return server names only."""
+    out: List[Dict[str, Any]] = []
+    for peer in list_peers():
+        if not isinstance(peer, dict):
+            continue
+        if str(peer.get("relation") or "partner") != "own":
+            continue
+        if effective_grants(peer).get("mcp", "off") != "on":
+            continue
+        pid = str(peer.get("peer_id") or "").strip()
+        if not pid:
+            continue
+        st = slug(peer)
+        res = call(pid, "GET", "/api/peer/mcp", timeout=15)
+        if res.get("status") != 200:
+            continue
+        raw = (res.get("data") or {}).get("mcps")
+        if not isinstance(raw, list):
+            raw = []
+        mcps = sorted({m.strip() for m in raw if isinstance(m, str) and m.strip()})
+        out.append({"peer_id": pid, "station": st, "mcps": mcps})
+    return out
+
+
+def remote_permissions() -> List[Dict[str, Any]]:
+    """Query own peers with events != 'off' via GET /api/peer/permissions.
+
+    Only permission metadata is returned by that route; command payloads are never
+    fetched or logged.
+    """
+    out: List[Dict[str, Any]] = []
+    for peer in list_peers():
+        if not isinstance(peer, dict):
+            continue
+        if str(peer.get("relation") or "partner") != "own":
+            continue
+        if effective_grants(peer).get("events", "off") == "off":
+            continue
+        pid = str(peer.get("peer_id") or "").strip()
+        if not pid:
+            continue
+        res = call(pid, "GET", "/api/peer/permissions", timeout=15)
+        if res.get("status") != 200:
+            continue
+        raw = (res.get("data") or {}).get("permissions")
+        if not isinstance(raw, list):
+            raw = []
+        out.append({"peer_id": pid, "station": slug(peer), "permissions": raw})
+    return out
+
+
+def answer_remote_permission(peer_id: str, rid: str, decision: str) -> Dict[str, Any]:
+    """Post an answer for a pending permission back to its origin station."""
+    return call(str(peer_id or ""), "POST", "/api/peer/permissions",
+                {"id": str(rid or ""), "decision": str(decision or "")})
 
 
 # ---- P6b: patch landing ----
@@ -1339,6 +2086,43 @@ import hashlib as _hashlib
 
 CHUNK = 256 * 1024
 MAX_FILE = 200 * 1024 * 1024
+# H6: at most this many chunk requests may be in flight during one fetch. The
+# chunk size never exceeds CHUNK (256 KB), so a wave is at most ~1 MB of wire.
+MAX_INFLIGHT = 4
+
+
+def file_cap_for(peer: Optional[Dict[str, Any]]) -> int:
+    """Configurable per-grant file-size cap (H6).
+
+    A link may lower the ceiling with ``grants["file_max_bytes"]`` (int or a
+    numeric string). Missing/invalid values fall back to ``MAX_FILE`` (200 MB);
+    the hard ceiling is never raised above ``MAX_FILE``.
+    """
+    cap = MAX_FILE
+    try:
+        grants = (peer or {}).get("grants") or {}
+        raw = grants.get("file_max_bytes") if isinstance(grants, dict) else None
+        if raw is not None:
+            value = int(raw)
+            if value > 0:
+                cap = min(value, MAX_FILE)
+    except (TypeError, ValueError):
+        pass
+    return cap
+
+
+def _sha256_file_prefix(path: str, limit: int) -> str:
+    """sha256 of the first ``limit`` bytes of ``path`` (used to verify resumes)."""
+    h = _hashlib.sha256()
+    left = max(0, int(limit))
+    with open(path, "rb") as fh:
+        while left > 0:
+            block = fh.read(min(1 << 20, left))
+            if not block:
+                break
+            h.update(block)
+            left -= len(block)
+    return h.hexdigest()
 
 
 def set_roots(peer_id: str, roots: List[str]) -> Dict[str, Any]:
@@ -1366,17 +2150,45 @@ def safe_path(path: str, roots: List[str], must_exist: bool = True) -> Optional[
     raw = str(path or "").strip()
     if not roots or not raw:
         return None
-    roots = [os.path.realpath(r) for r in roots]
-    p = raw if os.path.isabs(raw) else os.path.join(roots[0], raw)
-    real = os.path.realpath(p)
-    if must_exist and not os.path.exists(real):
+    norm_roots = [os.path.realpath(r) for r in roots if r]
+    if not norm_roots:
         return None
-    if not must_exist and not os.path.isdir(os.path.dirname(real)):
+    p = raw if os.path.isabs(raw) else os.path.join(norm_roots[0], raw)
+    # Collapse '.' / '..' before walking ancestors so 'sub/../../etc' cannot masquerade under 'sub'.
+    norm = os.path.normpath(p)
+
+    def _in_roots(candidate: str) -> bool:
+        for r in norm_roots:
+            try:
+                if os.path.commonpath([r, candidate]) == r:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    if must_exist:
+        real = os.path.realpath(norm)
+        if not os.path.exists(real):
+            return None
+        return real if _in_roots(real) else None
+
+    # For must_exist=False, walk up to the deepest existing ancestor, resolve symlinks
+    # via realpath, ensure it stays inside roots, and rebuild the non-existent tail.
+    cur = norm
+    tail: List[str] = []
+    while not os.path.lexists(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        tail.append(os.path.basename(cur))
+        cur = parent
+    if tail and not os.path.isdir(cur):
         return None
-    for r in roots:
-        if real == r or real.startswith(r.rstrip(os.sep) + os.sep):
-            return real
-    return None
+    real_ancestor = os.path.realpath(cur)
+    if not _in_roots(real_ancestor):
+        return None
+    real = os.path.join(real_ancestor, *reversed(tail)) if tail else real_ancestor
+    return real if _in_roots(real) else None
 
 
 def list_dir(real: str, limit: int = 500) -> List[Dict[str, Any]]:
@@ -1395,12 +2207,22 @@ def list_dir(real: str, limit: int = 500) -> List[Dict[str, Any]]:
     return out
 
 
-def read_chunk(real: str, offset: int) -> Dict[str, Any]:
+def read_chunk(real: str, offset: int, verify_prefix: Optional[int] = None) -> Dict[str, Any]:
+    """Return one (<= CHUNK) chunk plus metadata about ``real``.
+
+    H6: when ``verify_prefix`` is given, also return ``prefix_sha256`` -- the
+    sha256 of the first ``verify_prefix`` bytes -- so a receiver can check that
+    an existing ``.subway-part`` prefix still matches this file before resuming.
+    """
     size = os.path.getsize(real)
     with open(real, "rb") as fh:
         fh.seek(max(0, offset))
         data = fh.read(CHUNK)
     out = {"size": size, "offset": offset, "data": _b64.b64encode(data).decode(), "eof": offset + len(data) >= size}
+    if verify_prefix is not None:
+        want = max(0, min(int(verify_prefix), size))
+        out["prefix_sha256"] = _sha256_file_prefix(real, want)
+        out["prefix_size"] = want
     if out["eof"]:
         h = _hashlib.sha256()
         with open(real, "rb") as fh:
@@ -1410,7 +2232,9 @@ def read_chunk(real: str, offset: int) -> Dict[str, Any]:
     return out
 
 
-def write_chunk(real: str, data_b64: str, offset: int, final: bool, overwrite: bool) -> Dict[str, Any]:
+def write_chunk(real: str, data_b64: str, offset: int, final: bool, overwrite: bool,
+                cap: Optional[int] = None) -> Dict[str, Any]:
+    ceiling = cap if isinstance(cap, int) and cap > 0 else MAX_FILE
     if offset == 0 and os.path.exists(real) and not overwrite:
         return {"error": "file exists (send with overwrite to replace it)"}
     part = real + ".subway-part"
@@ -1421,8 +2245,8 @@ def write_chunk(real: str, data_b64: str, offset: int, final: bool, overwrite: b
         return {"error": "chunk out of order"}
     else:
         mode = "ab"
-    if offset + len(data) > MAX_FILE:
-        return {"error": "file too large"}
+    if offset + len(data) > ceiling:
+        return {"error": "file too large (over the {}-byte file cap)".format(ceiling)}
     with open(part, mode) as fh:
         fh.write(data)
     if final:
@@ -1449,6 +2273,15 @@ def station_files(station: str, path: str = "") -> str:
 
 
 def fetch_file(station: str, path: str, to: str = "") -> str:
+    """Fetch a file from a linked station (H6: resumable, 4 in flight, capped).
+
+    An existing ``.subway-part`` supplies the resume offset after its sha256 is
+    confirmed against the same prefix on the remote; a mismatch (or a shrunk
+    remote file) restarts cleanly from zero. Chunks are requested at most
+    ``MAX_INFLIGHT`` at a time and assembled in order into that partial file.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     peer = by_slug(station)
     if not peer:
         return f"Error: no linked station called {station}."
@@ -1458,31 +2291,159 @@ def fetch_file(station: str, path: str, to: str = "") -> str:
         dest = os.path.join(dest, os.path.basename(path))
     if os.path.exists(dest):
         return f"Error: {dest} exists here; choose another name."
-    part, offset, h, d = dest + ".subway-part", 0, _hashlib.sha256(), {}
-    with open(part, "wb") as fh:
-        while True:
-            res = call(peer["peer_id"], "GET", "/api/peer/file?" + urllib.parse.urlencode({"path": path, "offset": offset}), timeout=60)
-            if res.get("status") != 200:
-                fh.close()
-                os.remove(part)
-                err = (res.get("data") or {}).get("error") if res.get("status") else "offline"
-                return f"Error: {st} did not send {path}: {err or res.get('status')}"
-            d = res.get("data") or {}
-            blob = _b64.b64decode(d.get("data") or "")
-            fh.write(blob)
-            h.update(blob)
-            offset += len(blob)
-            if d.get("eof") or not blob:
-                break
-            if offset > MAX_FILE:
-                fh.close()
-                os.remove(part)
-                return "Error: file too large."
-    if d.get("sha256") and d["sha256"] != h.hexdigest():
+    part = dest + ".subway-part"
+    cap = file_cap_for(peer)
+
+    # Step 1: stat + verify. `verify` is always present (0 when there is no
+    # partial) so the response also carries the authoritative total size.
+    resume = os.path.getsize(part) if os.path.isfile(part) else 0
+    q = {"path": path, "offset": resume, "verify": resume}
+    meta_res = call(peer["peer_id"], "GET", "/api/peer/file?" + urllib.parse.urlencode(q), timeout=60)
+    if meta_res.get("status") != 200:
+        err = (meta_res.get("data") or {}).get("error") if meta_res.get("status") else "offline"
+        # Keep the partial on a transport error so a later call can resume.
+        return f"Error: {st} did not send {path}: {err or meta_res.get('status')}"
+    meta = meta_res.get("data") or {}
+    try:
+        size = int(meta.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+
+    # Step 2: enforce the configurable per-grant cap before any chunk is sent.
+    if size > cap:
+        if os.path.exists(part):
+            os.remove(part)
+        return (f"Error: {path} is {size} bytes, over the {cap}-byte file cap "
+                f"for {st}; nothing kept.")
+
+    start = resume
+    if resume:
+        remote_prefix = meta.get("prefix_sha256")
+        if resume >= size or not remote_prefix or _sha256_file_prefix(part, resume) != remote_prefix:
+            # Remote changed or shrank: restart cleanly from zero.
+            start = 0
+            with open(part, "wb"):
+                pass
+
+    # Step 3: up to MAX_INFLIGHT chunk requests in flight; assemble in order.
+    def get_chunk(off: int) -> Tuple[bytes, Optional[str]]:
+        res = call(peer["peer_id"], "GET",
+                   "/api/peer/file?" + urllib.parse.urlencode({"path": path, "offset": off}),
+                   timeout=60)
+        if res.get("status") != 200:
+            err = (res.get("data") or {}).get("error") if res.get("status") else "offline"
+            raise RuntimeError(str(err or res.get("status")))
+        d = res.get("data") or {}
+        return _b64.b64decode(d.get("data") or ""), d.get("sha256")
+
+    offsets = list(range(start, size, CHUNK)) or [0]
+    expected_sha: Optional[str] = None
+    try:
+        with open(part, "wb" if start == 0 else "ab") as fh:
+            for wave_start in range(0, len(offsets), MAX_INFLIGHT):
+                wave = offsets[wave_start:wave_start + MAX_INFLIGHT]
+                with ThreadPoolExecutor(max_workers=MAX_INFLIGHT) as pool:
+                    chunks = [f.result() for f in [pool.submit(get_chunk, off) for off in wave]]
+                # Completed waves form a valid prefix that a later call resumes.
+                for blob, sha in chunks:
+                    fh.write(blob)
+                    if sha:
+                        expected_sha = sha
+    except Exception as exc:
+        # Leave the partial file intact for the next (resuming) call.
+        return f"Error: {st} did not send {path}: {exc}"
+
+    h = _hashlib.sha256()
+    with open(part, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    total = os.path.getsize(part)
+    if total != size or (expected_sha and h.hexdigest() != expected_sha):
         os.remove(part)
-        return f"Error: {path} arrived damaged (checksum mismatch); nothing kept."
+        return f"Error: {path} arrived damaged or incomplete ({total} of {size} bytes); nothing kept."
     os.replace(part, dest)
-    return f"Fetched {st}:{path} to {dest} ({offset} bytes)."
+    return f"Fetched {st}:{path} to {dest} ({total} bytes)."
+
+
+# ---- F3-6: read-only remote file access for VFS workers ----
+
+def _remote_relpath(relpath: str) -> str:
+    """Return a clean, forward-slash relative path, or raise ValueError.
+
+    This is the strict gate before any remote fetch. It rejects NUL bytes,
+    absolute POSIX/Windows/UNC paths, any '..' segment on either separator, and
+    backslash tricks such as '..\\secret'.
+    """
+    raw = str(relpath or "")
+    if "\x00" in raw:
+        raise ValueError("path contains a NUL byte")
+    if not raw.strip():
+        raise ValueError("path is required")
+    if os.path.isabs(raw) or re.match(r"^[A-Za-z]:", raw):
+        raise ValueError("path must be relative")
+    norm = raw.replace("\\", "/")
+    if norm.startswith("/"):
+        raise ValueError("path must be relative")
+    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError("path must stay inside the shared folder")
+    clean = "/".join(parts)
+    # Belt and braces: the normalised form must not re-introduce an escape.
+    if os.path.isabs(clean) or clean.startswith("/") or ".." in clean.split("/"):
+        raise ValueError("path must stay inside the shared folder")
+    return clean
+
+
+def read_remote_file(peer_id_or_station: str, relpath: str) -> Dict[str, Any]:
+    """Read a file from a linked own station read-only (files: read grant).
+
+    The bytes are fetched into a throwaway temporary directory that is removed
+    before returning, so no workspace file is ever created or modified here.
+    Returns {"ok", "path", "data"(bytes), "sha256", "size", "station"} on success,
+    or {"error": ..., "code": "path"|"denied"|"remote"} on refusal.
+    """
+    try:
+        clean = _remote_relpath(relpath)
+    except ValueError as exc:
+        return {"error": str(exc), "code": "path"}
+    peer = by_slug(peer_id_or_station)
+    if not peer:
+        return {"error": f"no linked station called {peer_id_or_station}.", "code": "denied"}
+    if str(peer.get("relation") or "partner") != "own":
+        return {"error": "remote file read requires an own station link", "code": "denied"}
+    if effective_grants(peer).get("files", "off") not in ("read", "send"):
+        return {"error": "this link is not granted files: read", "code": "denied"}
+    st = slug(peer)
+    tmpdir = tempfile.mkdtemp(prefix="subway-remote-read-")
+    try:
+        dest = os.path.join(tmpdir, os.path.basename(clean))
+        msg = fetch_file(peer["peer_id"], clean, dest)
+        if isinstance(msg, str) and msg.startswith("Error:"):
+            return {"error": msg[len("Error:"):].strip(), "code": "remote"}
+        # Receiving-side guard: the real path of what arrived must stay inside
+        # the scratch dir (catches a symlink/escape planted by the sender).
+        root = os.path.realpath(tmpdir)
+        real = os.path.realpath(dest)
+        try:
+            inside = os.path.commonpath([root, real]) == root
+        except ValueError:
+            inside = False
+        if not inside or not os.path.isfile(real):
+            return {"error": "remote file escaped the read sandbox", "code": "remote"}
+        with open(real, "rb") as fh:
+            data = fh.read()
+    except (OSError, ValueError) as exc:
+        return {"error": f"remote read failed: {exc}", "code": "remote"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    try:
+        import audit
+        audit.record({"kind": "agent", "id": "vfs", "name": "vfs"}, "vfs.remote_read",
+                     {"filepath": clean, "name": st, "key": st}, True, peer_station=st)
+    except Exception:
+        pass
+    return {"ok": True, "path": clean, "data": data,
+            "sha256": _hashlib.sha256(data).hexdigest(), "size": len(data), "station": st}
 
 
 def send_file(station: str, path: str, to: str, overwrite: bool = False) -> str:
@@ -1494,8 +2455,9 @@ def send_file(station: str, path: str, to: str, overwrite: bool = False) -> str:
     if not os.path.isfile(src):
         return f"Error: {src} is not a file here."
     size = os.path.getsize(src)
-    if size > MAX_FILE:
-        return "Error: file too large (200 MB max)."
+    cap = file_cap_for(peer)
+    if size > cap:
+        return f"Error: file too large ({cap} bytes max for {st})."
     offset = 0
     with open(src, "rb") as fh:
         while True:
@@ -1895,6 +2857,183 @@ def remote_allowance(station: str) -> Dict[str, Any]:
     return {"station": slug(peer), **(res.get("data") or {})}
 
 
+def _parse_allowance_ts(val: Any) -> Optional[float]:
+    """Parse a Unix timestamp or ISO-8601 string into epoch seconds, or None if missing/invalid."""
+    if val is None or val == "" or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return f if f > 0 else None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        f = float(s)
+        return f if f > 0 else None
+    except ValueError:
+        pass
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _pick_num(src: Dict[str, Any], sub: Optional[Dict[str, Any]], sub_key: str, *keys: str) -> Optional[float]:
+    for k in keys:
+        v = src.get(k)
+        if v is not None and v != "" and not isinstance(v, bool):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    if isinstance(sub, dict):
+        v = sub.get(sub_key)
+        if v is not None and v != "" and not isinstance(v, bool):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def combined_allowance(stale_after_seconds: float = 300.0) -> Dict[str, Any]:
+    """Aggregate remote_allowance() across own peers (excluding partner peers)."""
+    now = time.time()
+    try:
+        max_age = max(0.0, float(stale_after_seconds))
+    except (TypeError, ValueError):
+        max_age = 300.0
+
+    rows: List[Dict[str, Any]] = []
+    tot_tok_limit = 0
+    tot_tok_used = 0
+    tot_tok_rem = 0
+    tot_usd_limit = 0.0
+    tot_usd_used = 0.0
+    tot_usd_rem = 0.0
+    stale_count = 0
+
+    for p in list_peers():
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("peer_id") or "")
+        raw_peer = get(pid) if pid else None
+        rel = str(p.get("relation") or (raw_peer or {}).get("relation") or "partner").strip().lower()
+        if rel != "own":
+            continue
+
+        station_name = str(p.get("alias") or p.get("name") or pid)
+        try:
+            res = remote_allowance(pid or station_name)
+        except Exception as exc:
+            res = {"station": station_name, "error": str(exc) or "request failed"}
+        if not isinstance(res, dict):
+            res = {"station": station_name, "error": "invalid allowance response"}
+
+        err = res.get("error")
+        ts_val: Optional[float] = None
+        for src in (res, p, raw_peer):
+            if not isinstance(src, dict):
+                continue
+            for key in ("timestamp", "ts", "updated_at", "sampled_at", "fetched_at", "last_seen"):
+                parsed = _parse_allowance_ts(src.get(key))
+                if parsed is not None:
+                    ts_val = parsed
+                    break
+            if ts_val is not None:
+                break
+
+        is_stale = bool(err) or bool(res.get("stale")) or ts_val is None or (now - ts_val) > max_age
+        if is_stale:
+            stale_count += 1
+
+        tok_sub = res.get("tokens") if isinstance(res.get("tokens"), dict) else None
+        usd_sub = res.get("usd") if isinstance(res.get("usd"), dict) else None
+
+        t_limit = _pick_num(res, tok_sub, "limit", "tokens_per_day", "tokens_limit", "limit_tokens")
+        t_used = _pick_num(res, tok_sub, "used", "used_today", "tokens_used", "used_tokens")
+        t_rem = _pick_num(res, tok_sub, "remaining", "left", "tokens_remaining", "remaining_tokens", "tokens_left")
+
+        u_limit = _pick_num(res, usd_sub, "limit", "usd_limit", "limit_usd", "daily_usd_limit")
+        u_used = _pick_num(res, usd_sub, "used", "usd_used", "used_usd")
+        u_rem = _pick_num(res, usd_sub, "remaining", "usd_remaining", "remaining_usd", "usd_left")
+
+        if t_limit is None and t_used is None and t_rem is None and u_limit is None and u_used is None and u_rem is None:
+            unit = str(res.get("unit") or res.get("currency") or "").strip().lower()
+            g_lim = _pick_num(res, None, "", "limit")
+            g_used = _pick_num(res, None, "", "used")
+            g_rem = _pick_num(res, None, "", "remaining")
+            if unit == "usd":
+                u_limit, u_used, u_rem = g_lim, g_used, g_rem
+            else:
+                t_limit, t_used, t_rem = g_lim, g_used, g_rem
+
+        if t_limit is not None and t_used is not None and t_rem is None and t_limit > 0:
+            t_rem = max(0.0, t_limit - t_used)
+        if t_limit is not None and t_rem is not None and t_used is None:
+            t_used = max(0.0, t_limit - t_rem)
+
+        if u_limit is not None and u_used is not None and u_rem is None and u_limit > 0:
+            u_rem = max(0.0, u_limit - u_used)
+        if u_limit is not None and u_rem is not None and u_used is None:
+            u_used = max(0.0, u_limit - u_rem)
+
+        ti_limit = int(round(t_limit or 0))
+        ti_used = int(round(t_used or 0))
+        ti_rem = int(round(t_rem or 0))
+
+        uf_limit = round(float(u_limit or 0.0), 6)
+        uf_used = round(float(u_used or 0.0), 6)
+        uf_rem = round(float(u_rem or 0.0), 6)
+
+        if not err:
+            tot_tok_limit += ti_limit
+            tot_tok_used += ti_used
+            tot_tok_rem += ti_rem
+            tot_usd_limit += uf_limit
+            tot_usd_used += uf_used
+            tot_usd_rem += uf_rem
+
+        row: Dict[str, Any] = {
+            "peer_id": pid,
+            "station": str(res.get("station") or station_name),
+            "name": str(p.get("name") or res.get("station") or station_name),
+            "relation": "own",
+            "stale": is_stale,
+            "timestamp": ts_val,
+            "tokens_per_day": ti_limit,
+            "used_today": ti_used,
+            "left": ti_rem if t_rem is not None else None,
+            "tokens": {"limit": ti_limit, "used": ti_used, "remaining": ti_rem},
+            "usd": {"limit": uf_limit, "used": uf_used, "remaining": uf_rem},
+        }
+        if err:
+            row["error"] = str(err)
+        rows.append(row)
+
+    tot_usd_limit_r = round(tot_usd_limit, 6)
+    tot_usd_used_r = round(tot_usd_used, 6)
+    tot_usd_rem_r = round(tot_usd_rem, 6)
+
+    return {
+        "tokens": {"limit": tot_tok_limit, "used": tot_tok_used, "remaining": tot_tok_rem},
+        "usd": {"limit": tot_usd_limit_r, "used": tot_usd_used_r, "remaining": tot_usd_rem_r},
+        "tokens_per_day": tot_tok_limit,
+        "used_today": tot_tok_used,
+        "left": tot_tok_rem,
+        "usd_limit": tot_usd_limit_r,
+        "usd_used": tot_usd_used_r,
+        "usd_remaining": tot_usd_rem_r,
+        "stale": stale_count > 0,
+        "stale_count": stale_count,
+        "peer_count": len(rows),
+        "stale_after_seconds": max_age,
+        "generated_at": now,
+        "peers": rows,
+    }
+
+
 # ---- Mode C: swarm (the sender's own agents work on this station's checkout) ----
 SWARM_MAX_BUNDLE = 200 * 1024 * 1024
 SWARM_BUNDLE_KEEP_SECONDS = 86400
@@ -2154,3 +3293,29 @@ def swarm_submit_remote(meta: Dict[str, Any], marker: Dict[str, Any], diff: str)
     if res.get("status") == 403:
         return f"{st} no longer grants swarm work to this station. Patch kept here."
     return f"{st} is unreachable; patch kept here ({res.get('error') or res.get('status')})."
+
+
+# --- Peer-scope rate limiting (in-memory token bucket, O(1), no files) ---
+import threading as _threading
+
+_RATE_CAPACITY = 240
+_RATE_REFILL = 4.0  # tokens per second
+_rate_buckets: Dict[str, Tuple[float, float]] = {}  # device_id -> (tokens, last_ts)
+_rate_lock = _threading.Lock()
+
+
+def rate_ok(device_id: str, now: float = None) -> Tuple[bool, int]:
+    """Token bucket for peer-scope device requests. (True, 0) or (False, retry_after>=1)."""
+    if now is None:
+        now = time.time()
+    key = str(device_id or "")
+    with _rate_lock:
+        tokens, last = _rate_buckets.get(key, (float(_RATE_CAPACITY), now))
+        elapsed = max(0.0, now - last)
+        tokens = min(float(_RATE_CAPACITY), tokens + elapsed * _RATE_REFILL)
+        if tokens >= 1.0:
+            _rate_buckets[key] = (tokens - 1.0, now)
+            return True, 0
+        _rate_buckets[key] = (tokens, now)
+        retry = int((1.0 - tokens) / _RATE_REFILL) + 1
+        return False, max(1, retry)

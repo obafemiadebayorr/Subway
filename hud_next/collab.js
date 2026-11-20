@@ -4,6 +4,7 @@
 
 const ROUTE = "collab";
 import { api } from "/hud/lib.js";
+import { securityTab, SECCSS } from "./collab_security.js";
 /* Prototype toast: lib.js notifications need the HUD stylesheet, which the prototype does not load. */
 function toast(msg) {
   let box = document.getElementById("cb-toasts");
@@ -12,22 +13,61 @@ function toast(msg) {
     document.body.appendChild(box); }
   const t = document.createElement("div");
   t.textContent = String(msg || "");
-  t.style.cssText = "background:var(--ink,#1a2b38);color:var(--surface,#fff);padding:10px 14px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
+  t.style.cssText = "background:var(--ink);color:var(--surface,#fff);padding:10px 14px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.18)";
   box.appendChild(t); setTimeout(() => t.remove(), 3200);
 }
 
 const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const PRESETS = [["personal", "Personal"], ["collaborator", "Collaborator"], ["observer", "Observer"]];
+/* Mirrors peers.py PRESETS; /api/peers returns no preset name, so match grants. */
+const PRESET_GRANTS = {
+  personal: { chats: "full", mail: "on", spawn: "direct", approve: "on", land: "edits", claims: "claim", events: "all", files: "send", apps: "off", collab: "on", swarm: "on" },
+  collaborator: { chats: "decisions", mail: "on", spawn: "pending", approve: "off", land: "patch", claims: "claim", events: "own", files: "read", apps: "off", collab: "on", swarm: "off" },
+  observer: { chats: "titles", mail: "off", spawn: "off", approve: "off", land: "off", claims: "read", events: "own", files: "off", apps: "off", collab: "off", swarm: "off" },
+};
+function activePreset(p) {
+  if (p.preset && PRESET_GRANTS[p.preset]) return p.preset;
+  const g = p.grants || {};
+  for (const key of Object.keys(PRESET_GRANTS)) {
+    const want = PRESET_GRANTS[key];
+    if (Object.keys(want).every((k) => String(g[k] ?? "") === String(want[k]))) return key;
+  }
+  return null;
+}
+const SCOPES = [["threads", "Threads", "Members can see this station's threads and their graphs."], ["workers", "Workers", "Members can see workers and send them instructions."], ["terminals", "Terminals", "Members can see shared terminal output."]];
+
+function scopeToggles(s) {
+  const scopes = s.scopes || {};
+  return `<div class="cb-scopes" aria-label="What's shared"><span class="cb-scopes-ttl">What's shared</span>${SCOPES.map(([key, label, hint]) =>
+    `<label class="cb-scope" title="${esc(hint)}"><input type="checkbox" data-scope="${esc(key)}"${scopes[key] ? " checked" : ""}> ${esc(label)}</label>`).join("")}</div>`;
+}
 
 /* ---------- live data (real APIs only; no mock data) ---------- */
-const S = { loaded: false, session: null, usage: null, peers: [], allowance: {}, history: {}, models: {}, coord: null, error: "", remote: [], local: [] };
+const S = { loaded: false, peersReady: false, session: null, usage: null, peers: [], allowance: {}, history: {}, models: {}, coord: null, error: "", remote: [], local: [] };
 const ok = (r) => (r && r.status === "fulfilled" ? r.value : null);
 
 async function loadCollab() {
+  const indexModels = (m) => {
+    S.models = {};
+    for (const st of (m || {}).stations || []) {
+      if (!st) continue;
+      for (const k of [st.peer_id, st.station, st.name]) if (k) S.models[k] = st;
+    }
+  };
+  /* Paint peer cards as soon as /api/peers lands; models fill in when the slower call returns. */
+  const peersReq = api("/api/peers").then((p) => {
+    S.peers = p.peers || [];
+    S.grantSchema = p.grant_schema || [];
+    S.peersReady = true;
+    render();
+    return p;
+  }).catch(() => null);
+  const modelsReq = api("/api/peers/models").then((m) => { indexModels(m); render(); return m; }).catch(() => null);
   const [sess, usage, peers, models, coord, rw, st, pl] = await Promise.allSettled([
     api("/api/collab/session"),
     api("/api/collab/usage"),
-    api("/api/peers"),
-    api("/api/peers/models"),
+    peersReq,
+    modelsReq,
     api("/api/coordination?track=main"),
     api("/api/remote_workers"),
     api("/api/status?view=next"),
@@ -35,11 +75,12 @@ async function loadCollab() {
   ]);
   S.session = (ok(sess) || {}).session || null;
   S.usage = ok(usage);
-  S.peers = (ok(peers) || {}).peers || [];
-  S.grantSchema = (ok(peers) || {}).grant_schema || [];
+  S.peers = (ok(peers) || {}).peers || S.peers || [];
+  S.grantSchema = (ok(peers) || {}).grant_schema || S.grantSchema || [];
+  S.peersReady = true;
   S.error = sess.status === "rejected" ? String(sess.reason?.message || sess.reason) : "";
-  S.models = {};
-  for (const st of (ok(models) || {}).stations || []) if (st && st.station) S.models[st.station] = st;
+  /* models already indexed by modelsReq; keep a settled fallback for the error path */
+  if (!Object.keys(S.models).length) indexModels(ok(models));
   S.coord = ok(coord);
   S.remote = (ok(rw) || {}).workers || [];
   /* Phones paired to this station ride as coaches on its own train. */
@@ -135,19 +176,20 @@ const CSS = `
 .cb-btn:focus-visible,.cb-seg button:focus-visible,.cb-sw:focus-visible,.cb summary:focus-visible{outline:2px solid var(--ochre);outline-offset:2px}
 .cb-card{background:var(--surface);border:1px solid var(--hair);border-radius:var(--radius);min-width:0}
 .cb-h{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 0 10px}
+.cb-h.stack{display:block}
 .cb-h h2{margin:0;font-size:15px;font-weight:600}
 .cb-h p{margin:0;font-size:12px;color:var(--muted)}
 .cb-muted{color:var(--muted)}
 .cb-mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
 .cb-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:var(--ground);color:var(--muted);white-space:nowrap}
-.cb-badge.gold{background:rgba(212,166,74,.16);color:#8a6418}
+.cb-badge.gold{background:color-mix(in srgb,var(--ochre) 16%,transparent);color:#8a6418}
 .cb-badge.sky{background:var(--sky-chip);color:var(--sky-ink)}
-.cb-dot{width:8px;height:8px;border-radius:50%;background:#B9C2BC;flex-shrink:0}
+.cb-dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
 .cb-dot.is-online{background:#3E9C6B;box-shadow:0 0 0 3px rgba(62,156,107,.15)}
 .cb-dot.is-idle{background:var(--ochre)}
 .cb-dot.is-running{background:var(--sky);box-shadow:0 0 0 3px rgba(38,146,166,.15)}
 .cb-dot.is-waiting{background:var(--ochre)}
-.cb-dot.is-done{background:#B9C2BC}
+.cb-dot.is-done{background:var(--muted)}
 
 /* preview switcher */
 .cb-preview{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
@@ -157,12 +199,12 @@ const CSS = `
 .cb-seg .n{font-size:11px;padding:0 6px;border-radius:999px;background:var(--ground)}
 
 /* session bar */
-.cb-bar{position:sticky;top:8px;z-index:4;padding:12px 14px;display:flex;flex-direction:column;gap:12px;box-shadow:0 6px 18px -14px rgba(15,47,58,.45)}
+.cb-bar{position:sticky;top:8px;z-index:4;padding:12px 14px;display:flex;flex-direction:column;gap:12px;box-shadow:0 6px 18px -14px color-mix(in srgb,var(--ink) 45%,transparent)}
 .cb-bar-main{display:flex;align-items:center;gap:12px;min-width:0}
 .cb-bar-ttl{min-width:0;flex:1}
 .cb-bar-ttl b{display:block;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cb-bar-ttl span{font-size:12px;color:var(--muted)}
-.cb-live{width:10px;height:10px;border-radius:50%;background:var(--ochre);box-shadow:0 0 0 4px rgba(212,166,74,.18);flex-shrink:0}
+.cb-live{width:10px;height:10px;border-radius:50%;background:var(--ochre);box-shadow:0 0 0 4px color-mix(in srgb,var(--ochre) 18%,transparent);flex-shrink:0}
 .cb-code{display:inline-flex;align-items:center;gap:8px;padding:6px 6px 6px 12px;border-radius:10px;background:var(--ground);font-family:ui-monospace,Menlo,monospace;font-size:14px;letter-spacing:.08em;font-weight:600}
 .cb-code button{all:unset;cursor:pointer;display:grid;place-items:center;width:28px;height:28px;border-radius:7px;color:var(--muted)}
 .cb-code button:hover{background:var(--surface);color:var(--ink)}
@@ -171,7 +213,7 @@ const CSS = `
 .cb-join{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .cb-join input{flex:1;min-width:140px;min-height:36px;border:1px solid var(--hair);border-radius:10px;padding:0 12px;font:600 14px ui-monospace,Menlo,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--ink);background:var(--surface)}
 .cb-join input:focus{outline:2px solid var(--ochre);outline-offset:1px}
-.cb-banner{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:10px;background:rgba(212,166,74,.12);color:#6d4f12;font-size:13px}
+.cb-banner{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:10px;background:color-mix(in srgb,var(--ochre) 12%,transparent);color:#6d4f12;font-size:13px}
 .cb-banner .grow{flex:1}
 .cb-banner button{all:unset;cursor:pointer;color:inherit;opacity:.7}
 
@@ -182,10 +224,10 @@ const CSS = `
 .cb-map .eng text.nm{fill:var(--ink);font-weight:600;font-size:12px}
 .cb-trains{display:grid;gap:12px}
 .cb-train{padding:14px}
-.cb-train.me{border-color:rgba(212,166,74,.55)}
+.cb-train.me{border-color:color-mix(in srgb,var(--ochre) 55%,transparent)}
 .cb-train-h{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .cb-av{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px;background:var(--sky-chip);color:var(--sky-ink);flex-shrink:0}
-.cb-train.me .cb-av{background:rgba(212,166,74,.2);color:#8a6418}
+.cb-train.me .cb-av{background:color-mix(in srgb,var(--ochre) 20%,transparent);color:#8a6418}
 .cb-train-h b{font-size:14px}
 .cb-train-h .grow{flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .cb-eng{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;background:var(--ground)}
@@ -200,8 +242,8 @@ const CSS = `
 .cb-coach small{display:block;font-size:11.5px;color:var(--muted)}
 .cb-coach select{min-height:30px;border:1px solid var(--hair);border-radius:8px;background:var(--surface);color:var(--ink);font-size:12px;padding:0 6px;max-width:120px}
 .cb-coach select:disabled{opacity:.45}
-.cb-sw{position:relative;width:38px;height:22px;border-radius:999px;border:0;background:#CBD3CE;cursor:pointer;flex-shrink:0;padding:0}
-.cb-sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .18s}
+.cb-sw{position:relative;width:38px;height:22px;border-radius:999px;border:0;background:var(--hair);cursor:pointer;flex-shrink:0;padding:0}
+.cb-sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--surface);transition:transform .18s}
 .cb-sw[aria-checked="true"]{background:var(--ochre)}
 .cb-sw[aria-checked="true"]::after{transform:translateX(16px)}
 .cb-train-f{display:flex;justify-content:flex-end;gap:6px;margin-top:10px}
@@ -215,7 +257,7 @@ const CSS = `
 .cb-pane h3{display:none;margin:0 0 10px;font-size:13px;font-weight:600}
 .cb-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
 .cb-claim{padding:10px 12px;border:1px solid var(--hair);border-radius:10px;display:grid;gap:6px}
-.cb-claim.conflict{border-color:var(--ochre);background:rgba(212,166,74,.06)}
+.cb-claim.conflict{border-color:var(--ochre);background:color-mix(in srgb,var(--ochre) 6%,transparent)}
 .cb-claim.stale{opacity:.7}
 .cb-claim-top{display:flex;gap:8px;align-items:center;min-width:0}
 .cb-claim-top .cb-mono{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -226,7 +268,7 @@ const CSS = `
 .cb-menu{position:relative}
 .cb-menu summary{list-style:none}
 .cb-menu summary::-webkit-details-marker{display:none}
-.cb-menu-pop{position:absolute;z-index:5;top:calc(100% + 4px);left:0;min-width:180px;padding:6px;background:var(--surface);border:1px solid var(--hair);border-radius:10px;box-shadow:0 12px 30px -16px rgba(15,47,58,.5)}
+.cb-menu-pop{position:absolute;z-index:5;top:calc(100% + 4px);left:0;min-width:180px;padding:6px;background:var(--surface);border:1px solid var(--hair);border-radius:10px;box-shadow:0 12px 30px -16px color-mix(in srgb,var(--ink) 50%,transparent)}
 .cb-menu-pop button{all:unset;cursor:pointer;display:flex;gap:8px;align-items:center;width:100%;box-sizing:border-box;padding:8px 10px;border-radius:7px;font-size:13px}
 .cb-menu-pop button:hover{background:var(--ground)}
 .cb-worker{display:flex;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--hair);border-radius:10px;min-width:0}
@@ -260,11 +302,11 @@ const CSS = `
 .cb-empty p{margin:0;max-width:380px;font-size:13px;color:var(--muted);line-height:1.45}
 
 /* QR dialog */
-.cb-dlg{border:0;border-radius:16px;padding:20px;max-width:min(340px,calc(100vw - 32px));box-shadow:0 30px 60px -30px rgba(15,47,58,.6);color:var(--ink)}
-.cb-dlg::backdrop{background:rgba(15,47,58,.35)}
+.cb-dlg{border:0;border-radius:16px;padding:20px;max-width:min(340px,calc(100vw - 32px));box-shadow:0 30px 60px -30px color-mix(in srgb,var(--ink) 60%,transparent);color:var(--ink)}
+.cb-dlg::backdrop{background:color-mix(in srgb,var(--ink) 35%,transparent)}
 .cb-dlg h3{margin:0 0 4px;font-size:15px}
 .cb-dlg p{margin:0 0 14px;font-size:12.5px;color:var(--muted)}
-.cb-dlg .qr{display:grid;place-items:center;padding:14px;border-radius:12px;background:#fff;border:1px solid var(--hair)}
+.cb-dlg .qr{display:grid;place-items:center;padding:14px;border-radius:12px;background:var(--surface);border:1px solid var(--hair)}
 .cb-dlg .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:14px}
 
 /* tablet */
@@ -311,6 +353,7 @@ function sessionBar() {
         ${host ? "" : '<button class="cb-btn ghost" type="button" data-act="uncouple">Uncouple</button>'}
         ${host ? '<button class="cb-btn danger" type="button" data-act="end">End session</button>' : ""}
       </div>
+      ${scopeToggles(s)}
     </section>`;
   }
   const opts = S.peers.map((p) => `<option value="${esc(slugOf(p))}">${esc(p.name)} · @${esc(slugOf(p))}</option>`).join("");
@@ -341,7 +384,7 @@ function starMap(trs) {
   for (const t of others) {
     const [x, y] = pos.get(t.id);
     const off = t.engine.state === "offline";
-    lines += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="${off ? "#C9D0CB" : "var(--ochre)"}" stroke-width="2" ${off ? 'stroke-dasharray="5 5"' : ""}/>`;
+    lines += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="${off ? "var(--hair)" : "var(--ochre)"}" stroke-width="2" ${off ? 'stroke-dasharray="5 5"' : ""}/>`;
   }
   for (const t of trs) {
     const [x, y] = pos.get(t.id);
@@ -349,11 +392,11 @@ function starMap(trs) {
     t.coaches.forEach((c, i) => {
       const a = (-Math.PI / 2) + (i - (n - 1) / 2) * 0.75 + (x < cx ? -Math.PI / 2 : x > cx ? Math.PI / 2 : Math.PI);
       const r = 62, px = x + Math.cos(a) * r, py = y + Math.sin(a) * r * 0.75;
-      lines += `<line x1="${x}" y1="${y}" x2="${px.toFixed(1)}" y2="${py.toFixed(1)}" stroke="#D5DBD3" stroke-width="1.5"/>`;
-      nodes += `<g><circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="7" fill="${c.state === "offline" ? "#E4E8E2" : "#fff"}" stroke="${c.state === "online" ? "#3E9C6B" : "#B9C2BC"}" stroke-width="2"/><title>${esc(c.name)} · ${esc(stateText(c.state))}</title></g>`;
+      lines += `<line x1="${x}" y1="${y}" x2="${px.toFixed(1)}" y2="${py.toFixed(1)}" stroke="var(--hair)" stroke-width="1.5"/>`;
+      nodes += `<g><circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="7" fill="${c.state === "offline" ? "var(--hair)" : "var(--surface)"}" stroke="${c.state === "online" ? "#3E9C6B" : "var(--muted)"}" stroke-width="2"/><title>${esc(c.name)} · ${esc(stateText(c.state))}</title></g>`;
     });
     const off = t.engine.state === "offline";
-    nodes += `<g class="eng"><circle cx="${x}" cy="${y}" r="${t.host ? 20 : 16}" fill="${t.host ? "var(--ochre)" : off ? "#E4E8E2" : "var(--sky-deep)"}"/>
+    nodes += `<g class="eng"><circle cx="${x}" cy="${y}" r="${t.host ? 20 : 16}" fill="${t.host ? "var(--ochre)" : off ? "var(--hair)" : "var(--sky-deep)"}"/>
       <text x="${x}" y="${y + 4}" text-anchor="middle" style="fill:#fff;font-weight:700;font-size:12px">${esc(t.person[0] || "?")}</text>
       <text class="nm" x="${x}" y="${y + (t.host ? 38 : 34)}" text-anchor="middle">${esc(t.person)}${t.host ? " · host" : ""}</text>
       <title>${esc(t.engine.name)} (engine) · ${esc(stateText(t.engine.state))}</title></g>`;
@@ -453,7 +496,7 @@ function coordination() {
 function emptyNoLinks() {
   return `<section class="cb-card cb-empty"><div class="ill">${ic("link", 22)}</div><h3>No linked stations yet</h3>
     <p>Link your other machines, or a collaborator's station, from the Devices page. Then start a session here and share the code.</p>
-    <a class="cb-btn primary" href="#devices">Link a station</a></section>`;
+    <a class="cb-btn primary" href="#devices">Link a station on Devices</a></section>`;
 }
 
 
@@ -467,7 +510,7 @@ const PCSS = `
 .cb-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 4px;border:1px solid var(--hair);border-radius:999px;background:var(--surface);font-size:12px;color:var(--ink)}
 .cb-chip .cb-av{width:22px;height:22px;font-size:11px}
 .cb-chip.partner .cb-av{background:var(--sky-chip);color:var(--sky-ink)}
-.cb-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;background:rgba(212,166,74,.14);color:#8a6418;font-size:12px;font-weight:600;text-decoration:none}
+.cb-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;background:color-mix(in srgb,var(--ochre) 14%,transparent);color:#8a6418;font-size:12px;font-weight:600;text-decoration:none}
 .pp{display:grid;gap:16px}
 .pp-side{display:grid;gap:16px;align-content:start}
 .pp-mem{padding:14px;display:grid;gap:12px}
@@ -480,7 +523,7 @@ const PCSS = `
 .pp-acc-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 .pp-acc-row>span{font-size:12.5px;display:flex;gap:6px;align-items:center}
 .pp-acc .cb-seg button{padding:5px 10px;font-size:12px}
-.pp-acc .cb-seg button[aria-pressed="true"][data-level="control"]{background:rgba(212,166,74,.18);color:#8a6418}
+.pp-acc .cb-seg button[aria-pressed="true"][data-level="control"]{background:color-mix(in srgb,var(--ochre) 18%,transparent);color:#8a6418}
 .pp-foot{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px solid var(--hair)}
 .pp-foot label{display:flex;gap:8px;align-items:center;font-size:12.5px}
 .pp-inv{padding:14px;display:grid;gap:10px}
@@ -494,8 +537,7 @@ const PCSS = `
 .pp-audit li{display:grid;grid-template-columns:56px 1fr;gap:10px;padding:7px 0;border-bottom:1px solid var(--hair);font-size:12.5px}
 .pp-audit li:last-child{border-bottom:0}
 .pp-audit time{color:var(--muted);font-variant-numeric:tabular-nums}
-.pp-mems{display:grid;gap:12px}
-@media (min-width:768px){.pp-mems{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.pp-mems{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
 @media (min-width:1200px){.pp{grid-template-columns:minmax(0,2fr) minmax(300px,1fr);align-items:start}}
 `;
 
@@ -506,10 +548,11 @@ const HCSS = `
 .cb-q-acts{display:inline-flex;gap:6px;flex-wrap:wrap}
 .cb-files summary{cursor:pointer;font-size:12px;color:var(--muted)}
 .cb-files ul{margin:6px 0 0;padding-left:16px;font-size:12px}
+.pp-ctl{display:flex;align-items:center;gap:8px;font-size:13px}
 .pp-swarm{display:flex;gap:8px;align-items:flex-start;font-size:13px;cursor:pointer}
-.pp-swarm input{margin-top:2px}
+.pp-swarm input{margin-top:2px;accent-color:var(--accent,#2a8a9a)}
 .pp-scr{display:flex;gap:8px;flex-wrap:wrap}
-.pp-scr .cb-btn{flex:1;min-width:120px}
+.pp-scr .cb-btn{font-size:13px;padding:6px 12px;border-radius:8px;border:1px solid var(--line,#ddd);background:#fff}
 .pp-perms summary{cursor:pointer;font-size:13px;padding:4px 0}
 .pp-perms-g{display:grid;grid-template-columns:1fr;gap:4px 12px;align-items:center;padding:6px 0;font-size:13px}
 .pp-perms-g label{color:var(--muted);margin-top:6px}
@@ -535,31 +578,43 @@ const HCSS = `
 .pp-models .cb-badge{font-weight:500}
 `;
 
-function historyBars(hist, cap) {
+function historyBars(hist, cap, startLabel) {
   const max = Math.max(1, cap || 0, ...hist.map((d) => d.used || 0));
   const total = hist.reduce((a, d) => a + (d.used || 0), 0);
   return `<div><div class="cb-hist" role="img" aria-label="Tokens used per day, last ${hist.length} days: ${tok(total)} in total">${hist.map((d) =>
       `<span class="${d.cap && d.used > d.cap ? "over" : ""}" title="${esc(d.date)}: ${tok(d.used)} tokens${d.cap ? " of " + tok(d.cap) : ""}"><i style="height:${Math.round(((d.used || 0) / max) * 100)}%"></i></span>`).join("")}</div>
-    <div class="cb-hist-cap"><span>${esc((hist[0] || {}).date || "")}</span><span>${tok(total)} in ${hist.length} days</span><span>today</span></div></div>`;
+    <div class="cb-hist-cap"><span>${esc(startLabel || (hist[0] || {}).date || "")}</span><span>${tok(total)} in ${hist.length} days</span><span>today</span></div></div>`;
+}
+
+const dayStr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+function chartStart(p) {
+  const ago14 = new Date(); ago14.setDate(ago14.getDate() - 13);
+  const created = p.created_at ? new Date(p.created_at) : null;
+  const start = created && !isNaN(created) && created > ago14 ? created : ago14;
+  return dayStr(start);
 }
 
 function modelsLine(p) {
-  const m = S.models[slugOf(p)];
+  const m = S.models[p.peer_id] || S.models[slugOf(p)] || S.models[p.name];
   if (!m) return `<small class="cb-muted">Models: not loaded</small>`;
   if (m.error) return `<small class="cb-muted">Models: ${esc(m.error)}</small>`;
   const list = Array.isArray(m.models) ? m.models : Object.values(m.models || {}).flat();
-  const names = list.map((x) => (typeof x === "string" ? x : x.id || x.model || x.name)).filter(Boolean);
+  const names = list.map((x) => (typeof x === "string" ? x : x.model || x.id || x.name)).filter(Boolean);
   if (!names.length) return `<small class="cb-muted">Models: none shared</small>`;
-  return `<div class="pp-models" aria-label="Models">${names.slice(0, 12).map((n) => `<span class="cb-badge">${esc(n)}</span>`).join("")}${names.length > 12 ? `<span class="cb-muted">+${names.length - 12}</span>` : ""}</div>`;
+  const shown = names.slice(0, 4).join(", ");
+  return `<small class="cb-muted">Models: ${names.length} — ${esc(shown)}${names.length > 4 ? ` +${names.length - 4} more` : ""}</small>`;
 }
 
 function peersPanel() {
-  if (!S.loaded) return `<p class="pp-note">Loading linked stations…</p>`;
+  if (!S.peersReady && !S.loaded) return `<p class="pp-note">Loading linked stations…</p>`;
   if (!S.peers.length) return emptyNoLinks();
-  return `<section aria-label="Linked stations"><div class="cb-h"><h2>Linked stations</h2><p>Daily token allowance, usage and models</p></div>
+  return `<section aria-label="Linked stations"><div class="cb-h stack"><h2>Linked stations</h2><p class="cb-muted">Daily token allowance, usage and models</p></div>
     <div class="pp-mems">${S.peers.map((p) => {
       const a = S.allowance[p.peer_id] || {};
-      const hist = S.history[p.peer_id] || [];
+
+      const start = chartStart(p);
+      const histAll = S.history[p.peer_id] || [];
+      const hist = histAll.filter((d) => !d.date || d.date >= start);
       const grants = Object.entries(p.grants || {}).filter(([k, v]) => GRANT_LABELS[k] && v && v !== "off").map(([k, v]) => `${GRANT_LABELS[k]}: ${v}`);
       return `<article class="cb-card pp-mem" aria-label="${esc(p.name)}">
         <div class="pp-mem-h"><span class="cb-av" aria-hidden="true">${esc((p.name || "?")[0])}</span>
@@ -569,11 +624,13 @@ function peersPanel() {
           <input id="al-${esc(p.peer_id)}" data-peer="${esc(p.peer_id)}" type="number" min="0" step="1000" value="${Number(a.tokens_per_day || 0)}" aria-describedby="al-h-${esc(p.peer_id)}">
           <small id="al-h-${esc(p.peer_id)}" class="cb-muted">${a.tokens_per_day ? `${tok(a.used_today)} used · ${tok(a.left)} left today` : `${tok(a.used_today)} used today · 0 = no limit`}</small>
         </div>
-        ${hist.length ? historyBars(hist, a.tokens_per_day) : ""}
+        ${hist.length ? historyBars(hist, a.tokens_per_day, start) : ""}
         ${modelsLine(p)}
+        <div class="pp-presets"><span class="cb-muted" style="font-size:12.5px">Preset</span><div class="cb-seg" role="group" aria-label="Preset">${PRESETS.map(([v, l]) => { const on = activePreset(p) === v; return `<button type="button" data-preset="${v}" data-gpeer="${esc(p.peer_id)}" aria-pressed="${on}">${l}</button>`; }).join("")}</div></div>
+        <div class="pp-ctl"><button type="button" class="st-switch" role="switch" aria-checked="${!!p.controller}" aria-label="Only controller" data-ctl="${esc(p.peer_id)}"></button><span>Only controller</span></div>
         ${S.grantSchema && S.grantSchema.length ? permsPanel(p) : grants.length ? `<small class="cb-muted">Grants: ${esc(grants.join(" · "))}</small>` : ""}
         ${swarmRow(p)}
-        <div class="pp-scr"><button type="button" class="cb-btn" data-scr="still" data-peer="${esc(p.peer_id)}" data-name="${esc(p.name)}">View screen</button><button type="button" class="cb-btn" data-scr="live" data-peer="${esc(p.peer_id)}" data-name="${esc(p.name)}">Watch live</button></div>
+        <div class="pp-scr"><button type="button" class="cb-btn" data-scr="still" data-peer="${esc(p.peer_id)}" data-name="${esc(p.name)}">View screen</button><button type="button" class="cb-btn" data-scr="live" data-peer="${esc(p.peer_id)}" data-name="${esc(p.name)}">Watch live</button><button type="button" class="cb-btn danger" data-unlink="${esc(p.peer_id)}">Unlink</button></div>
       </article>`;
     }).join("")}</div></section>`;
 }
@@ -661,9 +718,10 @@ let wrap = null;
 function render() {
   if (!wrap) return;
   const pill = S.session ? `<a class="cb-pill" href="#collab/sessions"><span class="cb-live" style="width:8px;height:8px"></span>In “${esc(S.session.name)}”</a>` : "";
-  const tabs = `<div class="cb-top"><nav class="cb-tabs" aria-label="Collab sections">${[["people", "People"], ["sessions", "Sessions"]].map(([k, l]) =>
+  const tabs = `<div class="cb-top"><nav class="cb-tabs" aria-label="Collab sections">${[["people", "People"], ["sessions", "Sessions"], ["security", "Security"]].map(([k, l]) =>
     `<a href="#collab/${k}"${ui.tab === k ? ' aria-current="page"' : ""}>${l}</a>`).join("")}</nav>${pill}</div>`;
   if (ui.tab === "people") { wrap.innerHTML = tabs + peopleTab(); return; }
+  if (ui.tab === "security") { wrap.innerHTML = tabs + securityTab({ peers: S.peers, activePreset, esc, rerender: render }); return; }
   if (!S.loaded) { wrap.innerHTML = tabs + `<p class="pp-note">Loading…</p>`; return; }
   const trs = trains();
   const body = S.session && trs.length
@@ -682,12 +740,19 @@ function onClick(e) {
   else if (act === "end") { if (confirm("End this session for everyone?")) post("/api/collab/end", {}, "Session ended"); }
   else if (act === "uncouple") { if (confirm("Leave this session?")) post("/api/collab/leave", {}, "Left the session"); }
   else if (act === "master") { if (confirm("Hand the master role to this station?")) post("/api/collab/master", { master_device: b.dataset.dev }, "Master changed"); }
+  else if (act === "pen-handover") { document.dispatchEvent(new CustomEvent("pen:state", { detail: { heldElsewhere: true, holder: b.dataset.dev || null } })); post("/api/collab/pen", { holder: b.dataset.dev }, "Pen handed over"); }
+  else if (act === "pen-acquire") { document.dispatchEvent(new CustomEvent("pen:acquired")); }
   else if (act === "approve") post("/api/remote_workers/approve", { ref: b.dataset.id }, "Approved");
   else if (act === "reject") { if (confirm("Reject this request?")) post("/api/remote_workers/reject", { ref: b.dataset.id }, "Rejected"); }
   else if (act === "land") { if (confirm("Land this patch into your checkout?")) post("/api/remote_workers/land", { id: b.dataset.id }, "Landed"); }
   else if (act === "lapprove") post("/api/approve_worker", { id: b.dataset.id }, "Approved");
   else if (act === "lreject" && REJ) { if (confirm("Reject this request?")) post(REJ, { id: b.dataset.id }, "Rejected"); }
   else if (act === "remove") { if (confirm("Remove this station from the session?")) post("/api/collab/remove", { device_id: b.dataset.dev }, "Removed"); }
+  else if (b.dataset.preset) post("/api/peers/grants", { peer_id: b.dataset.gpeer, grants: b.dataset.preset }, "Preset: " + b.dataset.preset);
+  else if (b.dataset.unlink) {
+    if (b.dataset.armed === "1") { post("/api/peer/unlink", { peer_id: b.dataset.unlink }, "Unlinked"); }
+    else { b.dataset.armed = "1"; b.textContent = "Confirm unlink"; }
+  }
 }
 
 function onSubmit(e) {
@@ -702,12 +767,14 @@ function onSubmit(e) {
 
 function onChange(e) {
   const t = e.target;
-  if (t.dataset.act === "billing") post("/api/collab/billing", { billing_mode: t.value }, "Billing mode " + t.value);
+  if (t.dataset.scope) post("/api/collab/scope", { scope: { [t.dataset.scope]: t.checked } }, "Sharing updated");
+  else if (t.dataset.act === "billing") post("/api/collab/billing", { billing_mode: t.value }, "Billing mode " + t.value);
   else if (t.dataset.grant) {
     const lab = (S.grantSchema.find((x) => x.key === t.dataset.grant) || {}).label || t.dataset.grant;
     post("/api/peers/grants", { peer_id: t.dataset.gpeer, grants: { [t.dataset.grant]: t.value } }, `${lab}: ${t.selectedOptions[0].text}`);
   }
   else if (t.dataset.swarm) post("/api/peers/grants", { peer_id: t.dataset.swarm, grants: { swarm: t.checked ? "on" : "off" } }, t.checked ? "Mode C allowed" : "Mode C off");
+  else if (t.dataset.ctl) post("/api/peers/controller", { peer_id: t.checked ? t.dataset.ctl : null }, t.checked ? "Only controller" : "Controller cleared");
   else if (t.dataset.peer) {
     const v = Math.max(0, Math.floor(Number(t.value) || 0));
     post("/api/peers/allowance", { peer_id: t.dataset.peer, tokens_per_day: v }, v ? `Allowance set to ${tok(v)}/day` : "Allowance removed");
@@ -723,9 +790,9 @@ function mount() {
   unmount();
   const [r, sub] = (location.hash.slice(1) || "home").split("/");
   if (r !== ROUTE && r !== "team") return;
-  ui.tab = r === "team" ? (sub === "sessions" ? "sessions" : "people") : (sub === "sessions" ? "sessions" : "people");
+  ui.tab = sub === "sessions" ? "sessions" : sub === "security" ? "security" : "people";
   document.body.classList.add("on-collab");
-  if (!document.getElementById("cb-css")) document.head.append(Object.assign(document.createElement("style"), { id: "cb-css", textContent: CSS + PCSS + HCSS }));
+  if (!document.getElementById("cb-css")) document.head.append(Object.assign(document.createElement("style"), { id: "cb-css", textContent: CSS + PCSS + HCSS + SECCSS }));
   wrap = document.createElement("div");
   wrap.className = "cb";
   wrap.addEventListener("click", onClick);

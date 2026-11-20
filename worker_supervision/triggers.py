@@ -303,7 +303,10 @@ def _run_triggers(worker_id: str, result: Dict[str, Any]) -> None:
         if unit_step:
             from workers import units as _units
             try:
-                child_prompt = _units.unit_prompt(str(unit_step["cwd"]), int(unit_step["index"]))
+                # F6: verify/brief pinned at spin time win over the (tamperable) manifest file.
+                child_prompt = _units.unit_prompt(str(unit_step["cwd"]), int(unit_step["index"]),
+                                                  pinned_verify=unit_step.get("verify"),
+                                                  pinned_brief=unit_step.get("brief"))
             except (ValueError, KeyError):
                 continue
             provider, model = str(meta.get("provider") or "auto"), str(meta.get("model") or "")

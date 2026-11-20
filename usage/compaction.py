@@ -509,7 +509,9 @@ def _pi_chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[i
     Context limit comes from _pi_models() when available, else 200000 (documented default)."""
     path = None
     if session_id:
-        if os.path.isfile(session_id):
+        # Only transcript paths count as paths (F3): an arbitrary file passed as a chat id
+        # used to become an existence/size oracle. Real transcripts are .jsonl.
+        if os.path.isfile(session_id) and str(session_id).endswith(".jsonl"):
             path = session_id
         else:
             # Resolve by pi session id.
@@ -596,7 +598,9 @@ def chat_context_usage(session_id: Optional[str] = None) -> Tuple[Optional[int],
     transcript for this cwd (or session_id) and usage.totalTokens / last assistant usage."""
     path = None
     if session_id:
-        if os.path.isfile(session_id):
+        # Same .jsonl restriction as the pi reader (F3): a raw path is only honoured for
+        # transcript files, so an arbitrary file id stays a 404, not an oracle.
+        if os.path.isfile(session_id) and str(session_id).endswith(".jsonl"):
             path = session_id
         else:
             matches = glob.glob(os.path.join(_s.CLAUDE_DIR, "projects", "*", f"{session_id}.jsonl"))

@@ -4,12 +4,21 @@ const SI={"shield-check": "<svg width=\"18\" height=\"18\" viewBox=\"0 0 256 256
    and every change is POSTed back. A change shows at once and is reverted if the HUD refuses it. */
 (function(){
 SI["terminal-window"]='<svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" style="flex-shrink:0"><path d="M128,128a8,8,0,0,1-3,6.25l-40,32a8,8,0,1,1-10-12.5L107.19,128,75,102.25a8,8,0,1,1,10-12.5l40,32A8,8,0,0,1,128,128Zm48,24H136a8,8,0,0,0,0,16h40a8,8,0,0,0,0-16Zm56-96V200a16,16,0,0,1-16,16H40a16,16,0,0,1-16-16V56A16,16,0,0,1,40,40H216A16,16,0,0,1,232,56ZM216,200V56H40V200H216Z"/></svg>';
-let s=null,CAP={},state="idle",err="";
+let s=null,CAP={},state="idle",err="",target="self",ownPeers=[],crossNote="";
 const apiErr=async r=>{let m=`HUD answered ${r.status}`;try{const j=await r.json();if(j&&j.error)m=j.error;}catch{}return m;};
+const fmtCrossDevice=cd=>{if(!cd||typeof cd!=="object")return "";const parts=[];
+  for(const[k,lbl]of[["applied","applied"],["denied","denied"],["offline","offline"]]){const v=cd[k];
+    const n=Array.isArray(v)?v.length:(typeof v==="number"?v:0);
+    if(n>0){const names=Array.isArray(v)?v.map(x=>typeof x==="string"?x:(x&&(x.name||x.peer_id||x.id))||"").filter(Boolean):[];
+      parts.push(names.length?`${n} ${lbl} (${names.join(", ")})`:`${n} ${lbl}`);}}
+  return parts.join(" · ");};
 async function load(){if(!s){state="loading";err="";paintIfOpen();}
-  try{const[a,b]=await Promise.all([fetch("/api/settings",{cache:"no-store"}),fetch("/api/status?view=next",{cache:"no-store"})]);
+  try{const[a,b,c]=await Promise.all([fetch("/api/settings",{cache:"no-store"}),fetch("/api/status?view=next",{cache:"no-store"}),fetch("/api/peers",{cache:"no-store"}).catch(()=>null)]);
     if(!a.ok)throw new Error(await apiErr(a));
     const vals=(await a.json()).values||{},st=b.ok?await b.json():{};
+    const pj=c&&c.ok?await c.json().catch(()=>null):null;
+    if(pj&&Array.isArray(pj.peers)){ownPeers=pj.peers.filter(p=>p&&p.relation==="own");
+      if(target!=="self"&&target!=="all"&&!ownPeers.some(p=>String((p&&(p.peer_id||p.id))||"")===target))target="self";}
     CAP=st.capacity||{};s={...(st.settings||{}),...vals};state="ready";}
   catch(e){state="error";err=e instanceof TypeError?"Couldn't reach the prototype server.":String(e.message||e);}
   paintIfOpen();}
@@ -17,12 +26,17 @@ const LABEL={god_mode:"God mode",worker_limits:"Worker limits",max_workers:"Max 
 const nameOf=k=>LABEL[k]||k.replace(/^iteration\./,"").replace(/_/g," ").replace(/^./,c=>c.toUpperCase());
 let pending=0;
 async function save(patch){const before={};for(const k in patch)before[k]=s[k];
-  Object.assign(s,patch);render(false);pending++;
-  try{const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(patch)});
+  const localApply=target==="self"||target==="all";
+  if(localApply)Object.assign(s,patch);
+  render(false);pending++;
+  try{const body=target!=="self"?{...patch,target}:patch;
+    const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     if(!r.ok)throw new Error(await apiErr(r));
-    const j=await r.json().catch(()=>({}));if(j.applied)Object.assign(s,j.applied);
-    const k=Object.keys(patch)[0];toast.success("Saved",{id:"st-save",description:`${nameOf(k)} updated in config.json`,duration:1800});}
-  catch(e){Object.assign(s,before);
+    const j=await r.json().catch(()=>({}));if(j.applied&&localApply)Object.assign(s,j.applied);
+    crossNote=j.cross_device?fmtCrossDevice(j.cross_device):"";
+    const k=Object.keys(patch)[0];
+    toast.success("Saved",{id:"st-save",description:crossNote?`${nameOf(k)} · ${crossNote}`:`${nameOf(k)} updated in config.json`,duration:1800});}
+  catch(e){if(localApply)Object.assign(s,before);
     toast.error("Not saved",{id:"st-save",description:e instanceof TypeError?"Couldn't reach the HUD. Is it running on 7890?":String(e.message||e)});}
   finally{pending--;if(isOpen())render(false);}}
 /* Archive and Principal have their own endpoints. post() sends the body, then reloads values from the HUD. */
@@ -92,12 +106,30 @@ const ROOT=[
   ["startup","rocket-launch","Startup",()=>OPEN_IN[s.hud_open_in||"auto"]||OPEN_IN.auto],
   ["terminal","terminal-window","Terminal commands",()=>({ask:"Approve everything",auto_safe:"Auto-approve safe commands",auto_approve:"Auto-approve everything"}[s.terminal_mode||"ask"]||"Approve everything")]]];
 const READY=new Set(["appearance","providers","workers","permissions","local","mcp","collab","context","archive","principal","behaviour","reply","tokens","git","storage","notifications","startup","terminal","wake"]);
-let PROV={list:null,loading:false,err:""};
+let PROV={list:null,profiles:null,loading:false,err:"",profErr:"",showAdd:false,editing:null,draft:{}};
+const PROV_BASE=[["claude","Claude"],["antigravity","Antigravity"],["opencode","OpenCode"],["copilot","Copilot"],["local","Local"],["custom","Custom"]];
+const PROV_AUTH=[["api_key","API key"],["oauth","OAuth"],["env","Environment"],["none","None"]];
+const emptyProvDraft=()=>({name:"",base_provider:"claude",binary_path:"",home_dir:"",shadow_home_dir:"",api_key:"",base_url:"",default_model:"",auth_mode:"api_key"});
 async function loadProvidersPage(){if(PROV.loading)return;PROV.loading=true;
-  try{const r=await fetch("/api/transplant/providers",{cache:"no-store"});const j=await r.json();PROV.list=j.providers||[];PROV.err=j.error||"";}
+  try{const[r,pr]=await Promise.all([fetch("/api/transplant/providers",{cache:"no-store"}),fetch("/api/provider_profiles",{cache:"no-store"}).catch(()=>null)]);
+    const j=await r.json();PROV.list=j.providers||[];PROV.err=j.error||"";
+    if(pr&&pr.ok){const pj=await pr.json();PROV.profiles=Array.isArray(pj.profiles)?pj.profiles:[];PROV.profErr=pj.error||"";}
+    else if(!PROV.profiles){PROV.profiles=[];}}
   catch(e){PROV.err="Couldn't reach the HUD.";}
   PROV.loading=false;if(isOpen())render(false);}
-const provSummary=()=>{if(!PROV.list)return"Transplant adapters";const n=o=>PROV.list.filter(p=>p.origin===o).length,d=PROV.list.filter(p=>p.drifted).length;return `${n("shipped")+n("learned")} mapped · ${n("unmapped")} unmapped${d?` · ${d} drifted`:""}`;};
+async function provPost(body,label){pending++;
+  try{const r=await fetch("/api/provider_profiles",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(!r.ok)throw new Error(await apiErr(r));
+    const j=await r.json().catch(()=>({}));
+    if(Array.isArray(j.profiles))PROV.profiles=j.profiles;
+    toast.success("Saved",{id:"st-save",description:label?`${label} updated`:undefined,duration:1800});
+    return true;}
+  catch(e){toast.error("Not saved",{id:"st-save",description:e instanceof TypeError?"Couldn't reach the HUD. Is it running on 7890?":String(e.message||e)});return false;}
+  finally{pending--;if(isOpen())render(false);}}
+const provSummary=()=>{const ps=PROV.profiles||[];const inst=ps.length?`${ps.length} instance${ps.length===1?"":"s"} · `:"";
+  if(!PROV.list)return inst?`${inst}Transplant adapters`:"Transplant adapters";
+  const n=o=>PROV.list.filter(p=>p.origin===o).length,d=PROV.list.filter(p=>p.drifted).length;
+  return `${inst}${n("shipped")+n("learned")} mapped · ${n("unmapped")} unmapped${d?` · ${d} drifted`:""}`;};
 const ago=ts=>{const x=Math.max(0,Date.now()/1000-ts);return x<60?"just now":x<3600?`${Math.floor(x/60)}m ago`:x<86400?`${Math.floor(x/3600)}h ago`:`${Math.floor(x/86400)}d ago`;};
 
 /* ---------- controls ---------- */
@@ -130,9 +162,14 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
  "":{title:"Settings",sub:"Workers, permissions, providers, mail and git",sections:ROOT.map(g=>({rows:g.map(([to,icon,label,d])=>row({to,icon,label,detail:typeof d==="function"?d():d,disabled:!READY.has(to)}))}))},
  workers:{title:"Workers",back:"",sections:[
   {rows:[row({label:"God mode",detail:"No permission prompts for workers.",trailing:sw("god_mode",s.god_mode,"God mode")}),
-         row({label:"Worker limits",detail:"Cap how many run at once.",trailing:sw("worker_limits",s.worker_limits,"Worker limits")})]},
+         row({label:"Worker limits",detail:"Cap how many run at once.",trailing:sw("worker_limits",s.worker_limits,"Worker limits")}),
+         row({label:"Launch approval",detail:"Auto launches isolated, capped, non-top-tier workers at once",trailing:select("launch_approval_local",s.launch_approval_local||"ask",[["ask","Always ask"],["auto","Auto"],["never","Never ask"]],"Launch approval")})]},
   {rows:[row({label:"Max workers",trailing:stepper("max_workers",s.max_workers,CAP.auto_limit,1,128)})],
    footer:`${CAP.auto_limit} suggested with ${CAP.free_ram_gb} GB RAM free. Leave empty for the automatic limit.`},
+  {title:"Token cap",rows:[row({label:"Token cap per worker",detail:"Auto lets the principal size each task",trailing:select("worker_budget_mode",s.worker_budget_mode||"auto",[["none","No cap"],["auto","Auto"],["range","Range"]],"Token cap per worker")}),
+   ...(s.worker_budget_mode==="range"?[row({label:"At least",detail:"Lowest cap a worker gets",trailing:stepper("worker_budget_min",s.worker_budget_min,200000,200000,1000000,50000)}),
+   row({label:"At most",detail:"Highest cap a worker gets",trailing:stepper("worker_budget_max",s.worker_budget_max,1000000,200000,1000000,50000)})]:[])],
+   footer:"Range keeps every worker's token cap between 200,000 and 1,000,000."},
   {title:"Code packets",rows:[row({label:"Code packets",detail:"Briefs that name files must carry their code",trailing:select("code_packets_mode",s.code_packets_mode,[["auto","Auto (builders)"],["require","Require"],["warn","Warn"],["off","Off"]],"Code packets")})],
    footer:"Auto refuses a builder brief that names files but carries no code; research, review and planner roles are exempt. Warn only reminds."},
   {title:"Delegation",rows:[row({to:"workers/delegation",icon:"tree-structure",label:"Delegation",detail:`${shapes.length} shape${shapes.length===1?"":"s"} · ${rounds?`${rounds} rounds`:"No round limit"}`})]},
@@ -146,12 +183,18 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
    row({label:"Hard stop",detail:"Tool calls without an edit before a worker is stopped",trailing:stepper("no_edit_tool_calls",s.no_edit_tool_calls,12,2,50)}),
    row({label:"Failure lines",detail:"Lines of a failing test run shown to the agent",trailing:stepper("projector_max_lines",s.projector_max_lines,40,5,400,5)})],
    footer:"The full output is always kept in the terminal log."},
+  {title:"Sandbox",rows:[
+   row({label:"Execution sandbox",detail:"Default isolation level for worker commands",trailing:select("sandbox.exec_default",s["sandbox.exec_default"]||"os",[["off","Off"],["worktree","Worktree"],["os","OS (Seatbelt/bwrap)"],["vm","VM"]],"Execution sandbox")}),
+   row({label:"Sandbox network",detail:"Outbound network policy inside the sandbox",trailing:select("sandbox.net_default",s["sandbox.net_default"]||"off",[["off","Blocked"],["allowlist","Allowlist proxy"],["open","Open"]],"Sandbox network")}),
+   row({label:"Allowed domains",detail:"Comma-separated hostnames for allowlist proxy",trailing:`<input class="st-text" data-text="sandbox.allow_domains" aria-label="Allowed domains" placeholder="api.anthropic.com, github.com" value="${esc(s["sandbox.allow_domains"]||"")}">`}),
+   row({label:"Allow unsandboxed fallback",detail:"Run without OS sandbox if seatbelt/bwrap is unavailable",trailing:sw("sandbox.unsandboxed_fallback",!!s["sandbox.unsandboxed_fallback"],"Allow unsandboxed fallback")})],
+   footer:"OS sandbox restricts writes to the worktree and blocks ~/.ssh, ~/.aws, and ~/.subway. Remote peers are always clamped by the host floor."},
   {title:"Failure doctor",rows:[
    row({label:"Doctor",detail:"Queue a fix agent when a worker fails",trailing:select("doctor_mode",s.doctor_mode,[["auto","Auto (builders)"],["on","Always"],["off","Off"]],"Failure doctor")}),
    row({label:"Doctor budget",detail:"Dynamic follows what the failed worker spent",trailing:select("doctor_budget_mode",s.doctor_budget_mode,[["dynamic","Dynamic"],["fixed","Fixed"]],"Doctor budget")}),
    row({label:"Max tokens",detail:"Used when the budget is fixed",trailing:select("doctor_budget_tokens",s.doctor_budget_tokens,docOpts,"Doctor max tokens")}),
    row({label:"Model",detail:"Empty lets Subway pick a cheap one",trailing:`<input class="st-text" data-text="doctor_model" aria-label="Doctor model" placeholder="auto" value="${esc(s.doctor_model||"")}">`})],
-   footer:"A single cheap agent reads why a worker failed and queues the fix. It always waits for your approval. A spin can override this with doctor=off|on|auto."}]},
+   footer:"A single cheap agent reads why a worker failed and queues the fix. It always waits for your approval. A spin can override this with doctor=off|on|auto.\nNote: this controls only the post-failure fix agent — the mid-run progress guard (Workers → “Hard stop after calls without an edit”, 0 = off) is what stops slow workers early."}]},
  "workers/delegation":{title:"Delegation",back:"workers",sections:[
   {title:"Delegation shapes",rows:SHAPES.map(([k,l])=>row({label:l,trailing:sw(`shape:${k}`,shapes.includes(k),l)})),
    footer:"Tree: workers spawn sub-workers. Mesh: iteration rounds. Pipeline: then= chains. Adaptive: learned routing. Iteration needs Mesh on."},
@@ -220,7 +263,9 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
    footer:"Comma-separated MCP tool names that count against the read budget above when called from the principal chat (default: read_symbol, context_slice, read_terminal, search_terminal, project_files). Coordination tools and worker code packets never count."}]};})(),
  behaviour:{title:"Behaviour",back:"",sections:[
   {title:"Stay awake",rows:[row({label:"Stay awake",trailing:select("caffeinate",s.caffeinate||"off",[["off","Off"],["workers","When workers run"],["always","Always"]],"Stay awake")})],
-   footer:"Keeps the Mac awake while work is in flight."}]},
+   footer:"Keeps the Mac awake while work is in flight."},
+  {title:"Headless app actions",rows:[row({label:"App actions in headless chats",trailing:select("apps_headless_mode",s.apps_headless_mode||"connected_only",[["off","Off"],["connected_only","Connected apps only"],["on","Any discovered app"]],"Headless app actions")})],
+   footer:"Controls Subway's gated app_action MCP tool during headless turns (shell execution stays blocked)."}]},
  reply:{title:"Reply style",back:"",sections:[
   {title:"All principals",rows:[row({label:"Reply style",trailing:select("reply_style",replyDefault(),REPLY_STYLES,"Reply style")})],
    footer:"Shapes replies only; thinking is never limited. Applies to new chats or after /mcp reconnect."},
@@ -258,7 +303,12 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
    footer:"When a second chat edits a tree another chat is editing, it must call chat_branch first and land with land_chat. Enforced in Claude Code; other agents are told."},
   {title:"Landing mode",rows:[
    row({label:"Landing mode",trailing:select("land_mode",(s.land_mode==="queue"||s.land_mode==="manual")?s.land_mode:"merge",[["merge","Auto"],["queue","Queue"],["manual","Manual"]],"Landing mode")})],
-   footer:"Auto merges a finished worker's branch back even with uncommitted edits, which stay uncommitted; \"preserve\" is treated as Auto. Queue holds branches until no worker in the repo is running (subway land flushes). Manual never merges on its own: the branch waits for you (subway land <branch>). A worker that changed a file someone is editing keeps its branch either way."}]},
+   footer:"Auto merges a finished worker's branch back even with uncommitted edits, which stay uncommitted; \"preserve\" is treated as Auto. Queue holds branches until no worker in the repo is running (subway land flushes). Manual never merges on its own: the branch waits for you (subway land <branch>). A worker that changed a file someone is editing keeps its branch either way."},
+  {title:"Release & ship",rows:[
+   row({label:"Forward-port ship fixes",trailing:sw("lanes_forward_port",s.lanes_forward_port!==false,"Forward-port ship fixes")}),
+   row({label:"Auto-advance ship when green",trailing:sw("ship_auto_advance",!!s.ship_auto_advance,"Auto-advance ship when green")})],
+   footer:"Forward-port merges ship-lane fixes into dev automatically. Auto-advance moves to the next ship step when checks pass; Release and Mirror always require a click."},
+  ...(window.SubwayLanes?.lanesState?.available?[{title:"Lanes",rows:[`<div class="st-lanes-slot" data-lanes-slot></div>`]}]:[])]},
  storage:{title:"Storage",back:"",sections:[
   {title:"Worktree cleanup",rows:[
    row({label:"Worktree cleanup",trailing:select("worktree_cleanup",s.worktree_cleanup==="on"?"on":"off",[["off","Off"],["on","On"]],"Worktree cleanup")})],
@@ -287,14 +337,42 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
   const sw2=k=>`<span style="display:inline-block;width:56px;height:36px;border-radius:8px;flex-shrink:0;background:${W[k]||"linear-gradient(135deg,#1f2433 0%,#2c3446 55%,#3a3550 100%)"}"></span>`;
   return{title:"Appearance",back:"",sections:[{title:"Wallpaper",rows:[...Object.keys(W).map(k=>row({label:k.charAt(0).toUpperCase()+k.slice(1),trailing:`<span style="display:flex;gap:8px;align-items:center">${sw2(k)}<button type="button" class="st-act" data-wp="${k}" aria-pressed="${String(cur===k)}">${cur===k?"Selected":"Use"}</button></span>`})),
    row({label:"Custom image",detail:cur.startsWith("custom:")?"In use · PNG, JPG or WebP, up to 8 MB":"PNG, JPG or WebP, up to 8 MB",trailing:`<input type="file" accept="image/png,image/jpeg,image/webp" data-wpfile aria-label="Upload wallpaper" style="max-width:180px">`})]},{title:"Display",rows:[row({label:"Low-power mode",detail:"Static map and background, no idle animation. Auto turns it on for laptops with 4 cores or 4 GB or less.",trailing:`<span style="display:flex;gap:6px">${[["auto","Auto"],["1","On"],["0","Off"]].map(([v,l])=>{const on=(window.HudMotion?window.HudMotion.setting():"auto")===v;return `<button type="button" class="st-act" data-lowpower="${v}" aria-pressed="${String(on)}">${l}</button>`;}).join("")}</span>`})]}]};})(),
- providers:(()=>{if(!PROV.list&&!PROV.loading)loadProvidersPage();const L=PROV.list||[];
+ providers:(()=>{if(!PROV.list&&!PROV.loading)loadProvidersPage();const L=PROV.list||[],PS=PROV.profiles||[];
+  const provForm=(d,existing)=>{const isEdit=!!(existing&&existing.id);
+    const sel=(field,val,opts,label)=>`<span class="st-sel"><select data-prov-field="${esc(field)}" aria-label="${esc(label)}">${opts.map(([v,l])=>`<option value="${esc(v)}"${String(v)===String(val)?" selected":""}>${esc(l)}</option>`).join("")}</select>${SI["caret-down"]}</span>`;
+    const inp=(field,ph,type="text")=>`<input type="${type}" class="st-text" data-prov-field="${esc(field)}"${type==="password"?' autocomplete="off"':""} placeholder="${esc(ph)}" value="${esc(d[field]||"")}" aria-label="${esc(field)}">`;
+    return [
+      row({label:"Display name",trailing:inp("name","e.g. Claude Work")}),
+      row({label:"Base provider",trailing:sel("base_provider",d.base_provider||"custom",PROV_BASE,"Base provider")}),
+      row({label:"Binary path",trailing:inp("binary_path","/usr/local/bin/claude")}),
+      row({label:"Home path",trailing:inp("home_dir","~/.claude")}),
+      row({label:"Shadow home path",trailing:inp("shadow_home_dir","~/.subway/shadow/claude-work")}),
+      row({label:"API Key",detail:isEdit&&existing.has_api_key?"Stored securely (leave blank to keep)":"Stored in Keychain or 0600 secret file",trailing:inp("api_key",isEdit&&existing.has_api_key?"•••••••• (unchanged)":"sk-...","password")}),
+      row({label:"Base URL",trailing:inp("base_url","https://api.anthropic.com")}),
+      row({label:"Default model",trailing:inp("default_model","claude-sonnet-4-5")}),
+      row({label:"Auth mode",trailing:sel("auth_mode",d.auth_mode||"api_key",PROV_AUTH,"Auth mode")}),
+      row({label:isEdit?"Save profile":"Create profile",trailing:`<span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${isEdit&&existing.has_api_key?`<button type="button" class="st-act" data-prov-clearkey="${esc(existing.id)}">Clear key</button>`:""}<button type="button" class="st-act" data-prov-cancel>Cancel</button><button type="button" class="st-act" data-prov-save="${isEdit?esc(existing.id):""}">${isEdit?"Save":"Add provider"}</button></span>`})
+    ];};
+  const instRows=[
+    row({label:"Provider instances",detail:PROV.profErr||(PS.length?`${PS.length} configured`:"No custom or BYOK instances yet"),trailing:`<button type="button" class="st-act" data-prov-add-toggle>${PROV.showAdd?"Close":"+ Add provider / BYOK"}</button>`}),
+    ...(PROV.showAdd?provForm(PROV.draft,null):[]),
+    ...PS.flatMap(p=>{const det=[p.base_provider||"custom",p.default_model,p.has_api_key?"API key set":"",p.base_url].filter(Boolean).join(" · ");
+      const main=row({label:p.name||p.id,detail:det||p.id,trailing:`<span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="st-act" data-prov-edit="${esc(p.id)}">${PROV.editing===p.id?"Close":"Configure"}</button><button type="button" class="st-act st-danger" data-prov-del="${esc(p.id)}">Delete</button>${sw("prov:"+p.id,p.enabled!==false,"Enable "+(p.name||p.id))}</span>`});
+      return PROV.editing===p.id?[main,...provForm(PROV.draft,p)]:[main];})
+  ];
+  const instancesSec={title:"Provider instances / BYOK",rows:instRows,footer:"API keys are stored in macOS Keychain (or a 0600 secret file) and never returned to the HUD."};
   const prow=p=>row({label:p.id,detail:(p.last_probe?`Probe ${p.last_probe.ok?"passed":"failed"} ${ago(p.last_probe.ts)}`:"Not probed yet")+(p.drifted?" · Drifted":""),
     trailing:p.origin==="unmapped"?`<button type="button" class="st-act" data-mapprov="${esc(p.id)}">Map this provider</button>`:`<span class="st-soon">${p.drifted?"Drifted":p.last_probe&&p.last_probe.ok?"OK":"—"}</span>`});
   const grp=(o,title,footer)=>{const rs=L.filter(p=>p.origin===o).map(prow);return rs.length?[{title,rows:rs,footer}]:[];};
+  const acpPumpSec={title:"ACP Session Pump",rows:[
+    row({label:"Persistent ACP pump",detail:"Keep ACP agent sessions warm instead of spawning cold per turn",trailing:sw("acp_pump_enabled",s.acp_pump_enabled!==false,"Persistent ACP pump")}),
+    row({label:"Idle timeout (seconds)",trailing:stepper("acp_pump_idle_seconds",s.acp_pump_idle_seconds,300,30,3600,30)}),
+    row({label:"Pooled sessions",detail:PROV.pumpCount!=null?`${PROV.pumpCount} active`:"Click Refresh to inspect or close all",trailing:`<span style="display:flex;gap:8px;align-items:center"><button type="button" class="st-act" data-pump-refresh>Refresh</button>${actBtn("Close all","/api/acp_pump/close",{})}</span>`})
+  ]};
   const move={title:"Moving a conversation",rows:[
     row({label:"Exchanges carried",detail:"Whole exchanges read back when a conversation moves to another provider (5–20)",trailing:stepper("transplant_turns",s.transplant_turns,12,5,20)}),
     row({label:"Carry the full conversation",detail:"Ignores the number above. Slower, and costs more tokens on the new provider",trailing:sw("transplant_full",s.transplant_full,"Carry the full conversation")})]};
-  const secs=[move,...grp("shipped","Shipped"),...grp("learned","Learned"),...grp("unmapped","Unmapped","Mapping writes a drafting brief; the drafting worker still needs your approval.")];
+  const secs=[instancesSec,acpPumpSec,move,...grp("shipped","Shipped"),...grp("learned","Learned"),...grp("unmapped","Unmapped","Mapping writes a drafting brief; the drafting worker still needs your approval.")];
   return{title:"Providers",back:"",sub:PROV.err||(PROV.list?"":"Loading…"),sections:secs.length?secs:[{rows:[row({label:PROV.loading?"Loading…":"No providers found"})]}]};})(),
  wake:(()=>{ensureWake();
   const muted=WAKE.fast&&Array.isArray(WAKE.fast.muted_senders)?WAKE.fast.muted_senders:[];
@@ -308,7 +386,7 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
       else{const ov=[];if(rd.provider_override&&rd.provider_override[k])ov.push("provider");if(rd.thread_override&&rd.thread_override[k])ov.push("thread");if(ov.length)detail=`Overridden for ${ov.join("/")}`;}
       return row({label:WAKE_LABELS[k]||k,detail,trailing:locked.has(k)?undefined:sw(`wakerule:${k}`,on,WAKE_LABELS[k]||k)});});}
   /* Status: same rows as wakeStatusRows. */
-  let statusRows=[{label:"Loading…"}],note="";
+  let statusRows=[row({label:"Loading…"})],note="";
   if(WAKE.status){const st=WAKE.status;note=st.note||"";statusRows=[];
     for(const[k,v]of Object.entries(st)){if(k==="settings"||k==="note")continue;
       if(k==="fix"&&(!v||(Array.isArray(v)&&!v.length)))continue;
@@ -317,7 +395,7 @@ function pages(){const shapes=s["delegation.shapes"],rounds=s["iteration.max_rou
       else if(k==="tailscale"&&v&&typeof v==="object"&&v.installed===false)detail="Not installed";
       else if(v&&typeof v==="object")detail=Array.isArray(v)?v.join(" · "):(Object.entries(v).filter(([,x])=>x!==""&&x!=null).map(([a,b])=>`${a}: ${b}`).join(" · ")||"None");
       else detail=String(v??"");
-      statusRows.push({label:WAKE_STATUS[k]||k.replace(/_/g," ").replace(/^./,c=>c.toUpperCase()),detail});}}
+      statusRows.push(row({label:WAKE_STATUS[k]||k.replace(/_/g," ").replace(/^./,c=>c.toUpperCase()),detail}));}}
   /* Fast mail: same rows as fastmailRows. */
   let mailRows=[{label:"Loading…"}];
   if(WAKE.fast){const msgs=Array.isArray(WAKE.fast.messages)?WAKE.fast.messages:[];mailRows=[];
@@ -369,21 +447,41 @@ function status(page){host=null;const box=document.createElement("div");box.clas
    <div class="st-card st-state">${state==="error"?`<p class="st-state-t">Couldn't load your settings</p><p class="st-detail">${esc(err)}</p><button type="button" class="st-retry">Try again</button>`
      :`<p class="st-detail">Loading your settings from the HUD…</p>`}</div>`;
   page.replaceChildren(box);box.querySelector(".st-retry")?.addEventListener("click",load);}
+window.addEventListener("subway:lanes",()=>{if(state==="ready"&&isOpen()&&subOf()==="git")render(false);});
 function render(animate){const page=document.getElementById("page");if(state!=="ready"||!s){status(page);return;}
   const sub=subOf();const P=pages()[sub]||pages()[""];
+  queueMicrotask(()=>{if(sub==="git")window.SubwayLanes?.loadLanes?.();window.SubwayLanes?.fillSettingsSlot?.(document.getElementById("page"),s);});
   const focusKey=document.activeElement&&host&&host.contains(document.activeElement)?(document.activeElement.closest("[data-step]")?.dataset.step||document.activeElement.dataset.sel||document.activeElement.dataset.flag||document.activeElement.dataset.text):null;
   const dir=animate&&lastSub!==null&&lastSub!==sub?(sub.length>lastSub.length?1:-1):0;lastSub=sub;
   host=document.createElement("div");host.className="st"+(dir?` in${dir>0?"r":"l"}`:"");
+  const targetOpts=[`<option value="self"${target==="self"?" selected":""}>This station</option>`,`<option value="all"${target==="all"?" selected":""}>All my stations</option>`,...ownPeers.map(p=>{const id=peerId(p),nm=peerName(p);return `<option value="${esc(id)}"${target===id?" selected":""}>${esc(nm)}</option>`;})].join("");
+  const targetBar=`<div class="st-target-bar" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;padding:8px 12px;border-radius:10px;background:var(--surface-2,rgba(128,128,128,0.08));border:1px solid var(--border,rgba(128,128,128,0.18))"><span class="st-label" style="font-size:12px;font-weight:600">Apply to</span><span class="st-sel"><select data-target-sel aria-label="Apply to">${targetOpts}</select>${SI["caret-down"]}</span>${crossNote?`<span class="st-detail" data-cross-note style="font-size:12px;margin-left:auto">${esc(crossNote)}</span>`:""}</div>`;
   host.innerHTML=`<header class="st-head">${P.back!=null?`<a class="st-back" href="#settings${P.back?"/"+P.back:""}">${SI["caret-left"]}<span>${P.back?pages()[P.back].title:"Settings"}</span></a>`:`<div class="eyebrow">Settings</div>`}
-    <h1>${esc(P.title)}</h1>${P.sub?`<p class="st-sub">${esc(P.sub)}</p>`:""}</header>${P.sections.map(section).join("")}`;
+    <h1>${esc(P.title)}</h1>${P.sub?`<p class="st-sub">${esc(P.sub)}</p>`:""}</header>${targetBar}${P.sections.map(section).join("")}`;
   page.replaceChildren(host);
   if(focusKey){const n=host.querySelector(`[data-step="${focusKey}"] input,[data-sel="${focusKey}"],[data-flag="${focusKey}"],[data-text="${focusKey}"]`);n&&n.focus({preventScroll:true});}
   const put=(node,k,v)=>{const p=node.closest("[data-post]")?.dataset.post;if(p)post(p,{[k]:v},nameOf(k));else save({[k]:v});};
   host.addEventListener("change",e=>{const f=e.target.closest("[data-wpfile]");if(!f||!f.files[0])return;const file=f.files[0];const rd=new FileReader();rd.onload=()=>{const b64=String(rd.result).split(",")[1]||"";fetch("/api/wallpaper",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:file.name,data:b64})}).then(r=>r.json()).then(j=>{if(j.ok){const v="custom:"+j.url;save({hud_wallpaper:v});window.applyWallpaper&&window.applyWallpaper(v);}else toast.error("Not uploaded",{description:j.error||"failed"});}).catch(()=>toast.error("Not uploaded",{description:"Couldn't reach the HUD."}));};rd.readAsDataURL(file);});
   host.addEventListener("click",e=>{const lp=e.target.closest("[data-lowpower]");if(lp){window.HudMotion&&window.HudMotion.set(lp.dataset.lowpower);host.querySelectorAll("[data-lowpower]").forEach(b=>b.setAttribute("aria-pressed",String(b===lp)));return;}
     const wp=e.target.closest("[data-wp]");if(wp){save({hud_wallpaper:wp.dataset.wp});window.applyWallpaper&&window.applyWallpaper(wp.dataset.wp);return;}
+    const pat=e.target.closest("[data-prov-add-toggle]");if(pat){PROV.showAdd=!PROV.showAdd;PROV.editing=null;PROV.draft=emptyProvDraft();render(false);return;}
+    const ped=e.target.closest("[data-prov-edit]");if(ped){const id=ped.dataset.provEdit;
+      if(PROV.editing===id){PROV.editing=null;PROV.draft={};}
+      else{const cur=(PROV.profiles||[]).find(x=>x.id===id)||{};PROV.showAdd=false;PROV.editing=id;
+        PROV.draft={name:cur.name||"",base_provider:cur.base_provider||"custom",binary_path:cur.binary_path||"",home_dir:cur.home_dir||"",shadow_home_dir:cur.shadow_home_dir||"",api_key:"",base_url:cur.base_url||"",default_model:cur.default_model||"",auth_mode:cur.auth_mode||"api_key"};}
+      render(false);return;}
+    const pc=e.target.closest("[data-prov-cancel]");if(pc){PROV.showAdd=false;PROV.editing=null;PROV.draft={};render(false);return;}
+    const ps=e.target.closest("[data-prov-save]");if(ps){const id=ps.dataset.provSave||"";
+      const body={action:id?"update":"add",...(id?{id}:{}),...PROV.draft};
+      if(id&&!String(body.api_key||"").trim())delete body.api_key;
+      provPost(body,body.name||id||"Provider").then(ok=>{if(ok){PROV.showAdd=false;PROV.editing=null;PROV.draft={};render(false);}});return;}
+    const pck=e.target.closest("[data-prov-clearkey]");if(pck){provPost({action:"update",id:pck.dataset.provClearkey,api_key:""},"API key").then(ok=>{if(ok)render(false);});return;}
+    const pdl=e.target.closest("[data-prov-del]");if(pdl){
+      if(pdl.dataset.armed!=="1"){pdl.dataset.armed="1";pdl.textContent="Confirm";return;}
+      provPost({action:"delete",id:pdl.dataset.provDel},"Provider").then(ok=>{if(ok&&PROV.editing===pdl.dataset.provDel){PROV.editing=null;PROV.draft={};}render(false);});return;}
     const mp=e.target.closest("[data-mapprov]");if(mp){fetch("/api/transplant/map",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({provider:mp.dataset.mapprov})}).then(r=>r.json()).then(j=>{if(j.ok)toast.success("Brief ready",{description:"Ask Subway to spin the drafter, or approve it in Workers."});else toast.error("Not mapped",{description:j.reason||j.error||"failed"});}).catch(()=>toast.error("Not mapped",{description:"Couldn't reach the HUD."})).finally(()=>{PROV.list=null;loadProvidersPage();});return;}
     const ab=e.target.closest("[data-act]");if(ab){post(ab.dataset.act,JSON.parse(ab.dataset.body||"{}"),ab.textContent.trim());return;}
+    const prf=e.target.closest("[data-pump-refresh]");if(prf){fetch("/api/acp_pump").then(r=>r.json()).then(d=>{PROV.pumpCount=d.active_sessions;render(false);}).catch(()=>toast.error("ACP pump",{description:"Couldn't reach the HUD."}));return;}
     const askB=e.target.closest("[data-ask]");if(askB){if(askB.dataset.armed){post("/api/settings",{[askB.dataset.ask]:true},"Terminal commands");}
       else{askB.dataset.armed="1";askB.textContent="Confirm";}return;}
     const rm=e.target.closest("[data-chiprm]");if(rm){chipSave(rm.dataset.chiprm,s[rm.dataset.chiprm]||[],rm.dataset.val,false);return;}
@@ -394,12 +492,16 @@ function render(animate){const page=document.getElementById("page");if(state!=="
       else if(k.startsWith("notify:")){const id=k.slice(7),cur=Array.isArray(s.notification_targets)?s.notification_targets:[];const t=cur.includes(id)?cur.filter(x=>x!==id):[...cur,id];save({notification_targets:t});}
       else if(k.startsWith("governor:")){const p=k.slice(9);save({governor_provider:p,governor_provider_on:s[`governor_${p}`]===false});}
       else if(k.startsWith("wakerule:")){post("/api/wake_rules",{rules:{[k.slice(9)]:{wake:f.getAttribute("aria-checked")!=="true"}}}).then(loadWakeData);return;}
+      else if(k.startsWith("prov:")){provPost({action:"toggle",id:k.slice(5),enabled:f.getAttribute("aria-checked")!=="true"},"Provider");return;}
       else save({[k]:!s[k]});return;}
     const mm=e.target.closest("[data-mailmute]");if(mm){post("/api/fastmail/mute",{station_id:mm.dataset.mailmute},"Fast mail").then(loadWakeData);return;}
     const b=e.target.closest("[data-step] button");if(b){const w=b.closest("[data-step]"),inp=w.querySelector("input");
       const by=+w.dataset.by,min=+w.dataset.min,max=+w.dataset.max;const cur=inp.value===""?+inp.placeholder:+inp.value;
       put(w,w.dataset.step,Math.max(min,Math.min(max,cur+by*+b.dataset.d)));}});
+  host.addEventListener("input",e=>{const pf=e.target.closest("[data-prov-field]");if(pf)PROV.draft[pf.dataset.provField]=pf.value;});
   host.addEventListener("change",e=>{const t=e.target;
+    if(t.matches("[data-target-sel]")){target=t.value||"self";crossNote="";render(false);return;}
+    if(t.dataset.provField){PROV.draft[t.dataset.provField]=t.value;return;}
     if(t.dataset.sel&&t.dataset.sel.startsWith("replystyle:")){save({reply_style_provider:t.dataset.sel.slice(11),reply_style_value:t.value});}
     else if(t.dataset.sel)put(t,t.dataset.sel,t.dataset.post?t.value:(/^\d+$/.test(t.value)?+t.value:t.value));
     else if(t.dataset.text!=null)put(t,t.dataset.text,t.value.trim());

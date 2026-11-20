@@ -1,6 +1,13 @@
-"""Native macOS Keychain storage for Subway MCP credentials."""
+"""Secret storage for Subway MCP credentials.
+
+macOS stores secrets in the native Keychain (ctypes SecItem calls). Windows and
+Linux have no single OS keychain Subway can rely on, so they fall back to a
+0600-permission file store under ~/.subway/secrets/ — best effort, but it keeps
+OAuth flows working instead of raising NotImplementedError on every call.
+"""
 
 import ctypes
+import os
 import sys
 
 
@@ -307,10 +314,72 @@ def _create_secret_data(cf, secret: bytes) -> int:
     return secret_data
 
 
+class _FileBackend:
+    """File-backed secret store for platforms without a native keychain.
+
+    Mirrors _CtypesBackend's status semantics: 0 on success,
+    _ERR_SEC_ITEM_NOT_FOUND (-25300) when the item does not exist.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self._dir = directory
+        try:
+            os.makedirs(self._dir, mode=0o700, exist_ok=True)
+            os.chmod(self._dir, 0o700)
+        except OSError:
+            pass  # Best effort: a read-only or exotic home dir still beats a hard crash.
+
+    def _path(self, service: str, account: str) -> str:
+        raw = f"{service}.{account}"
+        safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in raw)
+        return os.path.join(self._dir, safe + ".secret")
+
+    def _write(self, path: str, secret: bytes) -> None:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(secret)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+
+    def add(self, service: str, account: str, secret: bytes, label: str = "") -> int:
+        self._write(self._path(service, account), secret)
+        return 0
+
+    def update(self, service: str, account: str, secret: bytes) -> int:
+        self._write(self._path(service, account), secret)
+        return 0
+
+    def copy(self, service: str, account: str) -> tuple[int, bytes | None]:
+        try:
+            with open(self._path(service, account), "rb") as fh:
+                return 0, fh.read()
+        except FileNotFoundError:
+            return _ERR_SEC_ITEM_NOT_FOUND, None
+
+    def delete(self, service: str, account: str) -> int:
+        try:
+            os.remove(self._path(service, account))
+        except FileNotFoundError:
+            return _ERR_SEC_ITEM_NOT_FOUND
+        return 0
+
+
+def _secrets_dir() -> str:
+    override = os.environ.get("SUBWAY_DIR", "").strip()
+    base = override if override else os.path.join(os.path.expanduser("~"), ".subway")
+    return os.path.join(base, "secrets")
+
+
 def _get_backend():
     global _backend
     if _backend is None:
-        _backend = _CtypesBackend()
+        if sys.platform == "darwin":
+            _backend = _CtypesBackend()
+        else:
+            _backend = _FileBackend(_secrets_dir())
     return _backend
 
 
@@ -320,7 +389,6 @@ def _set_backend(backend) -> None:
 
 
 def set_secret(service: str, account: str, secret: bytes) -> None:
-    _require_macos()
     _validate_identity(service, account)
     _validate_secret(secret)
     backend = _get_backend()
@@ -332,7 +400,6 @@ def set_secret(service: str, account: str, secret: bytes) -> None:
 
 
 def get_secret(service: str, account: str) -> bytes | None:
-    _require_macos()
     _validate_identity(service, account)
     status, secret = _get_backend().copy(service, account)
     if status == _ERR_SEC_ITEM_NOT_FOUND:
@@ -343,7 +410,6 @@ def get_secret(service: str, account: str) -> bytes | None:
 
 
 def delete_secret(service: str, account: str) -> None:
-    _require_macos()
     _validate_identity(service, account)
     status = _get_backend().delete(service, account)
     if status not in (0, _ERR_SEC_ITEM_NOT_FOUND):

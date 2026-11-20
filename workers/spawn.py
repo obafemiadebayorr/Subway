@@ -256,7 +256,10 @@ def route_task(prompt: str, role: str = "", private: bool = False, god: bool = F
 
 _ROLE_PATTERNS = (
     ("orchestrator", re.compile(r"orchestrat|\blead\b|coordinator", re.I)),
-    ("research", re.compile(r"plan|planner|investigat|triage|diagnos|research|survey|measure|analys", re.I)),
+    # B3c: auditor-flavored roles (hunter/sweep/bug-bounty/xss) are research — they read
+    # all day and never edit; classifying them as builders got them killed by the
+    # progress guard at 'N tool calls and no edits' before finishing their sweep.
+    ("research", re.compile(r"plan|planner|investigat|triage|diagnos|research|survey|measure|analys|scan|market|competit|look ?up|find out|explore|web search|scrape|hunt|sweep|bug[ -]?bounty|\bxss\b", re.I)),
     ("reviewer", re.compile(r"review|audit|verif", re.I)),
 )
 # Tools each role must NOT have. Fewer tools = smaller prompt each call, and no accidental edits.
@@ -267,11 +270,14 @@ ROLE_DISALLOWED_TOOLS = {
     "orchestrator": ["Edit", "Write", "MultiEdit", "NotebookEdit"],
 }
 
-def role_kind(role: str, caps: List[str]) -> str:
+def role_kind(role: str, caps: List[str], prompt: str = "") -> str:
     """builder | reviewer | research | orchestrator, from the role text and capabilities."""
     for kind, rx in _ROLE_PATTERNS:
         if rx.search(role or ""):
             return kind
+    low = (prompt or "").lower()
+    if "no code edits" in low or "research task" in low:
+        return "research"
     return "builder" if "files:write" in (caps or []) else "orchestrator"
 
 
@@ -337,7 +343,7 @@ def _worker_command(provider: str, bin_path: str, model: str, effort: str, god: 
         if effort:  # Only send --effort when the model actually has levels.
             cmd.extend(["--effort", effort])
         cmd.extend(["--output-format", "stream-json", "--verbose"])
-        _deny = ROLE_DISALLOWED_TOOLS.get(role_kind(role, caps), [])
+        _deny = ROLE_DISALLOWED_TOOLS.get(role_kind(role, caps, prompt), [])
         if _deny:
             cmd.extend(["--disallowedTools", ",".join(_deny)])
         if thread_id:
@@ -452,6 +458,147 @@ for _mod in ("workers", "workers.routing", "server"):
         setattr(sys.modules[_mod], "_worker_command", _worker_command)
 
 
+def _coerce_sandbox_policy(raw: Any) -> Optional[Any]:
+    """Convert a dict or SandboxPolicy into a SandboxPolicy instance."""
+    if raw is None:
+        return None
+    import sandbox
+
+    if isinstance(raw, sandbox.SandboxPolicy):
+        return raw
+    if isinstance(raw, dict):
+        kwargs = dict(raw)
+        for tuple_field in ("writable_roots", "allow_domains", "excluded_commands"):
+            if tuple_field in kwargs and isinstance(kwargs[tuple_field], list):
+                kwargs[tuple_field] = tuple(kwargs[tuple_field])
+        return sandbox.SandboxPolicy(**kwargs)
+    return raw
+
+
+def resolve_worker_sandbox_policy(
+    workdir: str,
+    *,
+    from_link: bool = False,
+    peer_sandbox: str = "",
+    peer_relation: str = "own",
+    requested: Any = None,
+    provider: str = "",
+) -> Optional[Any]:
+    """Resolve and clamp the SandboxPolicy for a worker from settings and peer/local context."""
+    import sandbox
+
+    try:
+        from hud_server import settings_api as _settings
+
+        raw_exec = _settings.value("sandbox.exec_default")
+        raw_net = _settings.value("sandbox.net_default")
+        raw_domains = _settings.value("sandbox.allow_domains")
+        raw_fallback = _settings.value("sandbox.unsandboxed_fallback")
+        raw_state = _settings.value("sandbox.state_mode")
+    except Exception:
+        raw_exec = raw_net = raw_domains = raw_fallback = raw_state = None
+
+    exec_default = str(raw_exec or "").strip() or ("os" if from_link else "off")
+    net_default = str(raw_net or "").strip() or "off"
+    state_mode = str(raw_state or "").strip() or "live"
+    unsandboxed_fallback = bool(raw_fallback)
+
+    if isinstance(raw_domains, str):
+        allow_domains: Tuple[str, ...] = tuple(d.strip() for d in raw_domains.split(",") if d.strip())
+    elif isinstance(raw_domains, (list, tuple)):
+        allow_domains = tuple(str(d).strip() for d in raw_domains if str(d).strip())
+    else:
+        allow_domains = ()
+
+    req_policy = _coerce_sandbox_policy(requested)
+
+    if not from_link and not peer_sandbox:
+        if exec_default == "off" and state_mode == "live" and req_policy is None:
+            return None
+
+    local_ports = (11434,) if str(provider or "").strip().lower() == "local" else ()
+    floor_exec = (str(peer_sandbox).strip() or "os") if (from_link or peer_sandbox) else exec_default
+    host_floor = sandbox.SandboxPolicy(
+        exec_sandbox=floor_exec,
+        net_policy=net_default,
+        state_mode=state_mode,
+        writable_roots=(workdir,) if workdir else (),
+        allow_domains=allow_domains,
+        unsandboxed_fallback=unsandboxed_fallback,
+        local_allow_ports=local_ports,
+    )
+    return sandbox.clamp_policy(
+        host_floor,
+        req_policy,
+        relation=peer_relation,
+        is_remote=from_link,
+    )
+
+
+# Provider-specific API keys and tokens preserved when sandboxing scrubs the environment
+_PROVIDER_PRESERVED_ENV_KEYS: Dict[str, Tuple[str, ...]] = {
+    "pi": (
+        "DEEPAI_API_KEY",
+        "PI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+    ),
+    "claude": ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "opencode": (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPAI_API_KEY",
+    ),
+    "copilot": ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+    "codex": ("OPENAI_API_KEY",),
+    "antigravity": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+}
+
+
+def apply_sandbox_to_cmd(
+    cmd: List[str],
+    env: Dict[str, str],
+    workdir: str,
+    *,
+    sandbox_policy: Any = None,
+    provider: str = "",
+    proxy_port: Optional[int] = None,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Optionally wrap a worker command and environment with OS/state sandboxing."""
+    if sandbox_policy is None:
+        return list(cmd), dict(env)
+
+    import sandbox
+
+    policy = _coerce_sandbox_policy(sandbox_policy)
+    if getattr(policy, "exec_sandbox", None) in ("os", "vm"):
+        merged_env = sandbox.scrub_env(env)
+        allowed_keys = _PROVIDER_PRESERVED_ENV_KEYS.get(provider, ())
+        for k in allowed_keys:
+            if k in env:
+                merged_env[k] = env[k]
+    else:
+        merged_env = dict(env)
+    state_mode = getattr(policy, "state_mode", None)
+    if provider == "copilot" and "--sandbox" in cmd and state_mode != "dry_run":
+        _, env_overrides = sandbox.wrap_command(list(cmd), policy, workdir, proxy_port=proxy_port)
+        if env_overrides:
+            merged_env.update(env_overrides)
+        return list(cmd), merged_env
+
+    wrapped_cmd, env_overrides = sandbox.wrap_command(list(cmd), policy, workdir, proxy_port=proxy_port)
+    if env_overrides:
+        merged_env.update(env_overrides)
+    return list(wrapped_cmd), merged_env
+
+
+_apply_sandbox_to_cmd = apply_sandbox_to_cmd
+
+
 
 
 def _thread_finished(worker_id: str, meta: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -474,6 +621,43 @@ def _thread_finished(worker_id: str, meta: Dict[str, Any], result: Dict[str, Any
             "completed_at": finished_at.isoformat(), "duration_s": duration_s})
     except Exception:
         pass
+    with contextlib.suppress(Exception):
+        done_meta = _s._load_worker(worker_id) or (dict(meta) if isinstance(meta, dict) else {})
+        if worker_id and not done_meta.get("id"):
+            done_meta["id"] = worker_id
+        _flush_deferred_collect(done_meta)
+    with contextlib.suppress(Exception):
+        done_meta = _s._load_worker(worker_id) or (dict(meta) if isinstance(meta, dict) else {})
+        if worker_id and not done_meta.get("id"):
+            done_meta["id"] = worker_id
+        caller = (done_meta.get("caller_chat_id")
+                  or done_meta.get("parent_chat_id")
+                  or done_meta.get("from_chat"))
+        if caller:
+            notified = set(done_meta.get("completion_notified_chats") or [])
+            if caller not in notified:
+                st = (result or {}).get("status") or done_meta.get("status") or "completed"
+                ec = (result or {}).get("exit_code")
+                if ec is None:
+                    ec = done_meta.get("exit_code")
+                role = done_meta.get("role") or "worker"
+                report = (result or {}).get("report") or done_meta.get("report") or ""
+                if not report:
+                    report = (result or {}).get("reason") or done_meta.get("reason") or ""
+                rep_tail = _s.one_line(str(report or ""), 160)
+                text = f"Worker {worker_id} ({role}) finished with status '{st}' (exit {ec}): {rep_tail}"
+                send_fn = getattr(_s, "t_send_note", None)
+                if not send_fn:
+                    with contextlib.suppress(Exception):
+                        from cli_tools.notes import t_send_note as send_fn
+                if send_fn:
+                    send_fn(to=caller, text=text, from_chat=worker_id)
+                notified.add(caller)
+                done_meta["completion_notified_chats"] = list(notified)
+                with contextlib.suppress(Exception):
+                    stored = _s._load_worker(worker_id) or {}
+                    stored["completion_notified_chats"] = list(notified)
+                    _s._save_worker(stored)
 
 
 
@@ -631,10 +815,18 @@ def retry_swarm_pending(force: bool = False) -> List[str]:
             with open(fp, "r", encoding="utf-8") as fh:
                 kw = json.load(fh)
             kw.pop("parked_at", None)
+            link_origin = kw.pop("link_origin", None)
             os.remove(fp)  # t_spin_worker parks it again under a new id if the station is still offline
         except (OSError, ValueError):
             continue
         res = t_spin_worker(**kw)
+        if link_origin and not str(res).startswith("Queued as swarm_pending"):
+            m = re.search(r"worker_[0-9a-f]{6,}", str(res))
+            if m:
+                wmeta = _s._load_worker(m.group(0))
+                if wmeta:
+                    wmeta["link_origin"] = link_origin
+                    _s._save_worker(wmeta)
         if not str(res).startswith("Queued as swarm_pending"):
             note = f"{name[:-5]} ({kw.get('swarm_station')}): {str(res).splitlines()[0][:160]}"
             notes.append(note)
@@ -644,6 +836,66 @@ def retry_swarm_pending(force: bool = False) -> List[str]:
             except OSError:
                 pass
     return notes
+
+
+def token_cap_for(max_tokens, mode=None, lo=None, hi=None):
+    """(cap, note) for a new worker under the worker_budget_mode setting: none | auto | range."""
+    if mode is None:
+        try:
+            from hud_server import settings_api as _settings
+            mode = _settings.value("worker_budget_mode")
+            lo = _settings.value("worker_budget_min")
+            hi = _settings.value("worker_budget_max")
+        except Exception:
+            mode = "auto"
+    mode = str(mode or "auto").strip().lower()
+    asked = max(0, int(max_tokens or 0))
+    if mode == "none":
+        return 0, ("token cap removed (Settings: no cap)" if asked else "")
+    if mode != "range":
+        return asked, ""
+    lo, hi = int(lo or 200000), int(hi or 1000000)
+    if lo > hi:
+        lo, hi = hi, lo
+    cap = hi if not asked else min(max(asked, lo), hi)
+    return cap, ("" if cap == asked else f"token cap set to {cap:,} (Settings range {lo:,}-{hi:,})")
+
+
+_TOP_TIER_MARKS = ("opus", "fable")
+
+
+def approval_decision(mode, isolate=False, caps=(0, 0, 0), model=""):
+    """(launch_now, why) for the launch_approval_local setting: ask | auto | never."""
+    mode = str(mode or "ask").strip().lower()
+    if mode == "never":
+        return True, "approval before launch is off"
+    if mode != "auto":
+        return False, ""
+    names = ("token cap", "time cap", "tool-call cap")
+    missing = ([] if isolate else ["not isolated"]) + [f"no {n}" for n, v in zip(names, caps) if not int(v or 0)]
+    if any(m in str(model or "").lower() for m in _TOP_TIER_MARKS):
+        missing.append(f"top-tier model {model}")
+    if missing:
+        return False, ", ".join(missing)
+    return True, "auto-approved: isolated, capped, not top-tier"
+
+
+def _git_branch_label(path: str) -> str:
+    """Return the active git branch name for ``path``, or ``""`` on non-git dirs or errors."""
+    if not path or not os.path.isdir(path):
+        return ""
+    try:
+        res = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if res.returncode != 0:
+            return ""
+        return (res.stdout or "").strip()
+    except Exception:
+        return ""
 
 
 def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "main",
@@ -661,12 +913,38 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
                   wait: bool = False, wait_timeout_seconds: int = 0,
                   doctor: str = "", doctor_budget: int = 0,
                   units: Optional[List[Dict[str, Any]]] = None,
-                  _unit_step: bool = False, station: str = "", from_link: bool = False, swarm_station: str = "") -> str:
+                  _unit_step: bool = False, station: str = "", from_link: bool = False, swarm_station: str = "",
+                  lane: str = "", kind: str = "",
+                  session_id: str = "", session_sender: str = "",
+                  peer_sandbox: str = "", peer_relation: str = "own",
+                  sandbox_policy: Any = None) -> str:
     """Queue a worker for user approval. Agents can request workers, but only the user can launch them.
 
     wait=True makes this the native subagent shape: the call returns when the worker is done,
     with the worker's own report, instead of leaving the caller to look for it later.
     """
+    if session_id and session_sender:
+        try:
+            from hud_server import session_quota as _sq
+            if not _sq.check_or_stop(session_id, session_sender):
+                try:
+                    from hud_server import collab_api as _ca
+                    with _ca._LOCK:
+                        _s_doc = _ca._load()
+                        if _s_doc is not None and str(_s_doc.get("id")) == str(session_id):
+                            events = _s_doc.setdefault("cap_events", [])
+                            events.append({"sender": str(session_sender), "at": __import__("time").time(),
+                                           "kind": "cap_stop"})
+                            _s_doc["cap_events"] = events[-20:]
+                            _ca._save(_s_doc)
+                            _ca._fanout(_s_doc)
+                except Exception:
+                    pass
+                return (f"Error: lending cap reached for sender '{session_sender}' in session "
+                        f"'{session_id}'. No provider call was made. Both sides were notified via the session.")
+        except Exception:
+            return f"Error: could not verify lending cap for session '{session_id}'; refusing to dispatch."
+    max_tokens, _cap_note = token_cap_for(max_tokens)
     if station:
         import peers as _peers
         det = _s._detected_chat()
@@ -702,6 +980,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     provider, model, doctor = _doctor_launch_overrides(provider, model, doctor)
     if not role or (not prompt and not units):
         return "Error: role and prompt are required."
+    if project_dir and not os.path.isdir(os.path.expanduser(project_dir)):
+        return f"[ERROR] project_dir does not exist: {project_dir}"
     from hud_server import settings_api as _shapes
     if not _unit_step and str(_s._self_id() or "").startswith("worker_") and not _shapes.shape_enabled("tree"):
         return "Error: sub-workers (tree shape) are turned off in Settings > Workers > Delegation."
@@ -733,7 +1013,58 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
 
     cwd = os.path.realpath(os.path.expanduser(project_dir)) if project_dir else os.getcwd()
     if not os.path.isdir(cwd):
-        return f"Error: project_dir '{project_dir}' does not exist."
+        return f"[ERROR] project_dir does not exist: {project_dir or cwd}"
+
+    lane_arg = str(lane or "").strip()
+    kind_arg = str(kind or "").strip()
+    lane_origin_dir = cwd
+    resolved_lane: Optional[Dict[str, Any]] = None
+    try:
+        import lanes as _lanes
+    except ImportError:
+        _lanes = None
+    if _lanes is not None:
+        try:
+            resolved_lane = _lanes.resolve(lane_origin_dir, lane_arg or None, thread or None)
+        except Exception as exc:
+            if lane_arg:
+                return f"Error: {exc}"
+            resolved_lane = None  # no lane asked for: lanes are optional, never block a spin
+        if lane_arg and resolved_lane is None:
+            try:
+                _ldata = _lanes.load(lane_origin_dir) or {}
+                _lnames = [str(_l.get("name")) for _l in (_ldata.get("lanes") or []) if isinstance(_l, dict) and _l.get("name")]
+            except Exception:
+                _lnames = []
+            _avail = ", ".join(_lnames) if _lnames else "(none)"
+            return f"No lane '{lane_arg}'. Lanes: {_avail}"
+        if resolved_lane is not None:
+            _lrole = str(resolved_lane.get("role") or "")
+            _lfrozen = bool(resolved_lane.get("frozen")) if "frozen" in resolved_lane else (_lrole == "ship")
+            if _lrole == "ship" and _lfrozen:
+                _is_fix = kind_arg.lower() == "fix" or bool(
+                    re.search(r"\b(fix|bug|regression|failing test|hotfix)\b", f"{role}\n{original_prompt}", re.IGNORECASE)
+                )
+                if not _is_fix:
+                    _dev_name = ""
+                    try:
+                        _ldata = _lanes.load(lane_origin_dir) or {}
+                        for _l in (_ldata.get("lanes") or []):
+                            if isinstance(_l, dict) and _l.get("role") == "dev" and _l.get("name"):
+                                _dev_name = str(_l["name"])
+                                break
+                    except Exception:
+                        pass
+                    _lname = str(resolved_lane.get("name") or lane_arg)
+                    if _dev_name:
+                        return f"Lane {_lname} is frozen for release: only fixes land there. Use lane='{_dev_name}' or kind='fix'."
+                    return f"Lane {_lname} is frozen for release: only fixes land there. Use kind='fix'."
+            if _lrole != "main":
+                _lwt = str(resolved_lane.get("worktree") or "").strip()
+                if _lwt:
+                    if not os.path.isdir(_lwt):
+                        return f"Error: lane '{resolved_lane.get('name')}' worktree '{_lwt}' does not exist."
+                    cwd = os.path.realpath(_lwt)
 
     unit_meta: Optional[Dict[str, Any]] = None
     if units is not None:
@@ -837,6 +1168,27 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         needs = list(needs or [])
         if "desktop" not in needs:
             needs.append("desktop")
+
+    auto_lent = []
+    try:
+        import mcp_hub as _mcp_hub_auto
+        _specs = _mcp_hub_auto.discover_servers(project_dir=cwd) or {}
+        _skip = {"github", "desktop", "pdf", "paper", "linear"}
+        _names = set()
+        for _key, _spec in _specs.items():
+            for _cand in (_key, (_spec or {}).get("name"), (_spec or {}).get("key")):
+                if _cand:
+                    _names.add(_cand)
+        for _name in sorted(_names):
+            if str(_name).lower() in _skip:
+                continue
+            if re.search(rf"\b{re.escape(_name)}\b", prompt or "", re.I):
+                needs = list(needs or [])
+                if _name not in needs:
+                    needs.append(_name)
+                    auto_lent.append(_name)
+    except Exception:
+        auto_lent = []
 
     hub_needs = None
     if needs is not None:
@@ -1118,8 +1470,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "capabilities": capabilities,
         "needs": list(hub_needs) if hub_needs is not None else None,
         "borrowed_skills": borrowed_skills or None,
-        "role_kind": role_kind(role, capabilities or []),
-        "disallowed_tools": ROLE_DISALLOWED_TOOLS.get(role_kind(role, capabilities or []), []),
+        "role_kind": role_kind(role, capabilities or [], prompt),
+        "disallowed_tools": ROLE_DISALLOWED_TOOLS.get(role_kind(role, capabilities or [], prompt), []),
         "skip_permissions": any(f in cmd for f in ("--dangerously-skip-permissions", "--auto", "--allow-all-tools")),
         "budget": {
             "session_pct": budget_session_pct,
@@ -1133,6 +1485,11 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "track": track,
         "project_dir": cwd,
         "thread": thread_id,
+        "lane": str(resolved_lane.get("name") or "") if resolved_lane else "",
+        **({"lane_role": str(resolved_lane.get("role") or ""),
+            "lane_worktree": str(resolved_lane.get("worktree") or ""),
+            "lane_branch": str(resolved_lane.get("branch") or ""),
+            "lane_project_dir": lane_origin_dir} if resolved_lane else {}),
         "launched_by": _s._self_id(),
         "swarm_id": swarm_id,
         "isolate": bool(isolate),
@@ -1172,6 +1529,8 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
             "skills": list(skills) if skills is not None else None,
             "doctor": doctor_mode,
             "doctor_budget": doctor_budget,
+            "lane": lane_arg or (str(resolved_lane.get("name") or "") if resolved_lane else ""),
+            "kind": kind_arg,
         },
         "code_hashes": file_hashes,
         "code_ranges": code_ranges,
@@ -1202,6 +1561,22 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         meta["approved_by"] = f"lineage:{lineage_parent['id']}"
     if unit_meta:
         meta["unit"] = unit_meta
+    resolved_sandbox_policy = resolve_worker_sandbox_policy(
+        cwd,
+        from_link=from_link,
+        peer_sandbox=peer_sandbox,
+        peer_relation=peer_relation,
+        requested=sandbox_policy,
+        provider=provider,
+    )
+    if resolved_sandbox_policy is not None:
+        import dataclasses
+
+        meta["sandbox_policy"] = (
+            dataclasses.asdict(resolved_sandbox_policy)
+            if dataclasses.is_dataclass(resolved_sandbox_policy)
+            else resolved_sandbox_policy
+        )
     thread_override = _s._THREAD_PARENT.get()
     thread_extra: Dict[str, Any] = {}
     thread_kind: str = "spawned"
@@ -1248,8 +1623,13 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
         "No budget set for this worker. Ask your user whether they want one before it starts.\n")
     thin_brief = _thin_brief_warning(prompt, capabilities) if _code_packet_mode() != "off" else ""
     overshoot = _overshoot_warning(selected_provider, target_model, chosen_effort, int(max_tokens or 0))
-    queued = (f"{attach_warn}{god_warning}{overshoot}{thin_brief}[APPROVAL REQUIRED] Worker `{worker_id}` is queued in PENDING APPROVAL state.\n"
+    repo_name = os.path.basename(cwd.rstrip("/\\")) or cwd
+    branch_label = _git_branch_label(cwd)
+    repo_label = f"{repo_name} ({branch_label})" if branch_label else repo_name
+    lent_line = f"Lent hub servers from the brief: {', '.join(auto_lent)}\n" if auto_lent else ""
+    queued = (f"{attach_warn}{god_warning}{overshoot}{thin_brief}{lent_line}[APPROVAL REQUIRED] Worker `{worker_id}` is queued in PENDING APPROVAL state.\n"
             f"- Role: **{role}**\n"
+            f"- Repo: {repo_label}\n"
             f"- Target Provider: **{selected_provider.upper()}**\n"
             f"- Why this agent: {meta['route']}\n"
             f"- Model: **{target_model}** | Effort: **{chosen_effort or 'none'}** | Mode: **{meta['mode']}**\n"
@@ -1264,15 +1644,19 @@ def t_spin_worker(role: str, prompt: str, provider: str = "auto", track: str = "
     if not from_link and meta.get("mode") != "god":
         try:
             from hud_server import settings_api as _settings
-            auto_local = _settings.value("launch_approval_local") == "auto"
+            approval_mode = str(_settings.value("launch_approval_local") or "ask")
         except Exception:
-            auto_local = False
+            approval_mode = "ask"
+        auto_local, approval_why = approval_decision(approval_mode, isolate=isolate, caps=(max_tokens, max_seconds, max_tool_calls),
+                                                     model=target_model)
+        if not auto_local and approval_why:
+            queued += f"\n\nAuto approval asked anyway: {approval_why}."
         if auto_local:
             _s._thread_record(_s._thread_root(_s._load_worker(worker_id) or {"id": worker_id}), "approved", worker_id,
-                              data={"by": "setting: launch approval off"})
+                              data={"by": f"setting: {approval_why}"})
             launched = _s._launch_worker(worker_id)
             text = (f"[LAUNCHED] Worker `{worker_id}` ({role}, {selected_provider.upper()} {target_model}) launched at once: "
-                    f"approval before launch is off in Settings → Workers.\n{launched}")
+                    f"{approval_why} (Settings → Workers).\n- Repo: {repo_label}\n{launched}")
             if preflight_lines:
                 text += "\n\n- Preflight:\n" + "\n".join(f"  - {line}" for line in preflight_lines)
             return _await_block(text, worker_id, wait, wait_timeout_seconds)
@@ -1495,7 +1879,10 @@ def _link_or_copy_dir_fallback(src: str, dst: str) -> None:
 def _prepare_worktree(meta: Dict[str, Any]) -> None:
     """Give a worker its own copy of the repo, including uncommitted work, so workers can't overwrite each other."""
     repo = _s._git(meta["project_dir"], "rev-parse", "--show-toplevel")
-    base = _worktree_base(repo)
+    if meta.get("lane") and meta.get("lane_role") != "main":
+        base = _s._git(repo, "rev-parse", "HEAD")
+    else:
+        base = _worktree_base(repo)
     path = os.path.join(_s.SUBWAY_DIR, "worktrees", meta["id"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cfg = _s._load_json("config.json")
@@ -1510,7 +1897,7 @@ def _prepare_worktree(meta: Dict[str, Any]) -> None:
         meta["hold_for_peer"] = True
         meta["origin"] = {"station": swarm.get("station"), "peer_id": swarm.get("peer_id"), "billing_mode": "C",
                           "requested_by": swarm.get("requested_by", ""), "paid_by": "self"}
-    branch_mode = bool(cfg.get("git_branch_mode") or meta.get("branch_mode") or swarm)
+    branch_mode = bool(cfg.get("git_branch_mode") or meta.get("branch_mode") or swarm or (meta.get("lane") and meta.get("lane_role") != "main"))
     if os.path.exists(path):
         raise OSError(f"{path} already exists from an earlier launch of {meta['id']}. "
                       f"If no worker runs there, remove it with `git worktree remove --force {path}`.")
@@ -1742,7 +2129,94 @@ def _worker_commit_summary(repo: str, base: str, branch: str, role: str, wid: st
     return subject, summary
 
 
-def _merge_worker_branch(repo: str, branch: str, base: str, role: str, wid: str) -> Tuple[bool, str]:
+def _forward_port_ship_to_dev(ship_lane: Dict[str, Any], origin_dir: str, wid: str,
+                               meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """After a merge into a ship lane, forward-port its branch into every dev lane."""
+    cfg = _s._load_json("config.json") or {}
+    try:
+        from hud_server import settings_api as _settings_api
+        fp_enabled = bool(_settings_api.value("lanes_forward_port", cfg))
+    except Exception:
+        fp_enabled = cfg.get("lanes_forward_port", True) is not False
+    if not fp_enabled:
+        return None
+    try:
+        import lanes as _lanes
+        data = _lanes.load(origin_dir) or {}
+    except Exception:
+        return None
+    dev_lanes = [l for l in (data.get("lanes") or []) if isinstance(l, dict) and l.get("role") == "dev"]
+    if not dev_lanes:
+        return None
+    ship_name = str(ship_lane.get("name") or "")
+    ship_wt = str(ship_lane.get("worktree") or "")
+    ship_branch = str(ship_lane.get("branch") or "")
+    if not ship_branch and ship_wt and os.path.isdir(ship_wt):
+        with contextlib.suppress(Exception):
+            ship_branch = _s._git(ship_wt, "rev-parse", "--abbrev-ref", "HEAD")
+    if not ship_branch:
+        return None
+    results: List[Dict[str, Any]] = []
+    for dev in dev_lanes:
+        dev_name = str(dev.get("name") or "")
+        dev_wt = str(dev.get("worktree") or "")
+        if not dev_wt or not os.path.isdir(dev_wt):
+            continue
+        st_proc = subprocess.run(
+            ["git", "-C", dev_wt, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=30,
+        )
+        dirty_lines = [ln for ln in (st_proc.stdout or "").splitlines() if ln.strip() and not ln.startswith("??")]
+        if dirty_lines:
+            dirty_files = [ln[3:].strip() for ln in dirty_lines]
+            results.append({"lane": dev_name, "status": "skipped_dirty", "files": dirty_files})
+            continue
+        mproc = subprocess.run(
+            ["git", "-C", dev_wt, "merge", "--no-ff", "--no-edit", ship_branch],
+            capture_output=True, text=True, timeout=60,
+        )
+        if mproc.returncode == 0:
+            results.append({"lane": dev_name, "status": "merged", "files": []})
+        else:
+            cf_proc = subprocess.run(
+                ["git", "-C", dev_wt, "diff", "--name-only", "--diff-filter=U"],
+                capture_output=True, text=True, timeout=30,
+            )
+            conflict_files = [f.strip() for f in (cf_proc.stdout or "").splitlines() if f.strip()]
+            subprocess.run(["git", "-C", dev_wt, "merge", "--abort"], capture_output=True, text=True, timeout=30)
+            entry = {"lane": dev_name, "status": "conflict", "files": conflict_files}
+            results.append(entry)
+            files_text = ", ".join(conflict_files) if conflict_files else "unknown files"
+            text = f"Fix on {ship_name} didn't carry to {dev_name}: merge conflict in {files_text}"
+            with contextlib.suppress(Exception):
+                import sse_stream
+                sse_stream.publish("forward_port", {
+                    "text": text,
+                    "ship": ship_name,
+                    "dev": dev_name,
+                    "status": "conflict",
+                    "files": conflict_files,
+                    "worker_id": wid,
+                })
+            with contextlib.suppress(Exception):
+                _s.notify_desktop_event(
+                    f"forward_port|{wid}|{ship_name}|{dev_name}",
+                    "Subway", text, route="workers",
+                )
+    if not results:
+        return None
+    chosen = next((r for r in results if r["status"] == "conflict"), None)
+    if chosen is None:
+        chosen = next((r for r in results if r["status"] == "skipped_dirty"), results[-1])
+    if meta is not None:
+        meta["forward_port"] = chosen
+        if len(results) > 1:
+            meta["forward_ports"] = results
+    return chosen
+
+
+def _merge_worker_branch(repo: str, branch: str, base: str, role: str, wid: str,
+                         lane: Optional[Any] = None, meta: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     """Land a worker as a real --no-ff merge without committing anyone's uncommitted edits.
 
     The worker's own change is base..branch. `base` may be a "subway worktree base" snapshot of
@@ -1752,9 +2226,20 @@ def _merge_worker_branch(repo: str, branch: str, base: str, role: str, wid: str)
     that has uncommitted edits, or no longer applies, the branch is kept for a manual merge.
     """
     import thread_edges
+    lane_obj: Optional[Dict[str, Any]] = lane if isinstance(lane, dict) else None
+    lane_name = str((lane_obj or {}).get("name") or (lane if isinstance(lane, str) else "") or (meta or {}).get("lane") or "").strip()
+    if lane_obj is None and lane_name:
+        with contextlib.suppress(Exception):
+            import lanes as _lanes
+            lane_obj = _lanes.get((meta or {}).get("lane_project_dir") or repo, lane_name)
+    if isinstance(lane_obj, dict) and lane_obj.get("role") != "main":
+        _lwt = str(lane_obj.get("worktree") or "").strip()
+        if _lwt and os.path.isdir(_lwt):
+            repo = _lwt
     keep = f"Branch '{branch}' preserved for a manual merge"
     commit_subj, short_sum = _worker_commit_summary(repo, base, branch, role, wid)
-    msg = f"Merge branch '{branch}' (worker {wid}: {role} — {short_sum})"
+    lane_tag = f" [lane {lane_name}]" if lane_name else ""
+    msg = f"Merge branch '{branch}' (worker {wid}: {role} — {short_sum}){lane_tag}"
     try:
         with _s._state_lock("land_merge", timeout=60):
             patch = subprocess.run(["git", "-C", repo, "diff", "--binary", base, branch],
@@ -1828,6 +2313,8 @@ def _merge_worker_branch(repo: str, branch: str, base: str, role: str, wid: str)
             land_conflicts._save(_s.SUBWAY_DIR, rows)
     except Exception:
         pass
+    if isinstance(lane_obj, dict) and lane_obj.get("role") == "ship":
+        _forward_port_ship_to_dev(lane_obj, (meta or {}).get("lane_project_dir") or repo, wid, meta=meta)
     return landed
 
 
@@ -1852,12 +2339,144 @@ def _drop_snapshot(repo: str, branch: str, base: str, role: str, wid: str) -> st
         return base
 
 
+_FINISHING_WORKERS: set = set()
+
+
+def _active_children_in(path: str) -> List[str]:
+    """Return ids of active workers whose project_dir is ``path`` or inside it."""
+    if not path:
+        return []
+    root = os.path.realpath(str(path))
+    children: List[str] = []
+    for fp in sorted(glob.glob(os.path.join(_s.WORKERS_DIR, "worker_*.json"))):
+        wid = os.path.basename(fp)[:-5]
+        if wid in _FINISHING_WORKERS:
+            continue
+        w = _s._load_worker(wid)
+        if not isinstance(w, dict) or w.get("status") not in _s.ACTIVE_WORKER_STATES:
+            continue
+        proj = w.get("project_dir")
+        if not proj:
+            continue
+        real_proj = os.path.realpath(str(proj))
+        try:
+            if os.path.commonpath([root, real_proj]) != root:
+                continue
+        except ValueError:
+            continue
+        children.append(str(w.get("id") or wid))
+    return children
+
+
+def _flush_deferred_collect(child_meta: Dict[str, Any]) -> List[str]:
+    """Trigger deferred parent worktree collection if ``child_meta`` was the last active sub-worker."""
+    proj = child_meta.get("project_dir") if isinstance(child_meta, dict) else None
+    if not proj:
+        return []
+    child_id = str(child_meta.get("id") or "")
+    child_proj = os.path.realpath(str(proj))
+    notes: List[str] = []
+    if child_id:
+        _FINISHING_WORKERS.add(child_id)
+    try:
+        for fp in sorted(glob.glob(os.path.join(_s.WORKERS_DIR, "worker_*.json"))):
+            pid = os.path.basename(fp)[:-5]
+            if child_id and pid == child_id:
+                continue
+            pmeta = _s._load_worker(pid)
+            if not isinstance(pmeta, dict):
+                continue
+            dc = pmeta.get("deferred_collect")
+            wt = pmeta.get("worktree")
+            if not isinstance(dc, dict) or not wt:
+                continue
+            wt_real = os.path.realpath(str(wt))
+            try:
+                if os.path.commonpath([wt_real, child_proj]) != wt_real:
+                    continue
+            except ValueError:
+                continue
+            if _active_children_in(wt_real):
+                continue
+            pmeta.pop("deferred_collect", None)
+            _s._save_worker(pmeta)
+            note = _collect_worktree(pmeta, partial=bool(dc.get("partial")))
+            _s._save_worker(pmeta)
+            notes.append(note)
+    finally:
+        if child_id:
+            _FINISHING_WORKERS.discard(child_id)
+    return notes
+
+
+def _stage_worktree_changes(path: str) -> None:
+    """Stage modified, added, and deleted non-ignored files without failing on ignored node_modules symlinks."""
+    status = subprocess.run(
+        ["git", "-C", path, "status", "--porcelain", "-z", "-uall"],
+        capture_output=True,
+        timeout=60,
+        check=True,
+        text=False,  # porcelain -z paths are handled as bytes below (3.14 defaults to text)
+    )
+    entries = status.stdout.split(b"\x00")
+    paths: List[bytes] = []
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if not entry or len(entry) < 4:
+            continue
+        xy = entry[:2]
+        rel = entry[3:]
+        if xy[:1] in (b"R", b"C"):
+            # Porcelain -z emits an extra NUL-terminated original path for renames/copies.
+            i += 1
+        if not rel or rel == b"node_modules" or rel.startswith(b"node_modules/"):
+            continue
+        paths.append(rel)
+    if not paths:
+        return
+    subprocess.run(
+        ["git", "-C", path, "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        input=b"\x00".join(paths) + b"\x00",
+        capture_output=True,
+        timeout=60,
+        check=True,
+        text=False,
+    )
+
+
 def _collect_worktree(meta: Dict[str, Any], partial: bool = False) -> str:
     """Bring a worker's change back as a patch or merge commit. A clash or partial is left for review instead of corrupting main."""
     repo, path, base = meta["repo"], meta["worktree"], meta["base"]
+    active_kids = [wid for wid in _active_children_in(path) if wid != meta.get("id")]
+    if active_kids:
+        meta["deferred_collect"] = {"sub-workers": active_kids, "partial": partial}
+        _s._save_worker(meta)
+        return f"Collect deferred: sub-worker(s) {', '.join(active_kids)} still writing in the worktree."
+    if "deferred_collect" in meta:
+        meta.pop("deferred_collect", None)
+        _s._save_worker(meta)
+    lane_obj: Optional[Dict[str, Any]] = None
+    lane_name = str(meta.get("lane") or "").strip()
+    if lane_name:
+        with contextlib.suppress(Exception):
+            import lanes as _lanes
+            lane_obj = _lanes.get(meta.get("lane_project_dir") or repo, lane_name)
+        if lane_obj is None and (meta.get("lane_worktree") or meta.get("lane_role")):
+            lane_obj = {
+                "name": lane_name,
+                "worktree": meta.get("lane_worktree") or repo,
+                "branch": meta.get("lane_branch") or "",
+                "role": meta.get("lane_role") or "",
+            }
+        if isinstance(lane_obj, dict) and lane_obj.get("role") != "main":
+            _lwt = str(lane_obj.get("worktree") or "").strip()
+            if _lwt and os.path.isdir(_lwt):
+                repo = _lwt
     branch_name = meta.get("branch_name")
     if branch_name:
-        _s._git(path, "add", "-A", "--", ".", ":(exclude)node_modules")
+        _stage_worktree_changes(path)
         diff = subprocess.run(["git", "-C", path, "diff", "--cached", "--binary", base], capture_output=True, text=True, timeout=60).stdout
         note = "No files changed."
         # Mode C: a swarm worker's patch always goes back to the station that owns the checkout.
@@ -1899,7 +2518,7 @@ def _collect_worktree(meta: Dict[str, Any], partial: bool = False) -> str:
                 note = f"Branch '{branch_name}' kept for you to land: subway land {branch_name}"
             elif meta.get("unit") or _land_mode() == "merge":
                 # Unit chains always land by merge so the next unit starts from this one's commit.
-                merged, note = _merge_worker_branch(repo, branch_name, base, role, meta["id"])
+                merged, note = _merge_worker_branch(repo, branch_name, base, role, meta["id"], lane=lane_obj, meta=meta)
                 meta["merged"] = merged
                 if merged:
                     import thread_edges
@@ -1935,9 +2554,11 @@ def _collect_worktree(meta: Dict[str, Any], partial: bool = False) -> str:
             worktree_cleanup.sweep_if_enabled()
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            _flush_deferred_collect(meta)
         return note
 
-    _s._git(path, "add", "-A")
+    _stage_worktree_changes(path)
     diff = subprocess.run(["git", "-C", path, "diff", "--cached", "--binary", base], capture_output=True, text=True, timeout=60).stdout
     note = "No files changed."
     if diff.strip():
@@ -1952,6 +2573,8 @@ def _collect_worktree(meta: Dict[str, Any], partial: bool = False) -> str:
             note = "Patch applied to the working tree." if applied.returncode == 0 else f"Patch clashes, not applied: {patch}. {_s.one_line(applied.stderr, 160)}"
     with contextlib.suppress(Exception):
         _s._git(repo, "worktree", "remove", "--force", path)
+    with contextlib.suppress(Exception):
+        _flush_deferred_collect(meta)
     return note
 
 
@@ -2405,6 +3028,13 @@ def _terminate_process_tree(proc: Any) -> None:
                     proc.kill()
 
 
+def _is_computer_use_worker(meta: dict) -> bool:
+    if "desktop" in (meta.get("capabilities") or []) or meta.get("apps") == "desktop":
+        return True
+    text = f"{meta.get('role') or ''}".lower()
+    return bool(re.search(r"computer[- ]use|desktop", text))
+
+
 def _launch_worker(worker_id: str) -> str:
     """Start a queued worker. Callers must have established that the user approved it."""
     with _s._state_lock("workers"):  # The transition is atomic, so a double click can't launch twice.
@@ -2474,6 +3104,10 @@ def _launch_worker(worker_id: str) -> str:
         if git_state is not None:
             meta["git_state_before"] = git_state
             meta["git_dirty_before"] = git_dirty_before or []
+
+    # Option A: do not wrap the outer agent CLI command in sandbox-exec;
+    # keep meta["sandbox_policy"] so supervise.py configures the tool-level OS jail.
+    spawn_env: Optional[Dict[str, str]] = None
     _s._save_worker(meta)
 
     # A supervisor that dies leaves the worker reporting "supervisor disappeared before
@@ -2487,12 +3121,39 @@ def _launch_worker(worker_id: str) -> str:
         err_handle = open(sup_log, "ab", buffering=0)
     except OSError:
         err_handle = subprocess.DEVNULL
+    lease_id = ""
+    child_env = None
+    if _is_computer_use_worker(meta):
+        try:
+            import vdisplay
+            lease_id = "worker:" + worker_id
+            vdisplay.acquire_lease(lease_id, 1440, 900)
+            venv = vdisplay.display_env()
+            if venv:
+                child_env = dict(os.environ, **venv)
+            else:
+                vdisplay.release_lease(lease_id)
+                lease_id = ""
+        except Exception:
+            lease_id = ""
     try:
         popen_kw = _process_group_kwargs()
+        merged_env = dict(child_env) if child_env is not None else None
+        if spawn_env is not None:
+            if merged_env is None:
+                merged_env = dict(spawn_env)
+            else:
+                merged_env.update(spawn_env)
+        if merged_env is not None:
+            popen_kw["env"] = merged_env
         proc = subprocess.Popen([sys.executable, os.path.abspath(_s.__file__), "__supervise", worker_id],
                                 cwd=meta.get("project_dir") or _s.HOME, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=err_handle, **popen_kw)
     except OSError as exc:
+        if lease_id:
+            with contextlib.suppress(Exception):
+                import vdisplay
+                vdisplay.release_lease(lease_id)
         meta.update({"status": "failed", "report": f"Could not start supervisor: {exc}"})
         _s._save_worker(meta)
         if not meta.get("iteration_id"):
@@ -2503,7 +3164,13 @@ def _launch_worker(worker_id: str) -> str:
     if callable(close_fn):
         with contextlib.suppress(Exception):
             close_fn()  # the child keeps its own descriptor
-    threading.Thread(target=proc.wait, daemon=True).start()  # Reap the child, so no zombie lingers.
+    def _reap(p=proc, lid=lease_id):
+        p.wait()  # Reap the child, so no zombie lingers.
+        if lid:
+            with contextlib.suppress(Exception):
+                import vdisplay
+                vdisplay.release_lease(lid)
+    threading.Thread(target=_reap, daemon=True).start()
 
     meta.update({"status": "running", "pid": proc.pid, "report": "",
                  "started_at": _dt.datetime.now().astimezone().isoformat()})
@@ -2558,7 +3225,7 @@ def t_spin_batch(role: str, prompt: str, input_glob: str, output_file: str, mode
         return "Error: role, prompt, input_glob and output_file are required."
     cwd = os.path.realpath(os.path.expanduser(project_dir)) if project_dir else os.getcwd()
     if not os.path.isdir(cwd):
-        return f"Error: project_dir '{project_dir}' does not exist."
+        return f"[ERROR] project_dir does not exist: {project_dir or cwd}"
     files = sorted(p for p in glob.glob(os.path.join(cwd, input_glob), recursive=True) if os.path.isfile(p))
     if not files:
         return f"Error: no files match '{input_glob}' in {cwd}."

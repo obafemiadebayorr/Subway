@@ -130,6 +130,8 @@ def _osascript(script: str, args: Optional[List[str]] = None, timeout: int = 5) 
     """Execute an AppleScript via osascript with arguments passed through argv."""
     if sys.platform == "win32":
         return False, "osascript is not supported on Windows"
+    if sys.platform != "darwin":
+        return False, "osascript requires macOS; terminal automation is not supported on this platform"
     cmd = ["osascript", "-e", script] + list(args or [])
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -145,7 +147,7 @@ def _osascript(script: str, args: Optional[List[str]] = None, timeout: int = 5) 
 
 def is_busy(app: str, tty: str) -> Optional[bool]:
     """Check if the given terminal tab or session is busy running a command."""
-    if sys.platform == "win32":
+    if sys.platform == "win32" or sys.platform != "darwin":
         return None
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):
@@ -172,6 +174,8 @@ def type_command(app: str, tty: str, command: str) -> Tuple[bool, str]:
     """Send and execute a command in the target tab/session."""
     if sys.platform == "win32":
         return False, f"unsupported app '{app}' on Windows"
+    if sys.platform != "darwin":
+        return False, "typing into terminal tabs needs macOS (Terminal/iTerm2); not supported on this platform"
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):
         script = _TERMINAL_TYPE_SCRIPT
@@ -192,7 +196,7 @@ def type_command(app: str, tty: str, command: str) -> Tuple[bool, str]:
 
 def read_history(app: str, tty: str) -> str:
     """Read the full terminal scrollback/contents of the target tab/session."""
-    if sys.platform == "win32":
+    if sys.platform == "win32" or sys.platform != "darwin":
         return ""
     low = (app or "").strip().lower()
     if low in ("terminal", "apple_terminal", "terminal.app"):

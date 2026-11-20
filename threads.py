@@ -275,6 +275,40 @@ def list_threads(base_dir: str) -> List[Dict[str, Any]]:
     return out
 
 
+def wipe_session_threads(base_dir: str, session_id: str) -> List[str]:
+    """Best-effort delete local thread copies belonging to session_id. Returns removed thread ids."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+    folder = os.path.join(base_dir, THREADS_SUBDIR)
+    if not os.path.isdir(folder):
+        return []
+    wiped: List[str] = []
+    safe_sid = safe_name(sid)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(folder, name)
+        stem = name[:-6]
+        matched = stem == safe_sid or stem.startswith(f"{safe_sid}__")
+        if not matched:
+            recs = _read_lines(path)
+            matched = any(
+                r.get("thread") == sid
+                or (isinstance(r.get("data"), dict) and r["data"].get("session_id") == sid)
+                for r in recs
+            )
+        if matched:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                wiped.append(stem)
+    return wiped
+
+
 def record_used_chat(base_dir: str, chat_id: str, tool_name: str, app: str = "", project: str = "") -> None:
     """Record that chat_id called Subway tool_name into used_chats.json atomically."""
     cid = str(chat_id or "").strip()

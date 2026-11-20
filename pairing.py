@@ -156,6 +156,8 @@ def _save(name: str, data: Dict[str, Any], base_dir: Optional[str] = None) -> No
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
+        # Pairing/device state is user-private even though it stores hashes, not tokens (F4).
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -268,6 +270,47 @@ def dialog_script(req: Dict[str, Any], give_up_s: int = 600) -> str:
         'with title "Subway pairing" with icon caution '
         f'giving up after {int(give_up_s)}'
     )
+
+
+_last_refused_notice = 0.0
+_refused_audit_times: List[float] = []
+
+
+def alert_failed_pair(kind: str, detail: str) -> None:
+    """Tell the owner a pairing attempt was refused. Never raises."""
+    try:
+        now = time.time()
+        kind = str(kind or "unknown")[:40]
+        detail = str(detail or "")[:200]
+        # audit every time, capped at 30 per hour
+        global _refused_audit_times, _last_refused_notice
+        _refused_audit_times = [t for t in _refused_audit_times if now - t < 3600.0]
+        if len(_refused_audit_times) < 30:
+            try:
+                import audit as _audit
+                _audit.record(actor={"kind": kind, "id": "", "name": kind},
+                              action="pair.refused",
+                              target={"kind": kind, "detail": detail},
+                              ok=False)
+                _refused_audit_times.append(now)
+            except Exception:
+                pass
+        # desktop notice, at most one per 10 minutes
+        if now - _last_refused_notice < 600.0:
+            return
+        try:
+            import server as _s
+            _s.notify_desktop_event(
+                key="pair-refused",
+                title="Subway: a pairing attempt was refused",
+                message=f"A {kind} tried to connect with an invalid code. If this wasn't you, check Devices.",
+                route="devices",
+            )
+            _last_refused_notice = now
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def _notify(req: Dict[str, Any]) -> None:

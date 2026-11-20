@@ -221,8 +221,12 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
             return f"[REFUSED] terminal `{terminal_id}` is not available or commands not allowed."
 
         typed_ts = time.time()
+        try:
+            exec_command, resolved_vals = terminals.substitute_secret_handles(command)
+        except terminals.UnknownSecretHandleError as e:
+            return f"Error: {e}"
         _thread_terminal(decision if must_ask else "")
-        ok, err = native_terminals.type_command(app, tty, command)
+        ok, err = native_terminals.type_command(app, tty, exec_command)
         if not ok:
             if "macOS blocked Subway" in err:
                 return f"Error: {err}"
@@ -241,7 +245,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
                 term = terminals.get_terminal(_s._terminals_dir(), terminal_id)
             cmds = (term or {}).get("commands") or []
             for c in reversed(cmds):
-                if (c.get("command") in (command, terminals.redact_text(command))
+                if (c.get("command") in (command, terminals.redact_text(command), exec_command, terminals.redact_text(exec_command))
                         and (c.get("end_ts") or 0) >= typed_ts):
                     matching = c
                     break
@@ -255,7 +259,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
                 term = terminals.get_terminal(_s._terminals_dir(), terminal_id)
                 if term:
                     for c in reversed(term.get("commands") or []):
-                        if (c.get("command") in (command, terminals.redact_text(command))
+                        if (c.get("command") in (command, terminals.redact_text(command), exec_command, terminals.redact_text(exec_command))
                                 and (c.get("end_ts") or 0) >= typed_ts):
                             c["output"] = ""
                             break
@@ -270,8 +274,9 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         if capture_on:
             try:
                 history = native_terminals.read_history(app, tty)
-                raw_out = native_terminals.slice_output(history, command)
-                cleaned_out = terminals.redact_text(terminals.strip_ansi(raw_out or ""))
+                raw_out = native_terminals.slice_output(history, exec_command)
+                cleaned_out = terminals.redact_secret_values(
+                    terminals.redact_text(terminals.strip_ansi(raw_out or "")), resolved_vals)
                 if len(cleaned_out) > 20000:
                     cleaned_out = cleaned_out[-20000:]
             except Exception:
@@ -283,7 +288,7 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
                 still_valid = bool(_s.terminal_sharing_enabled() and term.get("share_enabled") and term.get("capture_output"))
                 final_to_store = cleaned_out if still_valid else ""
                 for c in reversed(term.get("commands") or []):
-                    if (c.get("command") in (command, terminals.redact_text(command))
+                    if (c.get("command") in (command, terminals.redact_text(command), exec_command, terminals.redact_text(exec_command))
                             and (c.get("end_ts") or 0) >= typed_ts):
                         c["output"] = final_to_store
                         break
@@ -299,9 +304,13 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         return f"[exit {code}]"
 
     run_id = f"run_{uuid.uuid4().hex[:8]}"
+    try:
+        exec_command, resolved_vals = terminals.substitute_secret_handles(command)
+    except terminals.UnknownSecretHandleError as e:
+        return f"Error: {e}"
     _thread_terminal(decision if must_ask else "")
     with _s._state_lock("terminals"):
-        terminals.create_run_request(_s._terminals_dir(), run_id, terminal_id, command,
+        terminals.create_run_request(_s._terminals_dir(), run_id, terminal_id, exec_command,
                                      timeout_seconds=timeout_seconds, caller_id=caller)
     deadline = time.time() + max(1, min(timeout_seconds, 600)) + 5
     while time.time() < deadline:
@@ -309,14 +318,16 @@ def t_run_terminal(terminal_id: str, command: str, timeout_seconds: int = 120) -
         if rec and rec.get("status") == "done":
             if not _s.terminal_sharing_enabled():
                 return "[REFUSED] terminal sharing was turned off while the command ran; its output was not kept."
+            safe_out = terminals.redact_secret_values(
+                terminals.redact_text(str(rec.get("output", "") or "")), resolved_vals)
             with _s._state_lock("terminals"):
                 terminals.record_command(
                     _s._terminals_dir(), terminal_id, command, exit_code=rec.get("exit_code"),
                     start_ts=rec.get("created_at"), end_ts=rec.get("completed_at"),
-                    output=rec.get("output", ""), caller_id=caller)
+                    output=safe_out, caller_id=caller)
             if rec.get("error"):
                 return f"Error: {rec['error']}"
-            return f"[exit {rec.get('exit_code')}] {rec.get('output', '')}"
+            return f"[exit {rec.get('exit_code')}] {safe_out}"
         rem = min(0.5, max(0.05, deadline - time.time()))
         try:
             import permissions as _perm

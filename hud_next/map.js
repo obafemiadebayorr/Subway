@@ -40,6 +40,8 @@ const LABELS=[
 const NS="http://www.w3.org/2000/svg";
 let svg=null,trains=[],raf=0,last=0;
 const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;
+const isNight=()=>{const t=document.documentElement.dataset.theme;return t==="dark"||(t!=="light"&&matchMedia("(prefers-color-scheme: dark)").matches);};
+const MP=()=>isNight()?{ground:"#0B0E11",ink:"#E8EEF2",station:"#14181C",bed:"#2A3036",plate:"#14181C"}:{ground:"#F3F4EE",ink:"#0F2F3A",station:"#fff",bed:"#E7E9E0",plate:"#F3F4EE"};
 const M=()=>window.HudMotion;const still=()=>reduce||!!(M()&&M().fpsCap()===0);
 function el(tag,attrs,parent){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);parent&&parent.append(e);return e;}
 
@@ -52,8 +54,8 @@ function offset(pts,d){const out=[];for(let i=0;i<pts.length;i++){
   return out;}
 const dstr=p=>"M"+p.map(q=>q[0].toFixed(1)+" "+q[1].toFixed(1)).join("L");
 
-let markDrawn=false;
-function draw(){if(svg)svg.remove();cancelAnimationFrame(raf);raf=0;trains=[];
+let markDrawn=false;const MARK_SVG={};
+function draw(){const P=MP();if(svg)svg.remove();cancelAnimationFrame(raf);raf=0;trains=[];
   const W=innerWidth,H=innerHeight,hb=document.querySelector(".hero")?.getBoundingClientRect().bottom||H*.2,top=hb+28,bot=H-(W<=1180?150:96);
   const s=Math.max(.45,Math.min(W/1440,(bot-top)/590)),ox=(W-1440*s)/2,oy=top-170*s,k=Math.max(.72,Math.min(1.15,s));
   const T=(x,y)=>[ox+x*s,oy+y*s];
@@ -64,7 +66,7 @@ function draw(){if(svg)svg.remove();cancelAnimationFrame(raf);raf=0;trains=[];
   for(const l of LINES){
     const pts=l.pts.map((p,i)=>{if(p[0]!==E)return T(p[0],p[1]);const y=T(0,p[1])[1];return[i===0?-60:W+60,y];});
     paths[l.id]=pts;
-    el("path",{d:dstr(pts),fill:"none",stroke:"#E7E9E0","stroke-width":20*k,"stroke-linejoin":"miter","stroke-linecap":"butt"},gBed);
+    el("path",{d:dstr(pts),fill:"none",stroke:P.bed,"stroke-width":20*k,"stroke-linejoin":"miter","stroke-linecap":"butt"},gBed);
     const g=el("g",{},gTrack);
     /* sleepers: a dashed wide stroke gives ties perpendicular to the track, bends included */
     el("path",{d:dstr(pts),fill:"none",stroke:l.c,"stroke-width":13*k,"stroke-dasharray":`${2.6*k} ${4.4*k}`,"stroke-linejoin":"miter",opacity:l.id==="T"?.55:.85},g);
@@ -73,23 +75,23 @@ function draw(){if(svg)svg.remove();cancelAnimationFrame(raf);raf=0;trains=[];
     l.screen=pts;}
   /* interchange bars: ink casing, white core, square ends */
   for(const[x1,y1,x2,y2]of PILLS){const a=T(x1,y1),b=T(x2,y2);
-    el("path",{d:dstr([a,b]),stroke:"#0F2F3A","stroke-width":15*k,"stroke-linecap":"square"},gSta);
-    el("path",{d:dstr([a,b]),stroke:"#fff","stroke-width":9.5*k,"stroke-linecap":"square"},gSta);}
+    el("path",{d:dstr([a,b]),stroke:P.ink,"stroke-width":15*k,"stroke-linecap":"square"},gSta);
+    el("path",{d:dstr([a,b]),stroke:P.station,"stroke-width":9.5*k,"stroke-linecap":"square"},gSta);}
   for(const[id,x,y,o]of TICKS){const[a,b]=o==="v"?[T(x,y-9),T(x,y+9)]:[T(x-9,y),T(x+9,y)];
-    el("path",{d:dstr([a,b]),stroke:"#0F2F3A","stroke-width":6*k,"stroke-linecap":"butt"},gSta);
-    el("path",{d:dstr([a,b]),stroke:"#fff","stroke-width":3*k,"stroke-linecap":"butt"},gSta);}
+    el("path",{d:dstr([a,b]),stroke:P.ink,"stroke-width":6*k,"stroke-linecap":"butt"},gSta);
+    el("path",{d:dstr([a,b]),stroke:P.station,"stroke-width":3*k,"stroke-linecap":"butt"},gSta);}
   /* termini: square box, colour frame, ink core */
   for(const l of LINES){if(!l.term)continue;l.term.forEach((on,i)=>{if(!on)return;const p=l.pts[i?l.pts.length-1:0];
     const grp=LINES.filter(m=>m.term&&m.pts[i?m.pts.length-1:0][1]===p[1]&&Math.abs(m.pts[i?m.pts.length-1:0][0]-p[0])<=24);
     if(grp[0]!==l)return;const xs=grp.flatMap(m=>[m.pts[i?m.pts.length-1:0][0]]);const[cx,cy]=T((Math.min(...xs)+Math.max(...xs))/2,p[1]+(i?16:-16));
     const w=(Math.max(...xs)-Math.min(...xs))*s+22*k,h=14*k;
-    el("rect",{x:cx-w/2,y:cy-h/2,width:w,height:h,fill:"#fff",stroke:"#0F2F3A","stroke-width":2*k},gSta);
+    el("rect",{x:cx-w/2,y:cy-h/2,width:w,height:h,fill:P.station,stroke:P.ink,"stroke-width":2*k},gSta);
     grp.forEach(m=>{const[mx]=T(m.pts[i?m.pts.length-1:0][0],0);el("rect",{x:mx-3*k,y:cy-3*k,width:6*k,height:6*k,fill:m.c},gSta);});});}
   /* labels with square route bullets and signs (svg is in the DOM, so text can be measured) */
   const fs=13*k,b=15*k,cy=-fs*.36,FONT="Instrument Sans, system-ui, sans-serif";
   for(const[x,y,anc,name,routes,signs]of LABELS){const[px,py]=T(x,y);const g=el("g",{transform:`translate(${px.toFixed(1)} ${py.toFixed(1)})`},gLab);
-    const plate=el("rect",{fill:"#F3F4EE"},g);
-    const t=el("text",{y:0,"font-size":fs,"font-weight":"600","font-family":FONT,fill:"#0F2F3A","letter-spacing":"-.01em"},g);t.textContent=name;
+    const plate=el("rect",{fill:P.plate},g);
+    const t=el("text",{y:0,"font-size":fs,"font-weight":"600","font-family":FONT,fill:P.ink,"letter-spacing":"-.01em"},g);t.textContent=name;
     const tw=t.getComputedTextLength();
     const full=tw+6*k+routes.length*(b+2.5*k)+signs.length*(b+4.5*k)-2.5*k;
     const dx=anc==="end"?-full:anc==="middle"?-full/2:0;t.setAttribute("x",dx);
@@ -100,25 +102,28 @@ function draw(){if(svg)svg.remove();cancelAnimationFrame(raf);raf=0;trains=[];
       else el("rect",{x:cx,y:cy-b/2,width:b,height:b,fill:L.c},g);
       const lt=el("text",{x:cx+b/2,y:cy+b*.33,"font-size":10*k,"font-weight":"700","text-anchor":"middle","font-family":FONT,fill:L.ink||"#fff"},g);lt.textContent=r;cx+=b+2.5*k;}
     for(const sg of signs){cx+=2*k;const g2=el("g",{transform:`translate(${cx} ${cy-b/2})`},g);
-      if(sg==="acc"){el("rect",{width:b,height:b,fill:"#2C86B0"},g2);const ic=el("g",{transform:`translate(${b*.12} ${b*.12}) scale(${b*.76/256})`,fill:"#fff"},g2);ic.innerHTML=MAPI.wheelchair;}
+      if(sg==="acc"){el("rect",{width:b,height:b,fill:"#2C86B0"},g2);const ic=el("g",{transform:`translate(${b*.12} ${b*.12}) scale(${b*.76/256})`,fill:P.station},g2);ic.innerHTML=MAPI.wheelchair;}
       else{const ic=el("g",{transform:`scale(${b/256})`},g2);ic.innerHTML=`<polygon points="128,20 244,228 12,228" fill="#F7C51E" stroke="#0F2F3A" stroke-width="18" stroke-linejoin="miter"/><rect x="118" y="92" width="20" height="78" fill="#0F2F3A"/><rect x="118" y="186" width="20" height="20" fill="#0F2F3A"/>`;}
       cx+=b+2.5*k;}}
   /* wordmark in the open block between Ledger St and Principal Sq: the logo is the S of "subway" */
-  {const logo=document.querySelector(".brand svg");if(logo){const[mx,my]=T(728,392),wf=44*s;
+  {const[mx,my]=T(728,392),wf=44*s;
     const g=el("g",{class:"map-mark",transform:`translate(${mx.toFixed(1)} ${my.toFixed(1)})`},gLab);
-    const t=el("text",{y:0,"font-size":wf,"font-weight":"600","font-family":FONT,fill:"#0F2F3A","letter-spacing":"-.025em"},g);t.textContent="ubway";
-    const Sh=wf*.76,sc=Sh/248,Sw=182*sc,gap=wf*.07,tw=t.getComputedTextLength(),full=Sw+gap+tw,x0=-full/2;
-    const S=el("g",{fill:"none",transform:`translate(${(x0-20*sc).toFixed(2)} ${(-Sh-10*sc+wf*.015).toFixed(2)}) scale(${sc.toFixed(4)})`},g);S.innerHTML=logo.innerHTML;
+    const t=el("text",{y:0,"font-size":wf,"font-weight":"600","font-family":FONT,fill:P.ink,"letter-spacing":"-.025em"},g);t.textContent="ubway";
+    const Sh=wf*.92,sc=Sh/312,Sw=252*sc,gap=wf*.06,tw=t.getComputedTextLength(),full=Sw+gap+tw,x0=-full/2;
+    const S=el("g",{transform:`translate(${(x0+6*sc).toFixed(2)} ${(-Sh+wf*.12+6*sc).toFixed(2)}) scale(${sc.toFixed(4)})`},g);
     t.setAttribute("x",x0+Sw+gap);t.setAttribute("y",0);
-    el("rect",{x:x0-10*s,y:-Sh-10*s,width:full+20*s,height:Sh+wf*.3+18*s,fill:"#F3F4EE"},g).parentNode.prepend(g.lastChild);
-    if(!markDrawn&&!reduce){markDrawn=true;S.querySelectorAll("path").forEach((p,i)=>{p.setAttribute("pathLength","1");
-      p.style.cssText=`stroke-dasharray:1;stroke-dashoffset:1;animation:mark-draw 1.1s cubic-bezier(.65,0,.35,1) ${.15+i*.14}s forwards`;});
-      t.style.cssText="opacity:0;animation:mark-fade .5s ease .75s forwards";}}}
+    el("rect",{x:x0-10*s,y:-Sh+wf*.12-10*s,width:full+20*s,height:Sh+wf*.18+18*s,fill:P.plate},g).parentNode.prepend(g.lastChild);
+    const anim=!markDrawn&&!reduce;if(anim){markDrawn=true;t.style.cssText="opacity:0;animation:mark-fade .5s ease .7s forwards";}
+    const src=(document.getElementById("brandMark")?.getAttribute("src"))||"logo/S1s.svg";
+    const put=txt=>{const sv=new DOMParser().parseFromString(txt,"image/svg+xml").documentElement;
+      [...sv.children].forEach((n,i)=>{const m=S.appendChild(document.importNode(n,true));
+        if(anim)m.style.cssText=`opacity:0;transform-box:fill-box;transform-origin:center;animation:${m.tagName==="circle"?"mark-pop .45s cubic-bezier(.3,1.6,.5,1)":"mark-lay .6s cubic-bezier(.2,.8,.2,1)"} ${(.1+i*.07).toFixed(2)}s forwards`;});};
+    if(MARK_SVG[src])put(MARK_SVG[src]);else fetch(src).then(r=>r.text()).then(x=>{MARK_SVG[src]=x;put(x);}).catch(()=>{});}
   /* trains: two-car sets in line colour with a window band */
   for(const[id,dir,off]of[["P",1,0],["O",-1,.4],["C",1,.2],["A",-1,.7]]){
     const path=el("path",{d:dstr(paths[id]),fill:"none",stroke:"none"},gTrain);const len=path.getTotalLength();
-    const cars=[0,1].map(()=>{const g=el("g",{},gTrain);el("rect",{x:-12*k,y:-4.6*k,width:24*k,height:9.2*k,fill:COLOR[id].c,stroke:"#0F2F3A","stroke-width":1.2*k},g);
-      el("rect",{x:-9*k,y:-1.4*k,width:18*k,height:2.8*k,fill:"#fff",opacity:.85},g);return g;});
+    const cars=[0,1].map(()=>{const g=el("g",{},gTrain);el("rect",{x:-12*k,y:-4.6*k,width:24*k,height:9.2*k,fill:COLOR[id].c,stroke:P.ink,"stroke-width":1.2*k},g);
+      el("rect",{x:-9*k,y:-1.4*k,width:18*k,height:2.8*k,fill:P.station,opacity:.85},g);return g;});
     trains.push({path,len,pos:len*off,dir,cars,k});}
   if(still()){place();return;}raf=requestAnimationFrame(tick);}
 function place(){for(const t of trains)t.cars.forEach((c,i)=>{const at=t.pos-i*27*t.k*t.dir;const L=((at%t.len)+t.len)%t.len;
@@ -132,4 +137,7 @@ const resume=()=>{if(!svg)return;if(still()){cancelAnimationFrame(raf);raf=0;las
 document.addEventListener("visibilitychange",resume);if(window.HudMotion)window.HudMotion.onChange(resume);
 document.addEventListener("page:render",mount);
 if(document.fonts&&document.fonts.ready)document.fonts.ready.then(mount);else mount();
+
+new MutationObserver(()=>{if(svg)draw();}).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{if(svg)draw();});
 })();

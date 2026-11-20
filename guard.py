@@ -87,6 +87,58 @@ def _principal_small_edit_lines() -> int:
         return 0
 
 
+def _read_budget_warn_pct() -> int:
+    """Return configured soft-warning percentage (50..100, default 80) for principal read budget."""
+    import server
+    cfg = server._load_json("config.json") or {}
+    try:
+        val = int(cfg.get("read_budget_warn_pct", 80))
+    except Exception:
+        return 80
+    return max(50, min(100, val))
+
+
+_EXEMPT_READ_BUDGET_PREFIXES = (
+    "git status",
+    "git diff",
+    "git apply",
+    "git add",
+    "git commit",
+    "git merge",
+    "git cherry-pick",
+    "git fetch",
+    "git show",
+    "pytest",
+    "python3 -m pytest",
+    "ruff check",
+    "node --test",
+    "npm test",
+)
+
+
+def _is_exempt_read_budget_cmd(cmd: str) -> bool:
+    """Return True if cmd starts with (or only chains via &&) safe landing/verification commands."""
+    if not isinstance(cmd, str):
+        return False
+    s = cmd.strip()
+    if not s:
+        return False
+    if any(tok in s for tok in (";", "||", "|", "\n", "\r", "`", "$(")):
+        return False
+    if re.search(r"(?<!&)&(?!&)", s):
+        return False
+    parts = [p.strip() for p in s.split("&&")]
+    if not parts or any(not p for p in parts):
+        return False
+    for part in parts:
+        if not any(
+            part == pref or part.startswith(pref + " ") or part.startswith(pref + "\t")
+            for pref in _EXEMPT_READ_BUDGET_PREFIXES
+        ):
+            return False
+    return True
+
+
 def _edit_line_count(tool_name: str, tool_input: Dict[str, Any]) -> int:
     """Lines an Edit/MultiEdit actually changes (context lines excluded); -1 when not measurable."""
     import difflib
@@ -94,17 +146,18 @@ def _edit_line_count(tool_name: str, tool_input: Dict[str, Any]) -> int:
     def one(e: Dict[str, Any]) -> int:
         if e.get("replace_all"):
             return -1
-        a = str(e.get("old_string") or "").splitlines()
-        b = str(e.get("new_string") or "").splitlines()
+        # B1: pi's edit shape is oldText/newText; claude's is old_string/new_string.
+        a = str(e.get("old_string") or e.get("oldText") or "").splitlines()
+        b = str(e.get("new_string") or e.get("newText") or "").splitlines()
         n = 0
         for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
             if tag != "equal":
                 n += max(i2 - i1, j2 - j1)
         return n
 
-    if tool_name in ("Edit", "edit_file") and "old_string" in tool_input:
+    if tool_name in ("Edit", "edit_file", "edit") and ("old_string" in tool_input or "oldText" in tool_input):
         return one(tool_input)
-    if tool_name == "MultiEdit" and isinstance(tool_input.get("edits"), list):
+    if tool_name in ("MultiEdit", "edit") and isinstance(tool_input.get("edits"), list):
         counts = [one(e) for e in tool_input["edits"] if isinstance(e, dict)]
         return -1 if (not counts or any(c < 0 for c in counts)) else sum(counts)
     return -1
@@ -296,6 +349,31 @@ def _count_user_turns(transcript_path: str) -> str:
         return ""
 
 
+def _git_common_dir(path: str) -> str:
+    """Return the normalized realpath of git's common dir for `path`, or '' if not in a git repo."""
+    import subprocess
+    cur = os.path.abspath(path)
+    while cur and not os.path.isdir(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+    if not cur:
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", cur, "rev-parse", "--git-common-dir"],
+            stderr=subprocess.DEVNULL, text=True, timeout=5,
+        ).strip()
+        if not out:
+            return ""
+        if not os.path.isabs(out):
+            out = os.path.join(cur, out)
+        return os.path.normcase(os.path.normpath(os.path.realpath(out)))
+    except Exception:
+        return ""
+
+
 def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Claude Code & Antigravity PreToolUse hook: deny an edit to a file another agent holds a lease on, or stop if chat budget reached."""
     import server
@@ -313,7 +391,22 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "permissionDecisionReason": reason,
         }}
 
+    read_warning: Optional[str] = None
+
     def _allow() -> Optional[Dict[str, Any]]:
+        if read_warning:
+            if is_antigravity:
+                # B2: no top-level "additionalContext" here — Antigravity's protojson hook parser
+                # rejects the unknown field and then refuses every read_file/run_command.
+                return {"decision": "allow", "reason": read_warning}
+            return {
+                "systemMessage": read_warning,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": read_warning,
+                },
+            }
         if is_antigravity:
             return {"decision": "allow"}
         return None
@@ -343,7 +436,10 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if enabled:
             _fp = (tool_input.get("Path") or tool_input.get("path") or tool_input.get("file_path") or
                    tool_input.get("filepath") or tool_input.get("notebook_path"))
-            if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "write_file", "edit_file") and isinstance(_fp, str) and _fp:
+            # B1: tool names now include pi's lowercase `edit`/`write` — pi principals were
+            # completely ungated before (B7b coupling to the guard enable is tested intent).
+            if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "write_file", "edit_file",
+                             "edit", "write") and isinstance(_fp, str) and _fp:
                 cpath = _canon_path(_fp, cwd)
                 sdir = os.path.abspath(os.path.expanduser(getattr(server, "SUBWAY_DIR", "") or ""))
                 import tempfile as _tempfile
@@ -355,13 +451,24 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 in_allowed = any((creal == x or creal.startswith(x + os.sep))
                                  and not (rcwd == x or rcwd.startswith(x + os.sep)) for x in ar)
                 in_project = creal == rcwd or creal.startswith(rcwd + os.sep)
+                if not in_project:
+                    cwd_common = _git_common_dir(rcwd)
+                    if cwd_common and _git_common_dir(creal) == cwd_common:
+                        in_project = True
                 if in_project and not in_allowed:
                     small = _principal_small_edit_lines()
                     n = _edit_line_count(tool_name, tool_input) if small else -1
                     if not (0 <= n <= small):
                         extra = f" Small edits up to {small} changed lines are allowed; this one changes {n}." if small and n > small else ""
                         return _deny("Principal hands off: your chat does not edit project files. Spin a worker (spin_worker) with the exact edit." + extra)
-            if (tool_name in ("Read", "Grep", "Glob", "Bash", "read_file", "run_command", "search_web")
+            _cmd_val = tool_input.get("CommandLine") or tool_input.get("command")
+            _exempt_cmd = (
+                tool_name in ("Bash", "run_command")
+                and isinstance(_cmd_val, str)
+                and _is_exempt_read_budget_cmd(_cmd_val)
+            )
+            if not _exempt_cmd and (
+                    tool_name in ("Read", "Grep", "Glob", "Bash", "read_file", "run_command", "search_web")
                     or _is_mcp_read_tool(tool_name, tool_input, mcp_read_tools)):
                 if max_reads > 0:
                     n = _bump_principal_reads(sid)
@@ -371,6 +478,13 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                                 if reset_mode == "compaction" else " Run `subway read-budget reset`.")
                         return _deny(f"Read budget reached ({n} reads, limit {max_reads}). Delegate this: spin a worker with spin_worker, "
                                      "and use code= packets in the brief instead of pulling code into this chat." + tail)
+                    warn_pct = _read_budget_warn_pct()
+                    if n * 100 >= max_reads * warn_pct:
+                        read_warning = (
+                            f"Read budget warning: {n}/{max_reads} reads used "
+                            f"({(n * 100) // max_reads}%, threshold {warn_pct}%). "
+                            "Consider delegating further exploration to a worker with spin_worker."
+                        )
 
     cmd = tool_input.get("CommandLine") or tool_input.get("command")
     if cmd and _writes_subway_state(str(cmd)):
@@ -379,9 +493,46 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if (re.search(r"(subway(?:-context)?|server\.py)\s+(budget|compaction)\b", cmd)
                 or any(k in cmd for k in ("/api/budget", "/api/chat_budget", "/api/settings", "X-Subway-Token"))):
             return _deny("Budgets are the user's to change. Ask them to run it, or use the HUD.")
+    if (
+        tool_name in ("run_command", "Bash", "bash", "shell")
+        and isinstance(cmd, str)
+        and os.environ.get("SUBWAY_SANDBOX_EXEC") == "os"
+        and os.environ.get("SUBWAY_SANDBOX_WORKTREE")
+        and os.environ.get("SUBWAY_SANDBOX_STRICT_READS") == "1"
+    ):
+        read_roots = [
+            os.path.normcase(os.path.normpath(os.path.realpath(p)))
+            for p in os.environ.get("SUBWAY_SANDBOX_READ_ROOTS", "").split(os.pathsep)
+            if p.strip()
+        ]
+
+        def _in_roots(p, roots):
+            return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+        real_wt = os.path.normcase(os.path.normpath(os.path.realpath(os.environ["SUBWAY_SANDBOX_WORKTREE"])))
+        raw_home = os.path.expanduser("~")
+        real_home = os.path.normcase(os.path.normpath(os.path.realpath(raw_home)))
+        for raw_tok in re.findall(r"""[^\s"'`|;&<>()]+""", cmd):
+            tok = raw_tok.split("=", 1)[1] if ("=" in raw_tok and not raw_tok.startswith(("/", "~"))) else raw_tok
+            if not tok:
+                continue
+            expanded = tok
+            if expanded == "~" or expanded.startswith("~/"):
+                expanded = raw_home + expanded[1:]
+            elif expanded.startswith("$HOME/") or expanded == "$HOME":
+                expanded = raw_home + expanded[5:]
+            elif expanded.startswith("${HOME}/") or expanded == "${HOME}":
+                expanded = raw_home + expanded[7:]
+            if not os.path.isabs(expanded):
+                continue
+            cand = os.path.normcase(os.path.normpath(os.path.realpath(expanded)))
+            if (cand == real_home or cand.startswith(real_home + os.sep)) and not (cand == real_wt or cand.startswith(real_wt + os.sep)):
+                if not _in_roots(cand, read_roots):
+                    return _deny("[SANDBOX] shell access to home path outside worktree denied")
 
     filepath = (tool_input.get("Path") or tool_input.get("path") or tool_input.get("file_path") or
-                tool_input.get("filepath") or tool_input.get("notebook_path")) if isinstance(tool_input, dict) else None
+                tool_input.get("filepath") or tool_input.get("notebook_path") or
+                tool_input.get("TargetFile")) if isinstance(tool_input, dict) else None
     cpath = None
     real_cpath = None
     if filepath and isinstance(filepath, str):
@@ -396,6 +547,33 @@ def hook_guard(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not in_worktrees and (cpath == sdir or cpath.startswith(sdir + os.sep)
                 or real_cpath == sreal or real_cpath.startswith(sreal + os.sep)):
             return _deny("Subway's state files are the user's to change.")
+        if os.environ.get("SUBWAY_SANDBOX_EXEC") == "os" and os.environ.get("SUBWAY_SANDBOX_WORKTREE"):
+            sb_wt = os.path.normcase(os.path.normpath(os.path.realpath(os.environ["SUBWAY_SANDBOX_WORKTREE"])))
+            in_wt = (real_cpath == sb_wt or real_cpath.startswith(sb_wt + os.sep))
+            if tool_name in ("write_file", "edit_file", "Write", "Edit", "MultiEdit", "NotebookEdit",
+                             "replace_file_content", "multi_replace_file_content", "write_to_file"):
+                git_hooks = os.path.join(sb_wt, ".git", "hooks")
+                git_config = os.path.join(sb_wt, ".git", "config")
+                in_protected_git = (
+                    real_cpath == git_hooks or real_cpath.startswith(git_hooks + os.sep)
+                    or real_cpath == git_config or real_cpath.startswith(git_config + os.sep)
+                )
+                if not in_wt or in_protected_git:
+                    return _deny("[SANDBOX] write outside worktree denied")
+            elif (os.environ.get("SUBWAY_SANDBOX_STRICT_READS") == "1"
+                  and tool_name in ("read_file", "Read", "view_file", "view_file_outline", "view_code_item")):
+                home_real = os.path.normcase(os.path.normpath(os.path.realpath(os.path.expanduser("~"))))
+                read_roots = [
+                    os.path.normcase(os.path.normpath(os.path.realpath(p)))
+                    for p in os.environ.get("SUBWAY_SANDBOX_READ_ROOTS", "").split(os.pathsep)
+                    if p.strip()
+                ]
+
+                def _in_roots(p, roots):
+                    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+                if (real_cpath == home_real or real_cpath.startswith(home_real + os.sep)) and not (in_wt or _in_roots(real_cpath, read_roots)):
+                    return _deny("[SANDBOX] read outside worktree denied")
 
     # 62b chat branches: a chat with its own branch edits only its worktree; with chat_branch_auto on, a second
     # chat editing a tree another chat is editing must take a branch first.

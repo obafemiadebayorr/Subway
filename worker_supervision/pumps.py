@@ -156,7 +156,9 @@ def _role_kind(role: Any = "", caps: Any = None) -> str:
     r = str(role or "").lower()
     if bool(re.search(r"orchestrat|lead|coordinator", r)):
         return "orchestrator"
-    if bool(re.search(r"plan|planner|investigat|triage|diagnos|research|survey|measure|analys|audit", r)):
+    # B3c: match spawn.py's research pattern for auditor-flavored roles, and audit for
+    # reviewers (drift: spawn had audit in reviewer, this copy did not).
+    if bool(re.search(r"plan|planner|investigat|triage|diagnos|research|survey|measure|analys|audit|hunt|sweep|scan", r)):
         return "research"
     if bool(re.search(r"review|verif", r)):
         return "reviewer"

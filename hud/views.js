@@ -3141,7 +3141,7 @@ function openThreadMenu(ev, chat, onRefresh) {
     item(icon("archive"), meta.archived ? "Unarchive" : "Archive thread", () => threadAction(chat, "archive", !meta.archived, onRefresh)),
     h("div", { class: "ctx-sep" }),
     item(icon("trash"), "Delete", () => confirmDelete(chat, onRefresh), true));
-  document.body.append(menu);
+  (window.__subwayFloatHost?.isConnected ? window.__subwayFloatHost : document.body).append(menu);
   ctxMenuEl = menu;
   const pad = 8;
   let x = ev.clientX, y = ev.clientY;
@@ -3149,7 +3149,7 @@ function openThreadMenu(ev, chat, onRefresh) {
   if (y + menu.offsetHeight + pad > window.innerHeight) y = window.innerHeight - menu.offsetHeight - pad;
   menu.style.left = `${Math.max(pad, x)}px`;
   menu.style.top = `${Math.max(pad, y)}px`;
-  const onDoc = (e) => { if (!menu.contains(e.target)) { closeCtxMenu(); document.removeEventListener("pointerdown", onDoc); } };
+  const onDoc = (e) => { if (!(e.composedPath ? e.composedPath().includes(menu) : menu.contains(e.target))) { closeCtxMenu(); document.removeEventListener("pointerdown", onDoc); } };
   setTimeout(() => document.addEventListener("pointerdown", onDoc), 0);
 }
 

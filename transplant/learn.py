@@ -388,11 +388,12 @@ def drifted(ad, home=None):
         return False, "no fingerprint"
     roots = []
     marker = "\x00"
+    home_norm = os.path.normpath(os.path.expanduser(home or "~"))
     for path in ad.store_paths(session_id=marker, project_slug=marker, ts_file=marker):
         head = path.split(marker)[0]
         while head and not os.path.isdir(head):
             head = os.path.dirname(head.rstrip(os.sep))
-        if head and head not in roots and head != os.path.dirname(head):
+        if head and os.path.normpath(head) != home_norm and head not in roots and head != os.path.dirname(head):
             roots.append(head)
     files = locate(ad.id, roots=roots) if roots else []
     files = [f for f in files if f["kind"] == ("sqlite" if ad.kind == "sqlite" else f["kind"])]

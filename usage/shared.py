@@ -94,6 +94,7 @@ def _check_cap(run: Dict[str, Any]) -> None:
     if not cap:
         return
     if int(run.get("tool_calls") or 0) == 0 and int(spent or 0) < 2 * int(cap or 0):
+        # Deliberate (test-pinned): absorb a big brief before the first tool call.
         return
     if spent >= cap:
         if int(run.get("tool_calls") or 0) == 0:

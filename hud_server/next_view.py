@@ -1,6 +1,6 @@
 """Slimmed status view for the hud_next frontend (GET /api/status?view=next).
 
-Ported from hud_next/DEVSERVER_REFERENCE.py.txt so the live HUD can serve the
+Ported from the old dev server reference (removed) so the live HUD can serve the
 prototype without the dev proxy. Only safe, UI-needed fields are exposed.
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ READ = {
     "notification_targets", "notification_webhook", "reply_style", "table_rows",
     "projector_enabled", "projector_max_lines", "nudge_builder_calls",
     "nudge_other_calls", "token_controls", "wake", "terminal_mode",
+    "transplant_turns", "transplant_full",
     "protected_commands", "protected_exceptions", "doctor_mode", "doctor_budget_mode",
     "doctor_budget_tokens", "doctor_model", "models", "benchmarks", "budgets",
     "launch_approval_remote", "link_default_preset", "link_default_allowance",

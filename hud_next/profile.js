@@ -7,7 +7,7 @@ const ACCOUNTS=[{id:"gh",name:"ObaIsSoft",sub:"GitHub · signed in",plan:"Owner"
 const STATUSES=[["online","Online","#22A06B"],["away","Away","#D4A64A"],["busy","DND","#E2382B"]];
 const THEMES=[["light","Light","sun"],["dark","Dark","moon"],["system","System","monitor"]];
 const ITEMS=[["Settings","gear-six","⌘,","#settings"],["Usage","chart-line-up","","#usage"],["Collab","users-three","","#collab"],["Landing","git-merge","","#landing"],["Help","question","?","#help"]];
-let acc=ACCOUNTS[0],status="online",theme="system",phase="closed",page="main";
+let acc=ACCOUNTS[0],status="online",theme=(()=>{try{return localStorage.getItem("hud-theme")||"system";}catch(_){return"system";}})(),phase="closed",page="main";
 const initials=a=>a.name.split(/\s+/).slice(0,2).map(p=>p[0]).join("").toUpperCase();
 const dot=s=>STATUSES.find(x=>x[0]===s)[2];
 const avatar=(a,size,st)=>`<span class="pf-av" style="width:${size}px;height:${size}px">${initials(a)}${st?`<i class="pf-st" style="background:${dot(st)}"></i>`:""}</span>`;
@@ -72,7 +72,7 @@ function wire(){
   root.querySelectorAll("[data-status]").forEach(b=>b.addEventListener("click",()=>{status=b.dataset.status;
     root.querySelectorAll("[data-status]").forEach(x=>{const on=x.dataset.status===status;x.setAttribute("aria-checked",on);x.querySelector("i").style.background=on?dot(x.dataset.status):"#CBD0C6";});
     root.querySelectorAll(".pf-st").forEach(d=>d.style.background=dot(status));}));
-  root.querySelectorAll("[data-theme]").forEach(b=>b.addEventListener("click",()=>{theme=b.dataset.theme;document.documentElement.dataset.theme=theme;
+  root.querySelectorAll("[data-theme]").forEach(b=>b.addEventListener("click",()=>{theme=b.dataset.theme;document.documentElement.dataset.theme=theme;try{localStorage.setItem("hud-theme",theme);}catch(_){}
     root.querySelectorAll("[data-theme]").forEach(x=>x.setAttribute("aria-checked",x.dataset.theme===theme));moveInd();}));
   root.querySelectorAll(".pf-item[href]").forEach(a=>a.addEventListener("click",e=>{close(e.detail===0?"keyboard":"pointer",true);}));
   root.querySelector("[data-switch]").addEventListener("click",()=>goTo("accounts"));

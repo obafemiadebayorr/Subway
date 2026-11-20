@@ -480,12 +480,23 @@ def start_hud_server(port: int = _s.HUD_PORT, daemon: bool = True) -> Optional[h
         except Exception as e:
             _s.log(f"skill index warm-up failed: {e}")
     threading.Thread(target=_warm_skills, daemon=True).start()
+    # Fire due mail items (scheduled sends, queued chat messages, triggers). One dispatcher per HUD.
+    try:
+        from hud_server import mail_watch
+        mail_watch.start(_s.log)
+    except Exception as e:
+        _s.log(f"mail watch failed to start: {e}")
     # /api/events reads a file spool so events produced by other processes (the MCP
     # server, workers) actually reach subscribers. One tailer per HUD process.
     if not getattr(_s, "_sse_tailer_started", False):
         _s._sse_tailer_started = True
         sse_stream.add_spool_listener(_hud_data.patch_cached_worker)
         sse_stream.start_spool_tailer()
+        try:
+            from hud_server import live_relay
+            live_relay.start_receiver()
+        except Exception as e:
+            _s.log(f"live relay not started: {e}")
     try:
         from hud_server import tunnel_supervisor
         tunnel_supervisor.start(port, _s._load_json("config.json"), _s.log)

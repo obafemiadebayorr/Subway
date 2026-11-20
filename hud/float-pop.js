@@ -6,7 +6,8 @@ export function floatOpen(panel, trigger, { align = "start", matchWidth = false 
     layer.className = "cmp cmp-layer";
     layer.appendChild(panel);
   }
-  if (layer.parentElement !== document.body) document.body.appendChild(layer);
+  const fh = window.__subwayFloatHost, host = fh && fh.isConnected && trigger.getRootNode() === fh.getRootNode() ? fh : document.body;
+  if (layer.parentElement !== host) host.appendChild(layer);
   const gap = 8;
   const place = () => {
     if (panel.hidden || !trigger.isConnected) return;

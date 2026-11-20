@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -305,10 +306,45 @@ def _chat_exchanges(chat_id: str, source: str) -> tuple:
     return c, _s.to_exchanges(info[0])
 
 
-def chat_turns(chat_id: str, source: str = "all", turns: int = 20, max_chars: int = 4000) -> dict:
-    """Recent user/assistant turns for the HUD: user text plus the assistant's final text only."""
-    c, ex = _chat_exchanges(chat_id, source)
+_HUD_TAIL = 8 << 20
+_HUD_TAIL_MAX = 64 << 20
+
+
+def _chat_exchanges_tail(chat_id: str, source: str, want: int) -> tuple:
+    """Like _chat_exchanges, but a Claude transcript is read from its tail only (8 MB, x4 up to 64 MB
+    until `want` exchanges are found). Returns (chat, exchanges, partial)."""
+    c = _s.resolve(chat_id, source, "")
+    if threads.is_chat_excluded(c, base_dir=_s.SUBWAY_DIR):
+        raise ValueError(f"Chat {chat_id} is excluded by app/project exclusion rules")
+    path = str(c.get("path") or "")
+    try:
+        size = os.path.getsize(path) if (c.get("source") or "").lower() == "claude" and path else 0
+    except OSError:
+        size = 0
+    tb = _HUD_TAIL if size > _HUD_TAIL else None
+    while True:
+        info = _s.chat_segments_info(c, "all", tail_bytes=tb) if tb else _s.chat_segments_info(c, "all")
+        ex = _s.to_exchanges(info[0])
+        if not tb or len(ex) > want or tb >= _HUD_TAIL_MAX or tb * 4 >= size:
+            break
+        tb *= 4
+    if tb and tb < size and len(ex) <= want:
+        info = _s.chat_segments_info(c, "all", tail_bytes=_HUD_TAIL_MAX) if size > _HUD_TAIL_MAX else _s.chat_segments_info(c, "all")
+        ex = _s.to_exchanges(info[0])
+        tb = _HUD_TAIL_MAX if size > _HUD_TAIL_MAX else None
+    return c, ex, bool(tb and tb < size)
+
+
+def turn_id(role: str, ts: Any, text: str) -> str:
+    """Stable id for one panel row, used by revert/fork."""
+    return hashlib.sha1(f"{role}|{ts}|{(text or '')[:200]}".encode()).hexdigest()[:12]
+
+
+def chat_turns(chat_id: str, source: str = "all", turns: int = 20, max_chars: int = 4000, _pre: Optional[tuple] = None, apply_cut: bool = True) -> dict:
+    """Recent user/assistant turns for the HUD: user text plus the assistant's final text only.
+    Huge Claude transcripts are read from the tail; `more` says older turns exist beyond what was read."""
     limit = max(1, int(turns))
+    c, ex, partial = _pre if _pre is not None else _chat_exchanges_tail(chat_id, source, limit)
     limit_chars = max(0, int(max_chars))
     out: List[Dict[str, Any]] = []
     for e in ex[-limit:]:
@@ -326,16 +362,46 @@ def chat_turns(chat_id: str, source: str = "all", turns: int = 20, max_chars: in
             ts = None
         user_text = str(e.get("user") or "").strip()
         if user_text:
-            out.append({"role": "user", "text": user_text[:limit_chars], "ts": ts})
-        final = str(e["assistant"][-1]) if e.get("assistant") else ""
+            out.append({"role": "user", "text": user_text[:limit_chars], "ts": ts, "tid": turn_id("user", ts, user_text)})
+        asst = e.get("assistant") or []
+        # Each break marks a reply that ended before a hook/Subway event started the next one.
+        for b in sorted(set(e.get("breaks") or [])):
+            if 0 < b < len(asst) and str(asst[b - 1]).strip():
+                out.append({"role": "assistant", "text": str(asst[b - 1])[:limit_chars], "ts": ts, "tid": turn_id("assistant", ts, str(asst[b - 1]))})
+        final = str(asst[-1]) if asst else ""
         if final.strip():
-            out.append({"role": "assistant", "text": final[:limit_chars], "ts": ts})
+            out.append({"role": "assistant", "text": final[:limit_chars], "ts": ts, "tid": turn_id("assistant", ts, final), **({"event": True} if e.get("breaks") else {})})
+    extra: Dict[str, Any] = {}
+    try:
+        from transplant import engine as _eng
+        cut = _eng.cut_for(c.get("id", chat_id)) if apply_cut else None
+    except Exception:
+        cut = None
+    if cut and cut.get("hidden"):
+        # Rows reverted by an earlier cut that was already continued stay hidden.
+        hidden = set(cut["hidden"])
+        kept = [r for r in out if r["tid"] not in hidden]
+        if len(kept) != len(out):
+            extra = {"reverted": len(out) - len(kept), "cut": cut.get("tid"), "cut_sent": True}
+        out = kept
+    if cut and cut.get("sent"):
+        pass
+    elif cut:
+        tids = [r["tid"] for r in out]
+        if cut.get("tid") in tids:
+            keep = tids.index(cut["tid"]) + 1
+            extra = {"reverted": len(out) - keep, "cut": cut["tid"], "cut_sent": False}
+            out = out[:keep]
+        else:
+            extra.update({"cut_unresolved": True})
     return {
         "id": c.get("id", chat_id),
         "source": c.get("source", source),
         "title": str(c.get("title") or ""),
         "turns": out,
         "total": len(ex),
+        "more": bool(partial or len(ex) > limit),
+        **extra,
     }
 
 
@@ -358,8 +424,9 @@ def _tool_line(t: Any) -> str:
 
 def chat_live(chat_id: str, source: str = "all", turns: int = 8, max_chars: int = 6000) -> dict:
     """chat_turns plus the in-progress tail: what the agent is doing right now."""
-    out = chat_turns(chat_id, source, turns=turns, max_chars=max_chars)
-    c, ex = _chat_exchanges(chat_id, source)
+    pre = _chat_exchanges_tail(chat_id, source, max(1, int(turns)))
+    out = chat_turns(chat_id, source, turns=turns, max_chars=max_chars, _pre=pre)
+    c, ex = pre[0], pre[1]
     last = ex[-1] if ex else {}
     user = str(last.get("user") or "").strip()
     assistant = [str(a) for a in (last.get("assistant") or [])]

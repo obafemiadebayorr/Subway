@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import win_lock
 
-ACTIONS = {"pin", "settle", "snooze", "archive", "rename", "tag", "delete", "principal", "set_principal", "auto_handoff"}
+ACTIONS = {"pin", "settle", "snooze", "archive", "rename", "tag", "delete", "delete_permanent", "principal", "set_principal", "auto_handoff"}
 _LIVE_WORKER_STATES = {"pending_approval", "queued", "starting", "running", "waiting", "paused", "blocked"}
 _META_KEYS = (
     "pinned",
@@ -114,6 +114,10 @@ def public(entry: Any) -> Dict[str, Any]:
         "fallback_principal": str(e.get("fallback_principal") or ""),
         "flagged": bool(e.get("flagged")),
         "rate_limited": bool(e.get("rate_limited")),
+        "origin": str(e.get("origin") or ""),
+        "origin_station": str(e.get("origin_station") or ""),
+        "origin_id": str(e.get("origin_id") or ""),
+        "queued_messages": list(e.get("queued_messages") or []),
         "updated_at": float(e.get("updated_at") or 0),
     }
 
@@ -209,42 +213,72 @@ def _rebind_thread_wake_spools(base_dir: str, thread_id: str, old_principal: str
                 except Exception:
                     continue
 
-    for sdir_name in ("wakes", "wake_spools"):
-        spools_dir = os.path.join(base_dir, sdir_name)
-        if not os.path.isdir(spools_dir):
-            continue
-        old_clean = (old_principal or "").lstrip("@").strip()
-        new_clean = (new_principal or "").lstrip("@").strip()
-        if old_clean and new_clean:
-            old_file = os.path.join(spools_dir, f"{old_clean}.jsonl")
-            new_file = os.path.join(spools_dir, f"{new_clean}.jsonl")
-            if os.path.isfile(old_file):
-                retained_lines: List[str] = []
-                moved_lines: List[str] = []
-                try:
-                    with open(old_file, "r", encoding="utf-8") as f:
-                        for line in f:
-                            raw = line.strip()
-                            if not raw:
-                                continue
-                            try:
-                                item = json.loads(raw)
-                                if str(item.get("thread_id") or item.get("thread") or "") == thread_id:
-                                    item["target"] = new_principal
-                                    moved_lines.append(json.dumps(item))
-                                else:
+    modified_set = set(modified_workers)
+    all_threads = _read(base_dir)
+    old_still_used_elsewhere = any(
+        str(tid_k) != str(thread_id)
+        and isinstance(tinfo, dict)
+        and str(tinfo.get("principal_id") or "") == old_principal
+        for tid_k, tinfo in all_threads.items()
+    )
+
+    def _safe_spool_id(principal: str) -> str:
+        return "".join(c for c in (principal or "").strip() if c.isalnum() or c in ("-", "_", "@", "."))
+
+    old_safe = _safe_spool_id(old_principal)
+    new_safe = _safe_spool_id(new_principal)
+    if old_safe and new_safe:
+        old_candidates = [old_safe]
+        stripped_old = old_safe.lstrip("@")
+        if stripped_old and stripped_old not in old_candidates:
+            old_candidates.append(stripped_old)
+
+        for sdir_name in ("wakes", "wake_spools"):
+            spools_dir = os.path.join(base_dir, sdir_name)
+            if not os.path.isdir(spools_dir):
+                continue
+            for suffix in (".jsonl", ".push.jsonl"):
+                new_file = os.path.join(spools_dir, f"{new_safe}{suffix}")
+                for old_id in old_candidates:
+                    old_file = os.path.join(spools_dir, f"{old_id}{suffix}")
+                    if not os.path.isfile(old_file):
+                        continue
+                    retained_lines: List[str] = []
+                    moved_lines: List[str] = []
+                    try:
+                        with open(old_file, "r", encoding="utf-8") as f:
+                            for line in f:
+                                raw = line.strip()
+                                if not raw:
+                                    continue
+                                try:
+                                    item = json.loads(raw)
+                                    item_thread = str(item.get("thread_id") or item.get("thread") or "")
+                                    item_worker = str(item.get("worker_id") or "")
+                                    matches = (item_thread == thread_id) or (
+                                        not item_thread and (item_worker in modified_set or not old_still_used_elsewhere)
+                                    )
+                                    if matches:
+                                        if "target" in item or suffix == ".jsonl":
+                                            item["target"] = new_principal
+                                        if "chat_id" in item:
+                                            item["chat_id"] = new_principal
+                                        moved_lines.append(json.dumps(item))
+                                    else:
+                                        retained_lines.append(raw)
+                                except Exception:
                                     retained_lines.append(raw)
-                            except Exception:
-                                retained_lines.append(raw)
-                    if moved_lines:
-                        with open(new_file, "a", encoding="utf-8") as f:
-                            for ml in moved_lines:
-                                f.write(ml + "\n")
-                        with open(old_file, "w", encoding="utf-8") as f:
-                            for rl in retained_lines:
-                                f.write(rl + "\n")
-                except Exception:
-                    pass
+                        if moved_lines:
+                            with open(new_file, "a", encoding="utf-8") as f:
+                                for ml in moved_lines:
+                                    f.write(ml + "\n")
+                            tmp = f"{old_file}.{os.getpid()}.{time.time_ns()}.tmp"
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                for rl in retained_lines:
+                                    f.write(rl + "\n")
+                            os.replace(tmp, old_file)
+                    except Exception:
+                        pass
     return modified_workers
 
 
@@ -622,12 +656,45 @@ def t_set_initiator(thread_id: str, initiator_id: str, note: str = "") -> str:
     return out
 
 
+def _principal_model(principal_id: str) -> str:
+    """Return the principal's model field if the chat record has one; '' on failure."""
+    try:
+        import server as _s
+        chat = _s.resolve(principal_id, strict=False)
+        if chat and isinstance(chat, dict):
+            for key in ("model", "model_id"):
+                val = chat.get(key)
+                if val:
+                    return str(val)
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _principal_label(principal_id: str, res: Optional[dict] = None) -> str:
+    """'<provider> · <model>' for a principal, or just the provider, or ''."""
+    res = res or {}
+    provider = str(res.get("provider") or "")
+    if not provider:
+        try:
+            provider = _provider_for_principal(principal_id)
+        except Exception:  # noqa: BLE001
+            provider = ""
+    model = str(res.get("model") or "")
+    if not model:
+        model = _principal_model(principal_id)
+    return " · ".join(x for x in (provider, model) if x)
+
+
 def t_set_principal(thread_id: str, principal_id: str, note: str = "", auto_handoff: Optional[bool] = None) -> str:
     """MCP tool wrapper for set_principal."""
     res = set_principal(thread_id, principal_id, note=note, auto_handoff=auto_handoff)
     if res.get("error"):
         return "Error: " + str(res["error"])
     out = f"[PRINCIPAL] {res.get('thread_id')} -> {res.get('principal_id')}"
+    label = _principal_label(str(res.get("principal_id") or principal_id), res)
+    if label:
+        out += f" · {label}"
     if note:
         out += f" ({note})"
     return out
@@ -762,6 +829,10 @@ def apply_action(base_dir: str, thread_id: str, action: str, value: Any = None) 
         elif kind == "delete":
             entry["deleted"] = _truthy(value)
             result = "Deleted" if entry["deleted"] else "Restored"
+        elif kind == "delete_permanent":
+            entry["deleted"] = True
+            entry["archived"] = True
+            result = "Deleted permanently"
         elif kind == "set_principal":
             pid = str(value or "").strip()
             entry["principal_id"] = pid
@@ -777,3 +848,71 @@ def apply_action(base_dir: str, thread_id: str, action: str, value: Any = None) 
             data[tid] = entry
         _write(base_dir, data)
         return {"ok": True, "result": result, "meta": public(entry)}
+
+
+def queue_thread_message(base_dir: str, thread_id: str, text: str, sender: str = '') -> dict:
+    """Queue a message into a thread atomically."""
+    import hashlib
+    import uuid
+    import threads
+
+    tid = str(thread_id or '').strip()
+    if not tid:
+        raise KeyError('thread not found')
+
+    bdir = _base_dir(base_dir)
+
+    # Check len(text.encode('utf-8')) <= 32768, else raise ValueError('message too large')
+    raw_bytes = (text or '').encode('utf-8')
+    if len(raw_bytes) > 32768:
+        raise ValueError('message too large')
+
+    # Check thread exists (in thread_state.json or threads/<safe_name>.jsonl), else raise KeyError('thread not found')
+    with _locked(bdir):
+        data = _read(bdir)
+        exists_in_state = tid in data
+        try:
+            safe = threads.safe_name(tid)
+            jsonl_path = os.path.join(bdir, 'threads', f'{safe}.jsonl')
+            exists_in_jsonl = os.path.isfile(jsonl_path)
+        except Exception:
+            exists_in_jsonl = False
+
+        if not exists_in_state and not exists_in_jsonl:
+            raise KeyError('thread not found')
+
+        # Check not archived in thread_state.json, else raise ValueError('archived')
+        if exists_in_state and data[tid].get('archived'):
+            raise ValueError('archived')
+
+        # Store queued message atomically
+        now = time.time()
+        msg_id = f'msg_{uuid.uuid4().hex[:12]}'
+        entry = _copy(data.get(tid))
+        queued = list(entry.get('queued_messages') or [])
+        msg_obj = {
+            'id': msg_id,
+            'text': text,
+            'sender': str(sender or ''),
+            'created_at': now,
+        }
+        queued.append(msg_obj)
+        entry['queued_messages'] = queued
+        entry['updated_at'] = now
+        data[tid] = entry
+        _write(bdir, data)
+
+    # Also append an event to the thread's event log if possible
+    try:
+        threads.record(
+            bdir,
+            tid,
+            'note',
+            node='thread_queue',
+            peer=str(sender or ''),
+            data={'message_id': msg_id, 'text': text[:500], 'sender': str(sender or '')},
+        )
+    except Exception:
+        pass
+
+    return {'queued': True, 'id': msg_id}

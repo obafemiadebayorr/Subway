@@ -18,11 +18,17 @@ def _extract_task_files(task: Dict[str, Any]) -> List[str]:
         files_val = [files_val]
     elif not isinstance(files_val, list):
         files_val = []
-    
+
+    proj_dir = task.get("project_dir")
+    if isinstance(proj_dir, str) and proj_dir.strip():
+        proj_dir = os.path.expanduser(proj_dir.strip())
+    else:
+        proj_dir = ""
+
     canon_files = []
     for f in files_val:
         if isinstance(f, str) and f.strip():
-            canon_files.append(_locks._canon_path(f.strip()))
+            canon_files.append(_locks._canon_path(f.strip(), project_dir=proj_dir))
     return canon_files
 
 
@@ -119,50 +125,38 @@ def run_concurrent(tasks: List[Dict[str, Any]], track: str = "main") -> Dict[str
     for i, t in enumerate(tasks):
         files = task_files_map[i]
         role = t.get("role", "Worker")
+        proj_dir = t.get("project_dir") or ""
         for f in files:
             # Lease each target file for the caller / group
             _locks.t_claim_file(
                 filepath=f,
                 purpose=f"run_concurrent [{group_id}] task {i+1}: {role}",
-                duration_seconds=t.get("max_seconds", 600) + 120
+                duration_seconds=t.get("max_seconds", 600) + 120,
+                project_dir=proj_dir,
             )
 
     # 5. Launch each task with isolate=True
     workers = []
+    drop_keys = {
+        "files", "target_files",
+        "depends_on", "after_worker", "wait_for", "after", "parent_task", "requires",
+    }
     for i, t in enumerate(tasks):
-        role = t.get("role", f"Worker #{i+1}")
-        prompt = t.get("prompt", "")
-        provider = t.get("provider", "auto")
-        model = t.get("model", "")
-        max_tokens = t.get("max_tokens")
-        max_seconds = t.get("max_seconds")
-        effort = t.get("effort")
-        permission_mode = t.get("permission_mode", "ask")
-        
-        # Build kwargs for t_spin_worker
-        spin_kwargs: Dict[str, Any] = {
-            "role": role,
-            "prompt": prompt,
-            "provider": provider,
-            "track": track,
-            "isolate": True,  # Critical: isolated worktree copy
-            "permission_mode": permission_mode,
-        }
-        if model:
-            spin_kwargs["model"] = model
-        if max_tokens is not None:
-            spin_kwargs["max_tokens"] = max_tokens
-        if max_seconds is not None:
-            spin_kwargs["max_seconds"] = max_seconds
-        if effort:
-            spin_kwargs["effort"] = effort
-        
+        role = t.get("role") or f"Worker #{i+1}"
+
+        # Build kwargs for t_spin_worker forwarding task parameters
+        spin_kwargs: Dict[str, Any] = {k: v for k, v in t.items() if k not in drop_keys}
+        spin_kwargs["role"] = role
+        spin_kwargs.setdefault("provider", "auto")
+        spin_kwargs["track"] = track
+        spin_kwargs.setdefault("isolate", True)
+
         # Call t_spin_worker
         try:
             res_str = _s.t_spin_worker(**spin_kwargs)
         except Exception as e:
             res_str = f"Error: failed to spin worker: {e}"
-        
+
         # Extract worker id from result string if possible
         worker_id = None
         if "worker_" in str(res_str):
@@ -170,7 +164,7 @@ def run_concurrent(tasks: List[Dict[str, Any]], track: str = "main") -> Dict[str
                 if word.startswith("worker_"):
                     worker_id = word.rstrip(".,;:)")
                     break
-        
+
         workers.append({
             "task_index": i,
             "role": role,
@@ -178,7 +172,7 @@ def run_concurrent(tasks: List[Dict[str, Any]], track: str = "main") -> Dict[str
             "status": "spawned" if (worker_id or not res_str.startswith("Error")) else "error",
             "message": res_str,
             "target_files": task_files_map[i],
-            "isolate": True
+            "isolate": spin_kwargs.get("isolate", True)
         })
 
     return {

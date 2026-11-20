@@ -143,8 +143,7 @@ let streamStarted = false;
 export function startAuditStream() {
   if (streamStarted || typeof EventSource === "undefined") return;
   streamStarted = true;
-  const token = document.querySelector('meta[name="subway-token"]');
-  const es = new EventSource(`/api/events?token=${encodeURIComponent(token ? token.content : "")}`);
+  const es = new EventSource('/api/events');
   es.addEventListener("audit", (ev) => {
     try { prependActivity(JSON.parse(ev.data)); } catch (e) { /* ignore malformed frames */ }
   });

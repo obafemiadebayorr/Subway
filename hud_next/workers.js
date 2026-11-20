@@ -81,6 +81,12 @@ const CSS = `
 .wq-code i{display:block;background:var(--ink);opacity:.8;border-radius:.5px}
 .wq-tags{display:flex;flex-wrap:wrap;gap:6px}
 .wq-tag{font-size:11px;font-weight:600;padding:3px 8px;border-radius:99px;background:var(--surface);box-shadow:0 0 0 1px var(--hair);color:var(--muted);white-space:nowrap}
+.wq-tag.wq-device{color:var(--sky-ink);background:var(--sky-chip-hi);box-shadow:none}
+.wq-launch{padding:10px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.wq-launch-lbl{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--muted);white-space:nowrap}
+.wq-dev-select{padding:7px 10px;border:0;border-radius:8px;background:var(--ground);box-shadow:0 0 0 1px var(--hair);font:inherit;font-size:13px;color:var(--ink);max-width:220px}
+.wq-launch-role{flex:0 1 180px;min-width:130px}
+.wq-launch-prompt{flex:1 1 220px;min-width:160px}
 .wq-acts{display:flex;flex-wrap:wrap;gap:8px}
 .wq-btn{border:0;border-radius:8px;padding:7px 12px;font:inherit;font-size:13px;font-weight:500;cursor:pointer;background:var(--surface);box-shadow:0 0 0 1px var(--hair);color:var(--ink)}
 .wq-btn.primary{background:var(--c);box-shadow:none;color:#fff}
@@ -209,6 +215,18 @@ async function loadWorkers(forceHist = false) {
   try {
     const [d] = await Promise.all([status(), loadChats()]);
     WK.live = d.workers || []; WK.hist = d.history || []; WK.perms = d.permissions || d.pending_permissions || []; WK.total = d.total_history || 0; WK.err = "";
+    // Remote (linked-station) permissions ride along but never block the local paint.
+    fetch("/api/remote_workers", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((rd) => {
+      const remotePerms = [];
+      for (const w of (rd && rd.workers) || []) {
+        for (const p of (w && w.pending_permissions) || []) {
+          remotePerms.push({ ...p, remote: true, worker_id: w.worker_id, station: w.station, role: w.role || w.label });
+        }
+      }
+      const local = (WK.perms || []).filter((p) => !p.remote);
+      WK.perms = [...local, ...remotePerms];
+      if (WK.slot?.isConnected) (WK.repaint || paintWorkers)(WK.slot);
+    }).catch(() => null);
     if (forceHist || WK.total !== WK.lastTotal || !WK.allHist.length) {
       WK.lastTotal = WK.total;
       loadAllHistory().then(() => { if (WK.slot?.isConnected) (WK.repaint || paintWorkers)(WK.slot); });
@@ -272,7 +290,7 @@ function permCard(p) {
   const btn = (dec, label, cls = "") => `<button type="button" class="wq-btn ${cls}" data-perm="${dec}" data-id="${esc(id)}"${busy ? " disabled" : ""}>${esc(label)}</button>`;
   return `<article class="wq-card wq-perm" data-perm-card="${esc(id)}" aria-label="${esc("Permission " + id + " " + pKind)}">
     <div class="wq-perm-head">
-      <div class="wq-perm-title"><span class="wq-tag">${esc(pKind)}</span><span>${esc(meta)}</span></div>
+      <div class="wq-perm-title"><span class="wq-tag">${esc(pKind)}</span>${p.remote ? `<span class="wq-tag">on @${esc(p.station || "?")}</span>` : ""}<span>${esc(meta)}</span></div>
       <span class="wq-id">${esc(id)}</span>
     </div>
     ${msg ? `<pre class="wq-perm-detail">${esc(typeof msg === "string" ? msg : JSON.stringify(msg, null, 2))}</pre>` : ""}
@@ -289,7 +307,10 @@ async function answerPerm(slot, id, decision, repaint) {
   WK.permBusy[id] = true;
   repaint(slot);
   try {
-    const res = await api("/api/answer_permission", { id, decision });
+    const perm = (WK.perms || []).find((p) => (p.id || p.request_id) === id);
+    const res = perm?.remote
+      ? await api("/api/peers/answer_permission", { worker_id: perm.worker_id, id, decision })
+      : await api("/api/answer_permission", { id, decision });
     if (res?.error) say(res.error, "error");
     else {
       WK.perms = WK.perms.filter((p) => (p.id || p.request_id) !== id);
@@ -376,6 +397,80 @@ function cancelUndo(key) {
   if (entry.slot?.isConnected) paintWorkers(entry.slot);
 }
 
+const DEV = { station: "", peers: [], loaded: false, busy: false, role: "", prompt: "" };
+
+function peerStation(p) {
+  return String(p?.station || p?.slug || p?.name || p?.peer_id || "").replace(/^@/, "");
+}
+
+function peerLabel(p) {
+  const slug = peerStation(p);
+  const name = String(p?.name || slug || p?.peer_id || "");
+  const status = p?.online === false ? " (offline)" : "";
+  return (slug ? "@" + slug : name) + (name && slug && name !== slug ? " — " + name : "") + status;
+}
+
+function syncDeviceSelect(slot) {
+  const sel = slot?.querySelector(".wq-dev-select");
+  if (!sel) return;
+  const opts = [["", "This station"], ["auto", "Auto (best device)"]];
+  const seen = new Set(["", "auto"]);
+  for (const p of DEV.peers) {
+    const slug = peerStation(p);
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+    opts.push([slug, peerLabel(p)]);
+  }
+  const nodes = opts.map(([val, label]) => {
+    const opt = document.createElement("option");
+    opt.value = val;
+    opt.textContent = label;
+    return opt;
+  });
+  sel.replaceChildren(...nodes);
+  sel.value = seen.has(DEV.station) ? DEV.station : "";
+  DEV.station = sel.value;
+}
+
+async function loadOwnPeers(slot) {
+  try {
+    const r = await fetch("/api/peers", { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    const list = Array.isArray(d?.peers) ? d.peers : (Array.isArray(d) ? d : []);
+    DEV.peers = list.filter((p) => p && (!p.relation || p.relation === "own"));
+    DEV.loaded = true;
+    if (slot?.isConnected) syncDeviceSelect(slot);
+  } catch (_) {}
+}
+
+async function launchWorker(slot) {
+  if (DEV.busy) return;
+  const prompt = DEV.prompt.trim();
+  const role = DEV.role.trim() || "Worker";
+  if (!prompt) { say("Enter a prompt to run a worker", "error"); return; }
+  const btn = slot.querySelector(".wq-launch-btn");
+  DEV.busy = true;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api("/api/spawn", { role, prompt, provider: "auto", track: "main", station: DEV.station });
+    if (res?.error) { say(res.error, "error"); }
+    else {
+      DEV.prompt = "";
+      const pInput = slot.querySelector(".wq-launch-prompt");
+      if (pInput) pInput.value = "";
+      const where = DEV.station === "auto" ? " on auto" : DEV.station ? " on @" + DEV.station : "";
+      say("Worker queued" + where, "success");
+      loadWorkers().then(() => slot.isConnected && paintWorkers(slot));
+    }
+  } catch (e) {
+    say(e.message || String(e), "error");
+  } finally {
+    DEV.busy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
 function ticket(w) {
   const k = kind(w), open = WK.open.has(w.id), busy = !!WK.busy[w.id];
   const start = ms(w.started_at || w.created_at), end = ms(w.completed_at);
@@ -384,6 +479,7 @@ function ticket(w) {
   const budget = w.cap ? (w.tokens ? Math.round((w.tokens / w.cap) * 100) + "% of " + tok(w.cap) : "Cap " + tok(w.cap)) : "No cap";
   const from = w.requested_by && !UUID.test(w.requested_by) ? "@" + w.requested_by : chatName(w.launched_by || w.requested_by) || "This station";
   const to = w.track ? "#" + w.track : "–";
+  const deviceLabel = w.station ? "@" + w.station : "This station";
   const line = [w.provider, w.model].filter(Boolean).join(" → ") + (w.effort ? ` · effort ${w.effort}` : "");
   const overBudget = /budget/i.test(String(w.status || ""));
   const stamp = k === "fail" ? (overBudget ? "Over budget" : String(w.status || "Failed").replace(/_/g, " ")) : k === "done" ? (w.merged ? "Merged" : w.branch_name ? "Not merged" : "Completed") : "";
@@ -404,12 +500,12 @@ function ticket(w) {
         ${stamp ? `<span class="wq-stamp" aria-hidden="true">${esc(stamp)}</span><span class="wq-punch" aria-hidden="true"></span>` : ""}
         <div><h3 class="wq-title">${esc(w.role || "Worker")}</h3><div class="wq-line">${esc(line)}</div>${(w.skills || []).length || (w.mcp || []).length ? `<div class="wk-borrow" aria-label="Borrowed">${(w.skills || []).map((n) => `<span class="wk-chip" title="Skill">✦ ${esc(n)}</span>`).join("")}${(w.mcp || []).map((n) => `<span class="wk-chip" title="MCP server">⚡ ${esc(n)}</span>`).join("")}</div>` : ""}</div>
         <div class="wq-route">${f("From", from, w.launched_by || "")}<span class="wq-track" style="--p:${prog.toFixed(3)}" aria-hidden="true"><span class="rail"></span><span class="stop a"></span><span class="stop b"></span>${LOCO}</span>${f("To", to)}</div>
-        <div class="wq-grid">${f("Departed", clock(start))}${f(k === "run" ? "Arrives" : "Arrived", k === "run" ? "En route" : k === "wait" ? "Not boarded" : clock(end))}${f("Journey", journey)}${f("Fare", fare)}${f("Budget", budget)}</div>
+        <div class="wq-grid">${f("Device", deviceLabel)}${f("Departed", clock(start))}${f(k === "run" ? "Arrives" : "Arrived", k === "run" ? "En route" : k === "wait" ? "Not boarded" : clock(end))}${f("Journey", journey)}${f("Fare", fare)}${f("Budget", budget)}</div>
       </div>
       <div class="wq-perf" aria-hidden="true"></div>
       <div class="wq-stub">
         <div class="wq-seat"><div class="wq-f"><span>Seat</span><span class="wq-id">${esc(w.id)}</span></div>${barcode(w.id)}</div>
-        ${tags.length ? `<div class="wq-tags">${tags.map((t) => `<span class="wq-tag">${esc(t)}</span>`).join("")}</div>` : ""}
+        <div class="wq-tags"><span class="wq-tag wq-device">${esc(deviceLabel)}</span>${tags.map((t) => `<span class="wq-tag">${esc(t)}</span>`).join("")}</div>
         <div class="wq-acts">${acts}${b("copy", "Copy id")}</div>
       </div>
     </div>
@@ -428,7 +524,7 @@ function paintWorkers(slot) {
   all.forEach(([w, k]) => { if (!w.archived && (k === "run" || k === "wait") || isToday(w)) n[k]++; });
   const q = WK.q.trim().toLowerCase();
   const [, , pick] = FILTERS.find(([key]) => key === WK.filter) || FILTERS[0];
-  const shown = all.filter(([w, k]) => pick(w, k) && (!q || [w.role, w.id, w.provider, w.model, w.track, chatName(w.launched_by)].some((v) => String(v || "").toLowerCase().includes(q))));
+  const shown = all.filter(([w, k]) => pick(w, k) && (!q || [w.role, w.id, w.provider, w.model, w.track, w.station, chatName(w.launched_by)].some((v) => String(v || "").toLowerCase().includes(q))));
   slot.querySelector(".wq-stats").innerHTML = [["Running", n.run], ["Waiting on you", n.wait + WK.perms.length], ["Finished today", n.done], ["Failed today", n.fail]]
     .map(([l, v]) => `<div class="wq-card wq-stat"><b>${v}</b><span>${l}</span></div>`).join("");
   const pSlot = slot.querySelector(".wq-perms");
@@ -522,9 +618,21 @@ async function commitWorkerAction(slot, a, id) {
 
 function workersTab(slot) {
   slot.innerHTML = `<div style="display:flex;flex-direction:column;gap:12px"><div class="wq-stats"></div>
+    <form class="wq-card wq-launch" aria-label="Run worker on device">
+      <label class="wq-launch-lbl">Run on <select class="wq-dev-select" name="station" aria-label="Run on device"></select></label>
+      <input class="wq-q wq-launch-role" type="text" name="role" placeholder="Role (e.g. Unit Tester)" aria-label="Worker role" value="${esc(DEV.role)}">
+      <input class="wq-q wq-launch-prompt" type="text" name="prompt" placeholder="Prompt to dispatch…" aria-label="Worker prompt" value="${esc(DEV.prompt)}">
+      <button type="submit" class="wq-btn primary wq-launch-btn"${DEV.busy ? " disabled" : ""}>Run worker</button>
+    </form>
     <div class="wq-perms" aria-label="Pending permissions"></div>
     <div class="wq-bar"><div class="wq-seg" role="group" aria-label="Filter workers"></div><input class="wq-q" type="search" placeholder="Search role, id, model, track or chat" aria-label="Search workers" value="${esc(WK.q)}"><span class="wq-undo-host"></span></div>
     <div class="wq-list" aria-live="polite"></div></div>`;
+  syncDeviceSelect(slot);
+  slot.querySelector(".wq-dev-select").addEventListener("change", (e) => { DEV.station = e.target.value; });
+  slot.querySelector(".wq-launch-role").addEventListener("input", (e) => { DEV.role = e.target.value; });
+  slot.querySelector(".wq-launch-prompt").addEventListener("input", (e) => { DEV.prompt = e.target.value; });
+  slot.querySelector(".wq-launch").addEventListener("submit", (e) => { e.preventDefault(); launchWorker(slot); });
+  loadOwnPeers(slot);
   slot.addEventListener("click", (e) => {
     const pb = e.target.closest("[data-perm]");
     if (pb && !pb.disabled) { answerPerm(slot, pb.dataset.id, pb.dataset.perm, paintWorkers); return; }
@@ -594,7 +702,9 @@ async function denyAllPerms(slot) {
     const id = p.id || p.request_id || "";
     if (!id) continue;
     try {
-      const res = await api("/api/answer_permission", { id, decision: "deny" });
+      const res = p.remote
+        ? await api("/api/peers/answer_permission", { worker_id: p.worker_id, id, decision: "deny" })
+        : await api("/api/answer_permission", { id, decision: "deny" });
       if (res?.error) failed.add(id);
     } catch (_) {
       failed.add(id);

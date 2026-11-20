@@ -10,19 +10,23 @@ const TILES=[
 const pl=(n,w)=>`${n} ${w}${n===1?"":"s"}`;
 async function live(){const get=u=>fetch(u,{cache:"no-store"}).then(r=>r.ok?r.json():{}).catch(()=>({}));
   const T=Object.fromEntries(TILES.map(t=>[t.id,t])),len=x=>Array.isArray(x)?x.length:x&&typeof x==="object"?Object.keys(x).length:Number(x)||0;
-  const upd=()=>{if(document.querySelector(".tiles"))paint();};
+  const H={run:0,wait:0,session:""},herop=()=>{const el=document.querySelector(".hero-sub");if(!el)return;const parts=[];if(H.run)parts.push(`${pl(H.run,"worker")} running`);if(H.wait)parts.push(`<a href="#workers">${pl(H.wait,"waiting for approval")}</a>`);if(H.session)parts.push(`<a href="#collab/sessions" class="hero-live" style="white-space:nowrap"><span aria-hidden="true" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ochre);box-shadow:0 0 0 3px color-mix(in srgb,var(--ochre) 20%,transparent);margin-right:6px;vertical-align:1px"></span>Coupled: ${esc(H.session)}</a>`);el.innerHTML=parts.length?parts.join(" · "):"All quiet.";};
+  const upd=()=>{if(document.querySelector(".tiles"))paint();herop();};
   /* Each fetch updates only its own badge as soon as it lands: no Promise.all blocking. */
   const fl={ov:0,lk:0};
   const files=()=>Object.assign(T.files,{needs:fl.ov>0,sub:[fl.ov?`${pl(fl.ov,"overlap")} to resolve`:"No overlaps",fl.lk?`${pl(fl.lk,"file")} leased`:""].filter(Boolean).join(" · ")+"."});
   get("/api/status?view=next").then(st=>{
-    const wait=(st.workers||[]).filter(w=>w.status==="pending_approval").length;
-    Object.assign(T.approvals,{needs:wait>0,sub:wait?`${pl(wait,"worker")} ${wait===1?"is":"are"} waiting on you.`:"Nothing waiting on you."});
+    const ws=st.workers||[];
+    H.run=ws.filter(w=>w.status==="running").length;
+    H.wait=ws.filter(w=>w.status==="pending_approval").length;
+    Object.assign(T.approvals,{needs:H.wait>0,sub:H.wait?`${pl(H.wait,"worker")} ${H.wait===1?"is":"are"} waiting on you.`:"Nothing waiting on you."});
     fl.lk=len(st.locks);files();upd();});
   get("/api/landing").then(ld=>{
     fl.ov=len(ld.conflicts);files();upd();});
   get("/api/coordination/all").then(co=>{
     const others=(co.groups||[]).flatMap(g=>g.stations||[]).filter(x=>x.relation&&x.relation!=="self").length;
     Object.assign(T.team,{needs:false,sub:others?`${pl(others,"linked station")} on track ${co.track||"main"}.`:"No linked stations online."});upd();});
+  get("/api/collab/session").then(cs=>{const se=cs&&cs.session;H.session=se&&se.name?String(se.name):"";upd();});
   get("/api/terminals").then(te=>{
     const tn=len(te.terminals);
     Object.assign(T.terminal,{needs:false,sub:tn?`${pl(tn,"terminal")} open.`:"Nothing running."});upd();});
@@ -36,7 +40,7 @@ const NAME="Oba";
 function greeting(){const hr=new Date().getHours();return hr<5?"Good night":hr<12?"Good morning":hr<17?"Good afternoon":"Good evening";}
 function hero(){const el=document.createElement("section");el.className="hero";
   el.innerHTML=`<h1 class="hero-h"><span class="hero-hi">${greeting()}, ${NAME}.</span><br>What should the <em>fleet do?</em></h1>
-  <p class="hero-sub">3 workers running · <a href="#workers">1 waiting for approval</a> · <a href="#collab/sessions" class="hero-live" style="white-space:nowrap"><span aria-hidden="true" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ochre);box-shadow:0 0 0 3px rgba(212,166,74,.2);margin-right:6px;vertical-align:1px"></span>Coupled: Trains review</a></p>`;return el;}
+  <p class="hero-sub">Checking…</p>`;return el;}
 function mount(){document.querySelector(".tiles")?.remove();
   const r=(location.hash.slice(1)||"home").split("/")[0];if(r!=="home")return;
   document.getElementById("page").append(hero());

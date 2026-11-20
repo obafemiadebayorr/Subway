@@ -136,17 +136,25 @@ def summary(manifest: Dict[str, Any]) -> str:
 
 def unit_meta(clean: List[Dict[str, Any]], index: int, cwd: str) -> Dict[str, Any]:
     return {"index": index, "cwd": cwd, "title": clean[index]["title"], "verify": clean[index]["verify"],
+            "brief": clean[index]["prompt"],
             "total": len(clean), "after": clean[index].get("after", "success")}
 
 
-def unit_prompt(cwd: str, index: int, clean: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Manifest summary + this unit's brief. Built when the unit starts so the statuses are current."""
+def unit_prompt(cwd: str, index: int, clean: Optional[List[Dict[str, Any]]] = None,
+                pinned_verify: Optional[str] = None, pinned_brief: Optional[str] = None) -> str:
+    """Manifest summary + this unit's brief. Built when the unit starts so the statuses are current.
+
+    F6: verify/brief pinned at spin time (unit_meta/chain_steps) override the manifest file when
+    provided — the manifest sits uncommitted in the tree and a tampered `verifies[i]` used to be
+    executed with shell=True in the main checkout on the resume path."""
     manifest = load_manifest(cwd)
     if not manifest or index >= len(manifest["units"]):
         raise ValueError(f"no unit {index + 1} in {manifest_path(cwd)}")
     entry = manifest["units"][index]
-    brief = (clean[index]["prompt"] if clean else (manifest.get("briefs") or [""] * (index + 1))[index])
-    verify = (clean[index]["verify"] if clean else (manifest.get("verifies") or [""] * (index + 1))[index])
+    brief = (clean[index]["prompt"] if clean else
+             (pinned_brief if pinned_brief is not None else (manifest.get("briefs") or [""] * (index + 1))[index]))
+    verify = (clean[index]["verify"] if clean else
+              (pinned_verify if pinned_verify is not None else (manifest.get("verifies") or [""] * (index + 1))[index]))
     n = len(manifest["units"])
     lines = [f"UNITS (you are unit {index + 1} of {n}; earlier units are finished and committed):",
              summary(manifest), "",

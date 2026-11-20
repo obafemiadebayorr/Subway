@@ -23,6 +23,7 @@ function applyAttrs(el, attrs) {
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === undefined || v === null || v === false) continue;
     if (k === "on") for (const [ev, fn] of Object.entries(v)) el.addEventListener(ev, fn);
+    else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2).toLowerCase(), v);
     else if (k === "class") el.setAttribute("class", v);
     else if (k === "value") el.value = v;
     else if (v === true) el.setAttribute(k, "");
@@ -161,7 +162,7 @@ export function set(key, value) {
 import { notify } from "./notifications.js";
 
 export function toast(message) {
-  notify({ message, kind: "info" });
+  if (window.toast?.info) window.toast.info(String(message)); else notify({ message, kind: "info" });
 }
 
 export async function act(path, body) {
@@ -197,7 +198,7 @@ export function modal(title, body, headExtra) {
   dlg.addEventListener("pointerdown", (e) => { pressedOutside = outside(e); });
   dlg.addEventListener("click", (e) => { if (pressedOutside && outside(e)) dlg.close(); pressedOutside = false; });
   dlg.addEventListener("close", () => dlg.remove());
-  document.body.append(dlg);
+  (window.__subwayFloatHost?.isConnected ? window.__subwayFloatHost : document.body).append(dlg);
   dlg.showModal();
   return dlg;
 }

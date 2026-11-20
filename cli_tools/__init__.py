@@ -178,11 +178,19 @@ def t_escalate_worker(worker_id: str, new_effort: str = "max", new_mode: str = "
     return f"{esc_msg}\n\n[SUCCESSOR WORKER QUEUED]\n{succ_res}"
 
 
-def t_quota_status(source: str = "all") -> str:
+def t_quota_status(source: str = "all", session_id: Optional[str] = None, sender: Optional[str] = None) -> str:
     """Show real limits and token counts for each detected client, with where they came from."""
     wanted = {"all": None, "claude": "claude", "antigravity": "antigravity", "opencode": "opencode"}.get(source)
     lines = ["[SUBWAY USAGE METERS]"]
-    for p in _s.load_quotas()["providers"]:
+    try:
+        load_quotas = getattr(_s, "load_quotas", None)
+        if load_quotas is None:
+            from usage.local import load_quotas
+        quotas = load_quotas()
+    except Exception as e:
+        quotas = {"providers": []}
+        lines.append(f"* quota sources unavailable: {e}")
+    for p in quotas.get("providers", []):
         if wanted and p["id"] != wanted:
             continue
         plan = f" ({p['plan']})" if p.get("plan") else ""
@@ -208,6 +216,27 @@ def t_quota_status(source: str = "all") -> str:
             lines.append(f"* {p['note']}")
         if p.get("error"):
             lines.append(f"* Source error: {p['error']}")
+    if session_id:
+        lines.append("\n=== Session lending caps ===")
+        try:
+            from hud_server import session_quota
+            ids = [sender] if sender else list(((session_quota._load_session(session_id) or {}).get("caps") or {}).keys())
+            if not ids:
+                lines.append("No caps set for this session.")
+            for sid_sender in ids:
+                rem = session_quota.remaining(session_id, sid_sender)
+                if not rem.get("ok"):
+                    lines.append(f"* {sid_sender}: {rem.get('error')}")
+                    continue
+                cap = rem.get("cap") or {}
+                used = rem.get("used") or {}
+                if not cap:
+                    lines.append(f"* {sid_sender}: no cap set")
+                    continue
+                lines.append(f"* {sid_sender}: cap={cap} used_tokens={used.get('tokens', 0)} "
+                             f"remaining={rem.get('remaining')} stop={rem.get('stop')}")
+        except Exception as exc:
+            lines.append(f"* session caps unavailable: {exc}")
     return "\n".join(lines)
 
 
@@ -579,6 +608,41 @@ def run_cli(argv: List[str]) -> int:
                     return 1
                 print("[SUBWAY] Registered Windows scheduled task Subway\\Daemon.")
                 return 0
+            if sys.platform.startswith("linux"):
+                # systemd user unit: the LaunchAgents path below is macOS-only and
+                # would leave a useless plist on Linux with nothing to autostart.
+                import platform as _platform
+                unit_dir = os.path.expanduser("~/.config/systemd/user")
+                unit = os.path.join(unit_dir, "subway-daemon.service")
+                os.makedirs(unit_dir, exist_ok=True)
+                py = sys.executable or shutil.which("python3") or "python3"
+                body = f"""[Unit]
+Description=Subway daemon (HUD + wake queue drain)
+After=graphical-session.target
+
+[Service]
+ExecStart={py} {os.path.abspath(sys.argv[0])} daemon
+Restart=on-failure
+Environment=SUBWAY_HOST=0.0.0.0
+Environment=SUBWAY_DIR={_s.SUBWAY_DIR}
+
+[Install]
+WantedBy=default.target
+"""
+                with open(unit, "w", encoding="utf-8") as f:
+                    f.write(body)
+                print(f"[SUBWAY] Wrote {unit}.")
+                try:
+                    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, timeout=15)
+                    r = subprocess.run(["systemctl", "--user", "enable", "--now", "subway-daemon.service"], capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        print("[SUBWAY] systemd user service enabled and started (subway-daemon.service).")
+                        return 0
+                    print(f"[SUBWAY] systemd enable failed: {(r.stderr or r.stdout or '').strip()[:160]}", file=sys.stderr)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    print(f"[SUBWAY] systemctl unavailable ({e}); start it manually.", file=sys.stderr)
+                print("[SUBWAY] Start manually with: systemctl --user enable --now subway-daemon.service")
+                return 0
             plist = os.path.expanduser("~/Library/LaunchAgents/com.subway.daemon.plist")
             old_plist = os.path.expanduser("~/Library/LaunchAgents/com.subway-context.daemon.plist")
             if os.path.exists(old_plist):
@@ -636,8 +700,11 @@ def run_cli(argv: List[str]) -> int:
                 if stop["now"]:
                     break
                 time.sleep(1)
-        print("[SUBWAY] Daemon stopped.")
-        return 0
+        httpd = getattr(_s, "_hud_server_instance", None)
+        if httpd is not None:  # serve_forever runs in a non-daemon thread; stop it or the process lingers
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+        print("[SUBWAY] Daemon stopped.", flush=True)
+        os._exit(0)
     if arg in ("restart-hud", "restart_hud", "run-server", "run_server"):
         port = _s.HUD_PORT
         for a in rest:
@@ -851,6 +918,18 @@ def run_cli(argv: List[str]) -> int:
                 print("\nStopped.")
             return 0
         if verb == "approve" and len(rest) > 1:
+            token = str(rest[1]).strip()
+            # An 8-character uppercase alphanumeric token is a device approval code (M6 T1);
+            # anything else is a pairing request_id and keeps the old behaviour.
+            if len(token) == 8 and token.isalnum() and token.isupper():
+                import device_approval
+                try:
+                    res = device_approval.approve(token)
+                except (KeyError, ValueError) as exc:
+                    print(f"Error: {exc}")
+                    return 1
+                print(f"Approved device for peer {res.get('peer', '')} (code {token}).")
+                return 0
             res = _pair.approve(rest[1])
             if "error" in res:
                 print(f"Error: {res['error']}")
@@ -866,7 +945,7 @@ def run_cli(argv: List[str]) -> int:
             res = _pair.revoke(rest[1])
             print(f"Revoked {rest[1]}." if "error" not in res else f"Error: {res['error']}")
             return 0 if "error" not in res else 1
-        print("Usage: subway pair [list] | pair watch [--dialog] | pair approve <request_id> | "
+        print("Usage: subway pair [list] | pair watch [--dialog] | pair approve <code|request_id> | "
               "pair deny <request_id> | pair revoke <device_id>")
         return 2
     if arg in ("link", "--link"):

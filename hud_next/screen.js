@@ -27,17 +27,17 @@ const qSelect = (who, cur, disabled) => `<select class="scr-q" data-scr-q="${who
 /* ---------- viewer: this station watches a linked one ---------- */
 let V = null; // { peer, name, el, sid, pc, live, closed }
 
-function openPanel(peer, name, live) {
+function openPanel(peer, name, live, mount) {
   closeViewer();
   const el = document.createElement("div");
-  el.className = "scr-ov";
+  el.className = "scr-ov" + (mount ? " embed" : "");
   el.setAttribute("role", "dialog");
   el.setAttribute("aria-modal", "false");
   el.setAttribute("aria-label", `${name}'s screen`);
   el.innerHTML = `<div class="scr-box"><div class="scr-h"><b>${esc(name)}'s screen</b><span class="scr-st" aria-live="polite">Connecting…</span>
     ${live ? '<span class="scr-st" data-ctl hidden>You can control this screen</span>' : ""}
     ${live ? qSelect("view", "balanced", true) : ""}<button type="button" class="scr-btn" data-scr="close">${live ? "Stop" : "Close"}</button></div><div class="scr-body"></div></div>`;
-  document.body.append(el);
+  if (mount) mount.append(el); else document.body.append(el);
   V = { peer, name, el, live, closed: false };
   el.querySelector("[data-scr=close]").focus();
   return V;
@@ -54,8 +54,8 @@ function closeViewer() {
   me.el.remove();
 }
 
-async function viewStill(peer, name) {
-  const me = openPanel(peer, name, false);
+async function viewStill(peer, name, mount) {
+  const me = openPanel(peer, name, false, mount);
   status(me, "Taking a still image…");
   try {
     const r = await remote({ peer_id: peer, op: "snapshot", max_w: 1600 });
@@ -115,6 +115,11 @@ function bindControl(me) {
     v.focus({ preventScroll: true });
     sendCtl(me, { type: "input", kind: "click", x: pt.x, y: pt.y });
   });
+  v.addEventListener("pointermove", (e) => {
+    if (!me.control) return;
+    const pt = videoPoint(v, e);
+    if (pt) throttledMove(me, pt);
+  });
   v.addEventListener("keydown", (e) => {
     if (!me.control) return;
     if (e.key === "Escape" && e.shiftKey) { flushText(me); v.blur(); e.preventDefault(); return; }
@@ -130,8 +135,8 @@ function bindControl(me) {
   v.addEventListener("blur", () => flushText(me));
 }
 
-async function watchLive(peer, name) {
-  const me = openPanel(peer, name, true);
+async function watchLive(peer, name, mount) {
+  const me = openPanel(peer, name, true, mount);
   me.el.querySelector(".scr-body").innerHTML = `<video autoplay playsinline muted tabindex="0"></video>`;
   bindControl(me);
   let r;
@@ -219,6 +224,42 @@ function paintControl(L) {
   if (!b) return;
   b.textContent = L.control ? "Control on — Revoke" : "Allow control";
   b.setAttribute("aria-pressed", String(!!L.control));
+  controlBanner(L);
+}
+
+/* Persistent high-contrast banner while a linked station controls this screen. */
+function controlBanner(L) {
+  document.querySelector(".scr-ctlban")?.remove();
+  if (!L.control) return;
+  const b = document.createElement("div");
+  b.className = "scr-ctlban";
+  b.setAttribute("role", "alert");
+  b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#c00;color:#fff;font-weight:700;padding:8px 12px;display:flex;gap:12px;align-items:center;justify-content:center";
+  b.innerHTML = `<span>Being controlled by ${esc(L.name)} — </span><button type="button" data-scr="panic" style="background:#fff;color:#c00;font-weight:700;border:0;padding:4px 10px;cursor:pointer">[Stop]</button>`;
+  b.querySelector("button").addEventListener("click", () => panicStop());
+  document.body.append(b);
+}
+
+/* One-click / Ctrl+Alt+Shift+Esc: end remote control, release held keys on the station. */
+function panicStop() {
+  const L = SH.live;
+  if (!L) return;
+  api("/api/peer/screen/control/stop", { session_id: L.sid }).catch(() => {});
+  api("/api/screen/control", { session_id: L.sid, on: false }).catch(() => {});
+  L.control = false;
+  paintControl(L);
+  if (L.dc?.readyState === "open") L.dc.send(JSON.stringify({ type: "control", on: false }));
+}
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.altKey && e.shiftKey && e.key === "Escape") { e.preventDefault(); panicStop(); }
+});
+
+/* Viewer side: coalesce pointermove to at most one per 50 ms (20 Hz). */
+function throttledMove(me, pt) {
+  const now = Date.now();
+  if (now - (me.lastMove || 0) < 50) return;
+  me.lastMove = now;
+  sendCtl(me, { type: "input", kind: "move", x: pt.x, y: pt.y });
 }
 
 /* Sharer turns remote control on or off for this share; the viewer is told over the data channel. */
@@ -256,6 +297,7 @@ function stopShare(byViewer = false) {
   try { L.pc.close(); } catch (_) {}
   if (!byViewer) api("/api/screen/answer", { session_id: L.sid, action: "stop" }).catch(() => {});
   document.querySelector(".scr-ban")?.remove();
+  document.querySelector(".scr-ctlban")?.remove();
   say(byViewer ? `${L.name} stopped watching` : "Stopped sharing your screen", "info");
 }
 
@@ -378,22 +420,29 @@ const CSS = `
 .scr-ov .scr-box{pointer-events:auto}
 body:has(.scr-ov) .dock{z-index:92}
 body:has(.scr-ov) .cmp{z-index:93}
-.scr-box{background:var(--paper,#fff);border-radius:16px;width:100%;max-width:1200px;max-height:calc(100vh - 136px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.scr-box{background:var(--paper,var(--surface));border-radius:16px;width:100%;max-width:1200px;max-height:calc(100vh - 136px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px color-mix(in srgb,var(--ink) 25%,transparent)}
 .scr-h{display:flex;align-items:center;gap:12px;padding:12px 16px;flex-wrap:wrap}
 .scr-h b{flex:1;min-width:0}
 .scr-st{font-size:13px;color:var(--muted)}
 .scr-body{background:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:200px;flex:1;overflow:auto}
 .scr-body img,.scr-body video{display:block;max-width:100%;max-height:calc(100vh - 240px);object-fit:contain}
 .scr-acts{display:flex;gap:8px;flex-wrap:wrap;padding:10px}
-.scr-btn{min-height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--hair,#ddd);background:var(--ground,#f3f3f0);font:inherit;cursor:pointer}
+.scr-btn{min-height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--hair);background:var(--ground);font:inherit;cursor:pointer}
 .scr-btn.pri{background:var(--sky-deep,#2b5f8a);color:#fff;border-color:transparent}
-.scr-ask{position:fixed;z-index:95;left:16px;right:16px;bottom:16px;background:var(--paper,#fff);border-radius:14px;padding:14px 16px;box-shadow:0 12px 40px rgba(0,0,0,.2);font-size:14px}
+.scr-ask{position:fixed;z-index:95;left:16px;right:16px;bottom:16px;background:var(--paper,var(--surface));border-radius:14px;padding:14px 16px;box-shadow:0 12px 40px color-mix(in srgb,var(--ink) 20%,transparent);font-size:14px}
 .scr-ask p{margin:0 0 6px}.scr-m{color:var(--muted);font-size:13px}
 .scr-ask .scr-acts{padding:6px 0 0}
-.scr-q{min-height:36px;padding:0 10px;border-radius:10px;border:1px solid var(--hair,#ddd);background:var(--paper,#fff);color:inherit;font:inherit;font-size:13px}
+.scr-q{min-height:36px;padding:0 10px;border-radius:10px;border:1px solid var(--hair);background:var(--surface);color:inherit;font:inherit;font-size:13px}
 .scr-q:disabled{opacity:.5}
 .scr-ql{display:flex;align-items:center;gap:8px;margin:6px 0}
 .scr-ban .scr-q{min-height:32px;background:#2c2f2e;color:#fff;border-color:#444}
+.scr-ov.embed{position:absolute;inset:0;z-index:6;pointer-events:auto;padding:0;display:flex}
+.scr-ov.embed .scr-box{width:100%;height:100%;max-height:none;border-radius:0;box-shadow:none}
+.scr-ov.embed .scr-h{padding:4px 8px;gap:6px}
+.scr-ov.embed .scr-st{font-size:10px}
+.scr-ov.embed .scr-body{min-height:0}
+.scr-ov.embed .scr-body img,.scr-ov.embed .scr-body video{max-height:100%}
+.scr-ov.embed .scr-btn{min-height:26px;font-size:11px;padding:0 10px}
 .scr-ban{position:fixed;z-index:96;top:12px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:10px;padding:6px 6px 6px 14px;border-radius:18px;background:#1d1f1e;flex-wrap:wrap;justify-content:center;color:#fff;font-size:13px;max-width:calc(100vw - 32px)}
 .scr-ban .scr-btn{min-height:32px;background:#c4492f;color:#fff;border:0}
 .scr-ban .scr-btn.ctl{background:#2c2f2e;color:#fff;border:1px solid #555}
@@ -407,3 +456,8 @@ body:has(.scr-ov) .cmp{z-index:93}
 `;
 if (!document.getElementById("scr-css")) document.head.append(Object.assign(document.createElement("style"), { id: "scr-css", textContent: CSS }));
 if (window.RTCPeerConnection && navigator.mediaDevices?.getDisplayMedia) checkRequests();
+
+export function mountViewer(peer, name, live, mount) {
+  return live ? watchLive(peer, name, mount) : viewStill(peer, name, mount);
+}
+export function closeViewerNow() { closeViewer(); }

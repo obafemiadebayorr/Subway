@@ -317,16 +317,38 @@ def _refresh_source(name: str, deadline: Optional[float] = None) -> Dict[str, An
         return _s._fallback_source_record(name)
 
 
+_shared_seen: Dict[str, float] = {}
+
+
+def _newer_shared(name: str, rec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The disk copy of a source when another process (e.g. the HUD) fetched it more recently than this one did.
+    Reads the file only when its mtime moved, so it costs one stat per call."""
+    have = bool(rec and rec.get("data"))
+    try:
+        m = os.path.getmtime(os.path.join(_s.SUBWAY_DIR, "usage_cache.json"))
+    except (OSError, AttributeError):
+        m = None
+    if have and m is not None and m <= _shared_seen.get(name, 0.0):
+        return None
+    if m is not None:
+        _shared_seen[name] = m
+    saved = _s._load_json("usage_cache.json").get(name)
+    if not saved or saved.get("data") is None:
+        return None
+    if have and float(saved.get("fetched_at") or 0) <= float((rec or {}).get("fetched_at") or 0):
+        return None
+    return saved
+
+
 def _source(name: str, max_age: Optional[float] = None) -> Dict[str, Any]:
     """A source's latest record, refreshed if older than max_age. None never refreshes."""
     with _s._usage_lock:
         rec = _s._usage.get(name)
-    if not rec or not rec.get("data"):
-        saved = _s._load_json("usage_cache.json").get(name)
-        if saved:
-            with _s._usage_lock:
-                rec = dict(saved, **(_s._usage.get(name) or {}))
-                _s._usage[name] = rec
+    saved = _newer_shared(name, rec)
+    if saved:
+        with _s._usage_lock:
+            rec = dict(_s._usage.get(name) or {}, data=saved["data"], fetched_at=saved.get("fetched_at", 0))
+            _s._usage[name] = rec
     if max_age is not None and (not rec or rec.get("loading") or rec.get("stale") or time.time() - rec.get("checked_at", 0) > max_age):
         rec = _s._refresh_source(name)
     return rec or {}
@@ -363,9 +385,13 @@ def _sampler_loop() -> None:
                 _s.refresh_benchmarks()
             with contextlib.suppress(Exception):
                 _s.sync_caffeinate()
+        with contextlib.suppress(Exception):
+            from hud_server import mail_watch
+            mail_watch.notify("usage")
         active = any(str(w.get("status") or "") in ("running", "stopping", "pending_approval") for w in workers)
         _sampler_wake.wait(timeout=5.0 if active else 30.0)
         _sampler_wake.clear()
+
 
 
 def load_quotas(refresh: bool = True) -> Dict[str, Any]:

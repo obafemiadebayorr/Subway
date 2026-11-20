@@ -290,6 +290,47 @@ def blob(project_dir: str, rel: str = "", sha: str = "", subway_dir: str = "",
     raise FileNotFoundError("no blob for that sha on this station")
 
 
+# ---------------------------------------------------------------- remote read-only (F3-6)
+
+def _assert_safe_remote_relpath(path: str) -> str:
+    """VFS-side strict check of a remote relative path; raises ValueError on escape."""
+    raw = str(path or "")
+    if "\x00" in raw:
+        raise ValueError("path contains a NUL byte")
+    # resolve() rejects '..', absolute paths, backslash separators escaping the
+    # root, and symlink escapes. A scratch root keeps this a pure string check.
+    resolve(os.path.join(tempfile.gettempdir(), "subway-vfs-remote-root"), raw)
+    return raw.replace("\\", "/")
+
+
+def open_remote_readonly(station: str, path: str, subway_dir: str = "") -> Dict[str, Any]:
+    """Read a file from a linked own station through peers, strictly read-only.
+
+    Returns a blob-style dict: {"path", "sha", "size", "text", "cached", "remote"}.
+    Raises ValueError for unsafe paths / failed fetches and PermissionError when
+    the link is not an own station or lacks the files: read grant. No local
+    workspace file is created or modified, and no write API is exposed here.
+    """
+    clean = _assert_safe_remote_relpath(path)
+    try:
+        import peers
+    except Exception as exc:  # pragma: no cover - peers ships with subway
+        raise RuntimeError("peers is unavailable") from exc
+    got = peers.read_remote_file(station, clean)
+    if not isinstance(got, dict) or not got.get("ok"):
+        err = got.get("error", "remote read failed") if isinstance(got, dict) else "remote read failed"
+        if isinstance(got, dict) and got.get("code") == "denied":
+            raise PermissionError(err)
+        raise ValueError(err)
+    data = got.get("data") or b""
+    if not isinstance(data, (bytes, bytearray)):
+        data = str(data).encode("utf-8", "replace")
+    data = bytes(data)
+    return {"path": clean, "sha": got.get("sha256") or _sha_bytes(data),
+            "size": len(data), "text": data.decode("utf-8", "replace"),
+            "cached": False, "remote": True}
+
+
 # ---------------------------------------------------------------- outbox
 
 def _idem_path(subway_dir: str) -> str:

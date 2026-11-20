@@ -100,11 +100,19 @@ def supervise_worker(worker_id: str) -> int:
     run: Dict[str, Any] = shared_spent
 
     def budget_stop(reason: str) -> None:
-        if run.get("response") or run.get("finished"):
+        proc = current["proc"]
+        if run.get("finished"):
             return
+        if proc and proc.poll() is not None:
+            return  # already exited; nothing to stop
+        # B3b: the old guard also bailed on run.get("response") — but _pump_agy sets
+        # `response` on every result event, and Antigravity emits one per turn in a
+        # resumed/multi-turn session. After the first turn's response text, budget_stop
+        # silently disarmed itself: worker_148692 burned 1.5M of a 250K cap (97 tool
+        # calls vs cap 20) with the caps fully configured, until a human stopped it.
+        # A live proc with a response is still capped from here on.
         stopped["budget"] = reason  # type: ignore[assignment]
         stopped["flag"] = True
-        proc = current["proc"]
         if is_acp and run.get("conversation") and proc and proc.poll() is None:
             with contextlib.suppress(Exception):
                 proc.stdin.write((json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": run["conversation"]}}) + "\n").encode("utf-8"))
@@ -247,10 +255,66 @@ def supervise_worker(worker_id: str) -> int:
                 env["SUBWAY_STATION_ID"] = meta["id"]
                 if meta.get("secret"):
                     env["SUBWAY_WORKER_SECRET"] = meta["secret"]
+                _sb_proxy = None
+                _sbpl_path = ""
+
+                def _cleanup_sandbox() -> None:
+                    nonlocal _sb_proxy, _sbpl_path
+                    if _sb_proxy is not None:
+                        with contextlib.suppress(Exception):
+                            _sb_proxy.stop()
+                        _sb_proxy = None
+                    if _sbpl_path:
+                        with contextlib.suppress(OSError):
+                            os.unlink(_sbpl_path)
+                        _sbpl_path = ""
+
+                if meta.get("sandbox_policy") and (not cmd or cmd[0] not in ("sandbox-exec", "bwrap")):
+                    import sandbox
+                    from workers.spawn import _coerce_sandbox_policy
+
+                    policy = _coerce_sandbox_policy(meta["sandbox_policy"])
+                    if getattr(policy, "exec_sandbox", None) == "os":
+                        real_workdir = os.path.realpath(workdir)
+                        if getattr(policy, "net_policy", None) == "allowlist":
+                            _sb_proxy = sandbox.SandboxNetworkProxy(allow_domains=policy.allow_domains)
+                            _sb_proxy.start()
+                        if sandbox.sys.platform == "darwin":
+                            _sbpl_path = f"/tmp/subway-sb-{meta['id']}.sbpl"
+                            sbpl_text = sandbox.build_seatbelt_profile(
+                                [real_workdir],
+                                net_policy=policy.net_policy,
+                                strict_reads=policy.strict_reads,
+                                proxy_port=_sb_proxy.port if _sb_proxy else None,
+                                local_allow_ports=policy.local_allow_ports,
+                                extra_deny=(_sbpl_path,),
+                                read_roots=getattr(policy, "read_roots", ()),
+                            )
+                            fd = os.open(_sbpl_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                            try:
+                                os.write(fd, sbpl_text.encode("utf-8"))
+                            finally:
+                                os.close(fd)
+                            env["SUBWAY_SANDBOX_PROFILE"] = _sbpl_path
+                        env["SUBWAY_SANDBOX_EXEC"] = "os"
+                        env["SUBWAY_SANDBOX_NET"] = str(policy.net_policy)
+                        env["SUBWAY_SANDBOX_WORKTREE"] = real_workdir
+                        env["SUBWAY_SANDBOX_STRICT_READS"] = "1" if policy.strict_reads else "0"
+                        if getattr(policy, "read_roots", ()):
+                            env["SUBWAY_SANDBOX_READ_ROOTS"] = os.pathsep.join(
+                                os.path.realpath(os.path.expanduser(r)) for r in policy.read_roots if r
+                            )
+                        sh_path = os.path.join(os.path.dirname(os.path.abspath(_s.__file__)), "bin", "subway-sandbox-sh")
+                        if os.path.exists(sh_path):
+                            env["SHELL"] = sh_path
+                        if _sb_proxy is not None:
+                            env["SUBWAY_SANDBOX_PROXY_PORT"] = str(_sb_proxy.port)
+                            env["SUBWAY_SANDBOX_HTTP_PROXY"] = f"http://127.0.0.1:{_sb_proxy.port}"
                 try:
                     proc = subprocess.Popen(cmd, cwd=workdir, stdin=subprocess.PIPE if is_acp else subprocess.DEVNULL, env=env,
                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 except OSError:
+                    _cleanup_sandbox()
                     if not copilot_acp_fallback and _s._fallback_copilot_acp(meta, workdir):
                         copilot_acp_fallback = True
                         cmd = list(meta["cmd"])
@@ -406,6 +470,7 @@ def supervise_worker(worker_id: str) -> int:
                         if callable(getattr(stream, "close", None)):
                             with contextlib.suppress(OSError):
                                 stream.close()
+                    _cleanup_sandbox()
                     result = {"status": "timed_out", "exit_code": code, "reason": f"Stopped after the {limit}s timeout."}
                     break
                 stall_event.set()
@@ -417,6 +482,7 @@ def supervise_worker(worker_id: str) -> int:
                     if callable(getattr(stream, "close", None)):
                         with contextlib.suppress(OSError):
                             stream.close()
+                _cleanup_sandbox()
                 handshake_stalled = bool(stopped.get("stall") and not stopped.get("quota_error"))
                 if (is_copilot and is_acp and run.get("acp_unavailable")
                         and (not stopped["flag"] or handshake_stalled)

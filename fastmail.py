@@ -26,6 +26,12 @@ VALID_STATES = ("queued", "delivered", "read", "replied", "failed", "suppressed"
 _STATE_TS_KEY = {"delivered": "delivered_at", "read": "read_at", "replied": "replied_at"}
 
 
+def _norm_station(name: str) -> str:
+    """Loose station-id normalization for mute matching (A3/A6): lowercase, strip @ and -latest suffix."""
+    n = str(name or "").strip().lower().lstrip("@")
+    return n[:-len("-latest")] if n.endswith("-latest") else n
+
+
 def _fastmail_dir() -> str:
     path = os.path.join(_s.SUBWAY_DIR, "fastmail")
     os.makedirs(path, exist_ok=True)
@@ -275,7 +281,8 @@ def rate_count(sender: str, now: float) -> int:
             continue
         if ev.get("kind") != "created":
             continue
-        if str(ev.get("from") or "") != str(sender):
+        if _norm_station(str(ev.get("from") or "")) != _norm_station(str(sender)):
+            # A6: rate-limit accounting is per normalized station identity.
             continue
         try:
             ts = _dt.datetime.fromisoformat(str(ev.get("ts") or "")).timestamp()
@@ -301,7 +308,8 @@ def _recent_duplicate(msg: Dict[str, Any], now: float) -> bool:
             continue
         if ev.get("kind") != "created":
             continue
-        if str(ev.get("from") or "") != str(msg.get("from") or ""):
+        if _norm_station(str(ev.get("from") or "")) != _norm_station(str(msg.get("from") or "")):
+            # A6: duplicate suppression also matches normalized identities.
             continue
         if str(ev.get("to") or "") != str(msg.get("to") or ""):
             continue
@@ -324,6 +332,8 @@ def enforce_guards(msg: Dict[str, Any]) -> Optional[str]:
     now = time.time()
 
     if sender and to and sender == to:
+        # A6 note: self-send stays an EXACT same-chat rule — station-level normalization
+        # here would refuse legitimate same-station/different-chat replies (test_reply_note).
         return "self-send refused"
 
     try:
@@ -334,8 +344,14 @@ def enforce_guards(msg: Dict[str, Any]) -> Optional[str]:
         return f"hop cap reached ({settings['max_hops']})"
 
     muted = [s.strip() for s in str(settings.get("muted_senders") or "").split(",") if s.strip()]
-    if to and to in muted:
-        return f"station `{to}` is muted"
+    if muted:
+        muted_n = {_norm_station(m) for m in muted}
+        if to and _norm_station(to) in muted_n:
+            # Original semantics (tested): a muted station is never woken — no delivery to it.
+            return f"station `{to}` is muted"
+        # A3: and mail FROM a muted station is refused — it must not spam everyone else.
+        if sender and _norm_station(sender) in muted_n:
+            return f"sender `{sender}` is muted"
 
     thread_id = str(msg.get("thread_id") or "")
     if not thread_id and msg.get("reply_to"):

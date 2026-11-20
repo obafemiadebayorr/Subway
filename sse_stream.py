@@ -1,6 +1,7 @@
-import json, os as _os, queue, select, threading, time, uuid
+import hashlib, json, os as _os, queue, select, threading, time, urllib.parse, uuid
+from collections import deque
 import subway_home
-from typing import Dict, Any, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 
 # --- Monotonic event ids -----------------------------------------------------
 # iOS suspends an app and drops its SSE socket, so a reconnecting phone must be able to say
@@ -282,3 +283,76 @@ def start_spool_tailer(interval: float = 0.5, max_bytes: int = 4 * 1024 * 1024) 
         _tailer["thread"], _tailer["stop"] = t, stop
         t.start()
     return t
+
+
+def tail_remote_thread(
+    thread_spec: str,
+    emit: Callable[[str], None],
+    stop_event: Optional[threading.Event] = None,
+    poll_interval: float = 2.0,
+    min_interval: float = 2.0,
+    max_seen: int = 200,
+    peer_call: Optional[Callable[..., Dict[str, Any]]] = None,
+    split_fn: Optional[Callable[[str], Any]] = None,
+    max_iterations: Optional[int] = None,
+) -> None:
+    """Poll a remote station's /api/peer/read_chat and emit 'thread_tail' SSE frames."""
+    if split_fn is None:
+        import peers as _peers
+        split_fn = _peers.split_remote
+    if peer_call is None:
+        import peers as _peers
+        peer_call = _peers.call
+
+    resolved = split_fn(thread_spec)
+    if not resolved:
+        return
+    head, peer = resolved
+    peer_id = peer["peer_id"]
+
+    interval = max(float(poll_interval), float(min_interval))
+    seen_ids: deque = deque(maxlen=max_seen)
+    iterations = 0
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            qs = urllib.parse.urlencode({"chat_id": head, "mode": "recent", "since": "last"})
+            res = peer_call(peer_id, "GET", f"/api/peer/read_chat?{qs}")
+            if isinstance(res, dict) and res.get("status") == 200:
+                data = res.get("data") or {}
+                messages = data.get("messages")
+                if isinstance(messages, list):
+                    for m in messages:
+                        if isinstance(m, dict):
+                            mid = str(m.get("id") or hashlib.sha256(json.dumps(m, sort_keys=True).encode("utf-8")).hexdigest()[:16])
+                            payload = {"thread": thread_spec, "message": m}
+                        else:
+                            mid = hashlib.sha256(str(m).encode("utf-8")).hexdigest()[:16]
+                            payload = {"thread": thread_spec, "text": str(m)}
+                        if mid not in seen_ids:
+                            seen_ids.append(mid)
+                            seq = next_seq()
+                            emit(f"id: {seq}\nevent: thread_tail\ndata: {json.dumps(payload)}\n\n")
+                else:
+                    text = str(data.get("text") or "")
+                    if text and "No new stations since your last transit" not in text:
+                        mid = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                        if mid not in seen_ids:
+                            seen_ids.append(mid)
+                            seq = next_seq()
+                            payload = {"thread": thread_spec, "text": text}
+                            emit(f"id: {seq}\nevent: thread_tail\ndata: {json.dumps(payload)}\n\n")
+        except Exception:
+            pass
+
+        iterations += 1
+        if max_iterations is not None and iterations >= max_iterations:
+            break
+        if stop_event is not None:
+            if stop_event.wait(interval):
+                break
+        else:
+            time.sleep(interval)
+

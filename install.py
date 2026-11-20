@@ -68,7 +68,12 @@ def _load_json(path: str) -> Dict[str, Any]:
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            text = f.read()
+        # A brand-new or never-populated config can be an empty file; that is a valid
+        # starting state, not a parse error (Windows Antigravity ships one empty).
+        if not text.strip():
+            return {}
+        data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError(f"Root of JSON in {path} must be an object, got {type(data).__name__}")
         return data
@@ -249,8 +254,12 @@ def detect_environments() -> Dict[str, Dict[str, Any]]:
     elif os.path.exists(pi_dir) or os.path.exists(pi_agent_dir):
         pi_detected = True
         pi_evidence = f"directory exists ({pi_dir if os.path.exists(pi_dir) else pi_agent_dir})"
+    elif os.path.exists(os.path.expanduser("~/.deepai-code")):
+        pi_userdata = os.path.expanduser("~/.deepai-code")
+        pi_detected = True
+        pi_evidence = f"DeepAI Code userdata exists ({pi_userdata})"
     else:
-        pi_evidence = "neither pi/deepai binary on PATH, /Applications/DeepAI Code.app, nor ~/.pi directory found"
+        pi_evidence = "neither pi/deepai binary on PATH, DeepAI Code app install, ~/.pi directory, nor ~/.deepai-code userdata found"
 
     cursor_config = os.path.expanduser("~/.cursor/mcp.json")
     cursor_app = "/Applications/Cursor.app"

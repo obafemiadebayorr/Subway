@@ -52,6 +52,23 @@ if (args[0] === 'tunnel') {
   return;
 }
 
+// `subway setup --headless [--apply] [--uninstall]`: first-run setup for a headless station
+// (identity + link code + start-on-login service). See plan/headless-station.md §2.
+if (args[0] === 'setup') {
+  const setup = spawn(process.execPath, [path.join(__dirname, 'subway-setup.mjs'), ...args.slice(1)], {
+    stdio: 'inherit',
+    env: process.env,
+  });
+  process.on('SIGINT', () => setup.kill('SIGINT'));
+  process.on('SIGTERM', () => setup.kill('SIGTERM'));
+  setup.on('error', (err) => {
+    console.error('[SUBWAY] Failed to run headless setup:', err.message);
+    process.exit(1);
+  });
+  setup.on('exit', (code) => process.exit(code === null ? 1 : code));
+  return;
+}
+
 const { bin: pythonBin, prefixArgs } = resolvePython();
 const child = spawn(pythonBin, [...prefixArgs, serverPy, ...args], {
   stdio: 'inherit',

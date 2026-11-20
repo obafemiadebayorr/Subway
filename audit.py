@@ -5,6 +5,7 @@ contents: only the action, its target ids and the actor.
 """
 import json
 import os
+import socket
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,26 @@ def target_of(payload: Any) -> Dict[str, str]:
 MAC = {"kind": "mac", "id": "mac", "name": "This Mac"}
 SPAWN_ACTIONS = frozenset({"/api/spawn", "/api/run_concurrent", "spin_worker", "spin_batch", "spin_swarm",
                            "run_concurrent"})
+_station = ""
+
+
+def _station_name() -> str:
+    global _station
+    if _station:
+        return _station
+    name = ""
+    try:
+        import station
+        name = str(((station.get_station_card() or {}).get("device") or {}).get("hostname") or "")
+    except Exception:
+        name = ""
+    if not name:
+        try:
+            name = socket.gethostname()
+        except Exception:
+            name = "unknown"
+    _station = str(name)[:80]
+    return _station
 
 
 def _who(d: Dict[str, str]) -> Dict[str, str]:
@@ -43,13 +64,17 @@ def _who(d: Dict[str, str]) -> Dict[str, str]:
 
 
 def record(actor: Dict[str, str], action: str, target: Optional[Dict[str, str]] = None, ok: bool = True,
-           origin: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+           origin: Optional[Dict[str, str]] = None, peer_station: Optional[str] = None) -> Dict[str, Any]:
     """origin is the machine the action came from: the device itself, or This Mac for local agents."""
     global _seq
     if origin is None:
         origin = MAC if actor.get("kind") == "agent" else actor
-    entry = {"ts": round(time.time(), 3), "actor": _who(actor), "origin": _who(origin),
+    entry = {"ts": round(time.time(), 3), "station": _station_name(), "actor": _who(actor), "origin": _who(origin),
              "action": str(action)[:80], "target": target or {}, "ok": bool(ok)}
+    if peer_station is None and origin.get("kind") in ("station", "peer", "link"):
+        peer_station = str(origin.get("name") or origin.get("id") or "") or None
+    if peer_station:
+        entry["peer_station"] = str(peer_station)[:80]
     with _lock:
         p = _path()
         os.makedirs(os.path.dirname(p), exist_ok=True)

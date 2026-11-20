@@ -83,7 +83,7 @@ try:
 except ImportError:  # Windows: state stays atomic per write, but not serialized across processes.
     fcntl = None  # type: ignore[assignment]
 
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 if os.environ.get("_SUBWAY_SANDBOX_INITIALIZED") == "1":
     os.environ.pop("SUBWAY_HUD_NO_OPEN", None)
 HOME = os.path.expanduser("~")
@@ -262,7 +262,7 @@ from chat_readers import _file_may_contain
 from agent_chat import t_agent_chat
 from cli_tools import (t_search_chat, t_tag_chat, t_read_chat, t_send_note, t_check_notes, t_whoami, t_reply_note, t_fastmail_status)
 from fastmail_broadcast import t_ask_room
-from postmail import (t_mail_post, t_mail_list, t_mail_cancel, t_mail_edit, t_post_mail, t_list_mail, t_edit_mail, t_cancel_mail, list_mail_items, evaluate_mail_items, recover_interrupted_mail)
+from postmail import (t_mail_post, t_mail_list, t_mail_ack, t_mail_cancel, t_mail_edit, t_post_mail, t_list_mail, t_edit_mail, t_cancel_mail, list_mail_items, evaluate_mail_items, recover_interrupted_mail)
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +290,108 @@ from guard import (  # noqa: E402
 from cli_tools.symbols import t_claim_symbol, t_read_symbol, t_read_outline
 from thread_state import t_set_principal
 from composer_context import t_context_slice, t_project_files, t_thread_export
+
+
+def t_list_lanes(project: str = "") -> str:
+    """List release lanes for a project as a markdown table."""
+    import lanes as _lanes
+
+    p = (project or "").strip() or os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()
+    try:
+        rows = _lanes.status(p)
+        data = _lanes.load(p)
+        lim = _lanes.limit()
+        rec = _lanes.recommend(p)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    default_name = data.get("default") or ""
+    lines = [
+        "| Name | Role | Branch | Ahead | Dirty | Frozen | Worktree |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for r in rows:
+        name = f"{r['name']} *" if r["name"] == default_name else r["name"]
+        lines.append(
+            f"| {name} | {r.get('role', '')} | {r.get('branch', '')} | "
+            f"{r.get('ahead_main', 0)} | {'yes' if r.get('dirty') else 'no'} | "
+            f"{'yes' if r.get('frozen') else 'no'} | {r.get('worktree', '')} |"
+        )
+    lines.append(
+        f"\nDefault: {default_name or '(none)'} | Limit: {lim['limit']} "
+        f"(Recommended: {rec['recommended']} — {rec['reason']})"
+    )
+    return "\n".join(lines)
+
+
+def t_lane(
+    action: str,
+    name: str = "",
+    branch: str = "",
+    base: str = "",
+    role: str = "dev",
+    force: bool = False,
+    frozen: bool = True,
+    project: str = "",
+) -> str:
+    """Manage release lanes (create, remove, default, freeze, ensure, get)."""
+    import lanes as _lanes
+
+    p = (project or "").strip() or os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()
+    act = (action or "").strip().lower()
+    try:
+        if act == "create":
+            res = _lanes.create(p, name, branch=branch or None, base=base or None, role=role or "dev")
+            return f"Created lane '{res['name']}' on branch '{res['branch']}' at {res['worktree']}."
+        if act == "remove":
+            res = _lanes.remove(p, name, force=bool(force))
+            return f"Removed lane '{res['name']}' (branch '{res.get('branch', '')}' kept)."
+        if act == "default":
+            d = _lanes.set_default(p, name)
+            return f"Default lane set to '{d}'." if d else "Default lane cleared."
+        if act == "freeze":
+            res = _lanes.set_frozen(p, name, bool(frozen))
+            return f"Lane '{res['name']}' frozen={res['frozen']}."
+        if act == "ensure":
+            res = _lanes.ensure_worktree(p, name)
+            return f"Lane '{res['name']}' worktree ready at {res['worktree']}."
+        if act == "get":
+            res = _lanes.get(p, name)
+            return json.dumps(res) if res else f"No lane '{name}'."
+        return f"Error: Unknown lane action '{action}'."
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+
+def t_ship_lane(lane: str, dry_run: bool = True, run_tests: bool = True) -> str:
+    """Run the read-only ship preflight for a release lane."""
+    import lanes as _lanes
+
+    if not bool(dry_run):
+        return "Outward steps run from the HUD Ship card (1.3.9 Phase 2)."
+    name = (lane or "").strip()
+    if not name:
+        return "Error: lane is required."
+    p = os.environ.get("SUBWAY_PROJECT_DIR") or os.getcwd()
+    try:
+        res = _lanes.get(p, name)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if not res:
+        return f"No lane '{name}'."
+    worktree = res.get("worktree") or ""
+    if not worktree:
+        return f"Error: Lane '{name}' has no worktree."
+    import ship_preflight as _preflight
+
+    result = _preflight.run(worktree, run_tests=bool(run_tests))
+    lines = []
+    for c in result.get("checks", []):
+        mark = "PASS" if c.get("ok") else "FAIL"
+        label = c.get("label") or c.get("id") or "check"
+        lines.append(f"{mark} {label}: {c.get('detail', '')}")
+    return "\n".join(lines)
+
+
 from worker_supervision.code_items import _extract_code_item, outline
 
 # --------------------------------------------------------------------------
@@ -741,6 +843,14 @@ from hud_server.lifecycle import _hud_cache_lock, _hud_cache
 from hud_server import (mark_hud_cache_stale, _bg_refresh_hud, get_hud_data, t_hud_status)
 
 
+def t_app_action(app_id: str, action: str = "run", title: str = "", date: str = "", notes: str = "", list_name: str = "", script: str = "") -> str:
+    """Run a gated action on a connected/discovered local app via app_connectors.run_action."""
+    from hud_server import app_connectors
+    return json.dumps(app_connectors.run_action(
+        app_id=app_id, action=action, script=script, title=title, date=date, notes=notes, list_name=list_name,
+    ))
+
+
 _POLL_GUARD_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 _POLL_GUARD_LOCK = threading.Lock()
 POLL_GUARD_TOOLS = frozenset({"worker_status", "hud_status", "read_track", "collect_reports"})
@@ -922,6 +1032,32 @@ def t_fetch_file(station: str, path: str, to: str = "") -> str:
 def t_send_file(station: str, path: str, to: str, overwrite: bool = False) -> str:
     import peers
     return peers.send_file(station, path, to, overwrite)
+
+
+def t_remote_read(station: str, path: str, start_line: int = 1, end_line: int = 0) -> str:
+    import remote_bridge
+    return remote_bridge.remote_read(station, path, start_line, end_line)
+
+
+def t_remote_write(station: str, path: str, content: str, base_sha: Optional[str] = None) -> str:
+    import remote_bridge
+    return remote_bridge.remote_write(station, path, content, base_sha)
+
+
+def t_remote_exec(station: str, cmd: str, cwd: str = "", timeout: int = 60) -> str:
+    import remote_bridge
+    return remote_bridge.remote_exec(station, cmd, cwd, timeout)
+
+
+def t_station_term(station: str, cmd: str, cwd: str = "", timeout: float = 60.0) -> dict:
+    """Run a command on an 'own' linked station and return the full terminal result."""
+    import term_remote
+    return term_remote.station_term(station, cmd, cwd, timeout)
+
+
+def t_remote_test(station: str, cmd: str = "pytest -q", cwd: str = "", timeout: int = 120) -> str:
+    import remote_bridge
+    return remote_bridge.remote_test(station, cmd, cwd, timeout)
 
 
 TOOLS = {
@@ -1258,6 +1394,33 @@ TOOLS = {
         "description": "List all active workspace file leases and sign-offs across all agents.",
         "inputSchema": {"type": "object", "properties": {}},
     }),
+    "list_lanes": (t_list_lanes, {
+        "description": "List release lanes for a git project as a markdown table.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "Project directory (defaults to current git repo)."},
+        }},
+    }),
+    "lane": (t_lane, {
+        "description": "Manage release lanes (create, remove, default, freeze, ensure, get).",
+        "inputSchema": {"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["create", "remove", "default", "freeze", "ensure", "get"]},
+            "name": {"type": "string", "description": "Lane name."},
+            "branch": {"type": "string", "description": "Branch name (default: release/<name>)."},
+            "base": {"type": "string", "description": "Base ref when creating a new branch."},
+            "role": {"type": "string", "enum": ["dev", "ship"], "default": "dev"},
+            "force": {"type": "boolean", "default": False},
+            "frozen": {"type": "boolean", "default": True},
+            "project": {"type": "string", "description": "Project directory."},
+        }},
+    }),
+    "ship_lane": (t_ship_lane, {
+        "description": "Run the read-only ship preflight for a release lane (tests, version, changelog, docs, clean). Never performs outward actions.",
+        "inputSchema": {"type": "object", "required": ["lane"], "properties": {
+            "lane": {"type": "string", "description": "Release lane name."},
+            "dry_run": {"type": "boolean", "default": True, "description": "Read-only preflight only. False is not supported here."},
+            "run_tests": {"type": "boolean", "default": True, "description": "Run the test suite as part of the preflight."},
+        }},
+    }),
     "station_files": (t_station_files, {
         "description": "List folders and files on a linked station (needs its files grant). No path lists the folders it shares.",
         "inputSchema": {"type": "object", "required": ["station"], "properties": {
@@ -1273,6 +1436,51 @@ TOOLS = {
         "inputSchema": {"type": "object", "required": ["station", "path", "to"], "properties": {
             "station": {"type": "string"}, "path": {"type": "string"}, "to": {"type": "string"},
             "overwrite": {"type": "boolean"}}},
+    }),
+    "remote_read": (t_remote_read, {
+        "description": "Read a file on an 'own' linked station.",
+        "inputSchema": {"type": "object", "required": ["station", "path"], "properties": {
+            "station": {"type": "string"},
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "default": 1},
+            "end_line": {"type": "integer", "default": 0},
+        }},
+    }),
+    "remote_write": (t_remote_write, {
+        "description": "Write a file on an 'own' linked station (with optional optimistic-lock base_sha).",
+        "inputSchema": {"type": "object", "required": ["station", "path", "content"], "properties": {
+            "station": {"type": "string"},
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "base_sha": {"type": "string"},
+        }},
+    }),
+    "remote_exec": (t_remote_exec, {
+        "description": "Execute a shell command on an 'own' linked station.",
+        "inputSchema": {"type": "object", "required": ["station", "cmd"], "properties": {
+            "station": {"type": "string"},
+            "cmd": {"type": "string"},
+            "cwd": {"type": "string", "default": ""},
+            "timeout": {"type": "integer", "default": 60},
+        }},
+    }),
+    "station_term": (t_station_term, {
+        "description": "Run a command on an 'own' linked station via its terminal API; polls to completion and returns {ok, output, exit, id}.",
+        "inputSchema": {"type": "object", "required": ["station", "cmd"], "properties": {
+            "station": {"type": "string"},
+            "cmd": {"type": "string"},
+            "cwd": {"type": "string", "default": ""},
+            "timeout": {"type": "number", "default": 60.0},
+        }},
+    }),
+    "remote_test": (t_remote_test, {
+        "description": "Run a test command on an 'own' linked station.",
+        "inputSchema": {"type": "object", "required": ["station"], "properties": {
+            "station": {"type": "string"},
+            "cmd": {"type": "string", "default": "pytest -q"},
+            "cwd": {"type": "string", "default": ""},
+            "timeout": {"type": "integer", "default": 120},
+        }},
     }),
     "list_terminals": (t_list_terminals, {
         "description": "List terminals your user has opted in to sharing: name, folder, last command, failures.",
@@ -1322,11 +1530,15 @@ TOOLS = {
             "private": {"type": "boolean", "default": False, "description": "The task must stay on this machine."},
             "swarm_id": {"type": "string", "description": "Set by spin_swarm. Leave empty."},
             "isolate": {"type": "boolean", "default": False, "description": "Work in a private git worktree, and return the change as a patch. Use it whenever workers share a repo."},
+            "lane": {"type": "string", "default": "", "description": "Release lane name (e.g. ship/dev/main)."},
+            "kind": {"type": "string", "default": "", "description": "Worker kind (e.g. 'fix' to allow landing on a frozen ship lane)."},
             "max_tokens": {"type": "integer", "description": "Stop the worker after this many tokens. Antigravity, OpenCode and DeepAI (pi) workers."},
             "max_seconds": {"type": "integer", "description": "Stop the worker after this many seconds. For providers that report no tokens, this is the cap."},
             "max_tool_calls": {"type": "integer", "description": "Hard stop after this many tool calls in total (0 = off)."},
             "station": {"type": "string", "description": "Run the worker on a linked station (its short name from list_chats / subway link list). That station's grants decide whether it waits for approval there. See its models with `subway link models <station>`; a refused model lists them."},
             "swarm_station": {"type": "string", "description": "Mode C: work on a linked station's checkout with YOUR agents and quota. Its checkout is copied here; the result goes back as a patch its owner approves. The station must have granted swarm."},
+            "session_id": {"type": "string", "description": "Lending session id; with session_sender, enforces the per-sender cap before any provider call."},
+            "session_sender": {"type": "string", "description": "Device id of the lender whose cap applies to this borrowed-model run."},
             "route_reason": {"type": "string", "description": "Why this worker got this provider, shown in the HUD."},
             "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "default": "normal", "description": "Worker priority: urgent, normal, or low."},
             "track": {"type": "string", "default": "main", "description": "Shared context track name."},
@@ -1360,6 +1572,9 @@ TOOLS = {
             "doctor_budget": {"type": "integer",
                               "description": "Token budget for this worker's failure doctor. Overrides the doctor budget setting."},
             "from_link": {"type": "string", "description": "Internal linked-station origin identifier."},
+            "sandbox_policy": {"type": "object", "description": "Internal: sandbox policy for the worker's commands (set by the HUD or trusted callers; see workers.spawn.resolve_worker_sandbox_policy)."},
+            "peer_sandbox": {"type": "string", "description": "Internal: the linked station's sandbox grant (set by the HUD relay)."},
+            "peer_relation": {"type": "string", "description": "Internal: the linked station's relation to this device (set by the HUD relay)."},
         }},
     }),
     "spin_batch": (t_spin_batch, {
@@ -1482,7 +1697,9 @@ TOOLS = {
     }),
     "quota_status": (t_quota_status, {
         "description": "Real session and weekly limits, token counts, and data freshness for each LLM client detected on this machine.",
-        "inputSchema": {"type": "object", "properties": {"source": READ_SOURCE}},
+        "inputSchema": {"type": "object", "properties": {"source": READ_SOURCE,
+            "session_id": {"type": "string", "description": "Optional collaboration session id; adds per-sender lending cap block."},
+            "sender": {"type": "string", "description": "Optional device_id to limit the cap block to one sender."}}},
     }),
     "set_quota": (t_set_quota, {
         "description": "Record limits by hand for a client that can't report them. Live readings always take priority.",
@@ -1574,6 +1791,18 @@ TOOLS = {
             "since_timestamp": {"type": "number", "default": 0.0},
         }},
     }),
+    "app_action": (t_app_action, {
+        "description": "Run a gated action on a connected/discovered local app (e.g. Calendar create_event, Reminders create_reminder, open, or safe AppleScript without shell).",
+        "inputSchema": {"type": "object", "properties": {
+            "app_id": {"type": "string", "description": "App id or name (e.g. 'calendar', 'reminders')."},
+            "action": {"type": "string", "default": "run", "description": "Action: open, create_event, create_reminder, or run."},
+            "title": {"type": "string", "default": "", "description": "Event/reminder title."},
+            "date": {"type": "string", "default": "", "description": "Date/time string for calendar events."},
+            "notes": {"type": "string", "default": "", "description": "Notes/body text."},
+            "list_name": {"type": "string", "default": "", "description": "Optional Reminders list name."},
+            "script": {"type": "string", "default": "", "description": "Optional AppleScript (shell execution forbidden)."},
+        }, "required": ["app_id"]},
+    }),
     "hud_status": (t_hud_status, {
         "description": "Snapshot departure-board view of active lines, file leases, worker swarms, and shared tracks.",
         "inputSchema": {"type": "object", "properties": {
@@ -1622,8 +1851,9 @@ TOOLS = {
             "prompt": {"type": "string", "description": "Full self-contained instructions for the worker when fired."},
             "provider": {"type": "string", "default": "auto", "description": "Target provider ('auto', 'claude', 'antigravity', 'opencode', 'copilot', 'local', or custom id)."},
             "model": {"type": "string", "default": "", "description": "Optional specific model identifier."},
-            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"], "description": "Event or schedule condition that triggers the task."},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return", "usage_rise", "github"], "description": "Event or schedule condition that triggers the task."},
             "condition": {"type": "object", "description": "Condition parameters."},
+            "to_chat": {"type": "string", "description": "Optional chat id/alias: deliver the prompt as a message into that chat instead of starting a worker."},
             "track": {"type": "string", "default": "main"},
             "project_dir": {"type": "string", "default": ""},
             "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"], "default": "auto"},
@@ -1643,12 +1873,13 @@ TOOLS = {
     }),
     "post_mail": (t_post_mail, {
         "description": "Queue a scheduled or event-driven task in the persistent HUD mailbox.",
-        "inputSchema": {"type": "object", "required": ["role", "prompt", "condition_type", "condition"], "properties": {
-            "role": {"type": "string", "description": "Short worker role title (2-5 words)."},
-            "prompt": {"type": "string", "description": "Full self-contained instructions for the worker when fired."},
+        "inputSchema": {"type": "object", "required": ["prompt", "condition_type", "condition"], "properties": {
+            "role": {"type": "string", "default": "", "description": "Short worker role title (2-5 words). Defaults to 'Chat message' when to_chat is set."},
+            "prompt": {"type": "string", "description": "Full self-contained instructions for the worker when fired, or the message text when to_chat is set."},
+            "to_chat": {"type": "string", "default": "", "description": "to_chat: deliver the prompt as a message into that chat (id, @alias, or self) instead of starting a worker. An offline chat is woken only if the user allows it in the HUD (mail.wake_offline)."},
             "provider": {"type": "string", "default": "auto", "description": "Target provider ('auto', 'claude', 'antigravity', 'opencode', 'copilot', 'local', or custom id)."},
             "model": {"type": "string", "default": "", "description": "Optional specific model identifier."},
-            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"], "description": "Event or schedule condition that triggers the task."},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return", "usage_rise", "chat_idle", "github"], "description": "Event or schedule condition that triggers the task."},
             "condition": {"type": "object", "description": "Condition parameters."},
             "track": {"type": "string", "default": "main"},
             "project_dir": {"type": "string", "default": ""},
@@ -1683,6 +1914,12 @@ TOOLS = {
             "limit": {"type": "integer", "default": 50}
         }}
     }),
+    "mail_ack": (t_mail_ack, {
+        "description": "Confirm you received and handled a mailbox message delivered to this chat (the message names the mail_id).",
+        "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
+            "mail_id": {"type": "string", "description": "Mailbox item ID from the delivered message (e.g. 'mail_a1b2c3d4')."}
+        }}
+    }),
     "mail_cancel": (t_mail_cancel, {
         "description": "Cancel a queued or waiting mailbox item so it never runs.",
         "inputSchema": {"type": "object", "required": ["mail_id"], "properties": {
@@ -1705,7 +1942,7 @@ TOOLS = {
             "prompt": {"type": "string"},
             "provider": {"type": "string"},
             "model": {"type": "string"},
-            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"]},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return", "usage_rise", "github"]},
             "condition": {"type": "object"},
             "track": {"type": "string"},
             "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
@@ -1725,7 +1962,7 @@ TOOLS = {
             "prompt": {"type": "string"},
             "provider": {"type": "string"},
             "model": {"type": "string"},
-            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return"]},
+            "condition_type": {"type": "string", "enum": ["time", "worker_done", "ledger_message", "file_change", "token_warning", "allowance_return", "usage_rise", "github"]},
             "condition": {"type": "object"},
             "track": {"type": "string"},
             "effort": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
@@ -1745,7 +1982,7 @@ _REPEAT_GUARD_LOCK = threading.Lock()
 _REPEAT_GUARD: Dict[str, List[Tuple[float, str]]] = {}
 # Tools that can block for minutes. The read loop dispatches these off-thread, so the
 # elicitation reply a waiting worker needs still gets read (cli_tools.main).
-SLOW_TOOLS = {"spin_worker", "collect_reports", "await_worker"}
+SLOW_TOOLS = {"spin_worker", "collect_reports", "await_worker", "remote_exec", "remote_test"}
 
 _REPEAT_GUARD_TOOLS = {
     "hud_status", "worker_status", "list_chats", "list_terminals",
@@ -1851,7 +2088,7 @@ AUDITED_TOOLS = frozenset({
     "reject_worker", "stop_worker", "instruct_worker", "answer_permission",
     "send_note", "reply_note", "post_mail", "broadcast_track", "claim_file",
     "release_file", "signoff_file", "land_chat", "resolve_conflict", "set_quota",
-    "restart_hud",
+    "restart_hud", "remote_read", "remote_write", "remote_exec", "remote_test",
 })
 
 

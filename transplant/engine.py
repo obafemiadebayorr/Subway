@@ -146,10 +146,33 @@ def _norm_id(chat_id):
     return str(chat_id or "").strip().lstrip("@")
 
 
-def conversation_for(chat_id):
+def _session_key(chat_id, provider=""):
+    sid = _norm_id(chat_id)
+    prov = str(provider or "").strip()
+    return f"{prov}:{sid}" if prov else sid
+
+
+def _lookup_root(data, chat_id, provider=""):
+    sid = _norm_id(chat_id)
+    sessions = data["sessions"]
+    root = None
+    if provider:
+        root = sessions.get(_session_key(sid, provider))
+    if not root:
+        root = sessions.get(sid)
+    if not root and not provider:
+        suffix = f":{sid}"
+        for k, v in sessions.items():
+            if k.endswith(suffix):
+                root = v
+                break
+    return root
+
+
+def conversation_for(chat_id, provider=""):
     """(root id, record) for any session that belongs to a conversation, else (None, None)."""
     data = _load()
-    root = data["sessions"].get(_norm_id(chat_id))
+    root = _lookup_root(data, chat_id, provider=provider)
     rec = data["conversations"].get(root) if root else None
     return (root, rec) if rec else (None, None)
 
@@ -157,21 +180,23 @@ def conversation_for(chat_id):
 def start_conversation(chat_id, provider, project_dir=""):
     """Create (or return) the conversation whose first segment is this native chat."""
     sid = _norm_id(chat_id)
+    skey = _session_key(sid, provider)
     with _lock:
         data = _load()
-        root = data["sessions"].get(sid)
+        root = data["sessions"].get(skey) or (data["sessions"].get(sid) if not provider else None)
         if root and root in data["conversations"]:
             return root, data["conversations"][root]
+        root = sid if sid not in data["conversations"] else skey
         rec = {
-            "root": sid,
+            "root": root,
             "project_dir": project_dir,
             "current": 0,
             "segments": [_segment(provider, sid, sid, NATIVE)],
         }
-        data["conversations"][sid] = rec
-        data["sessions"][sid] = sid
+        data["conversations"][root] = rec
+        data["sessions"][skey] = root
         _save(data)
-        return sid, rec
+        return root, rec
 
 
 def _segment(provider, session_id, ref, method, **more):
@@ -226,7 +251,7 @@ def add_segment(root, provider, session_id, ref, method, **more):
         seg = _segment(provider, _norm_id(session_id), ref, method, **more)
         rec["segments"].append(seg)
         rec["current"] = len(rec["segments"]) - 1
-        data["sessions"][_norm_id(session_id)] = root
+        data["sessions"][_session_key(session_id, provider)] = root
         _save(data)
         return seg
 
@@ -239,16 +264,25 @@ def drop_segment(root, session_id):
         if not rec:
             return
         sid = _norm_id(session_id)
-        keep = [s for s in rec["segments"] if s.get("session_id") != sid or s.get("method") == NATIVE]
-        if len(keep) != len(rec["segments"]):
+        keep = []
+        dropped = []
+        for s in rec["segments"]:
+            if s.get("session_id") != sid or s.get("method") == NATIVE:
+                keep.append(s)
+            else:
+                dropped.append(s)
+        if dropped:
             cur = current_segment(rec)
             rec["segments"] = keep
             rec["current"] = keep.index(cur) if cur in keep else len(keep) - 1
-            data["sessions"].pop(sid, None)
+            for s in dropped:
+                data["sessions"].pop(_session_key(sid, s.get("provider", "")), None)
+            if not any(s.get("session_id") == sid for s in keep):
+                data["sessions"].pop(sid, None)
             _save(data)
 
 
-def activate(root, session_id, at=None):
+def activate(root, session_id, at=None, provider=""):
     """Switch back: the existing segment for session_id becomes current again.
 
     `at` is when the switch began (before the message was sent), so the sent message
@@ -257,11 +291,18 @@ def activate(root, session_id, at=None):
         data = _load()
         rec = data["conversations"][root]
         now = float(at) if at else time.time()
+        sid = _norm_id(session_id)
         for i, seg in enumerate(rec["segments"]):
-            if seg.get("session_id") == _norm_id(session_id):
+            if seg.get("session_id") == sid and (not provider or seg.get("provider") == provider):
                 cur = current_segment(rec)
                 if cur is not None and cur is not seg and cur.get("end") is None:
                     cur["end"] = now
+                # A1: keep the resumed segment's previous end — it is the "you left here at"
+                # timestamp the away-delta window needs. Nulling `end` alone used to make the
+                # next visit re-send the whole segment history as a duplicate delta.
+                prev_end = seg.get("end")
+                if prev_end is not None:
+                    seg["last_end"] = prev_end
                 seg["end"] = None
                 seg["resumed"] = now
                 rec["current"] = i
@@ -352,7 +393,8 @@ def _launch(argv, cwd, log_path):
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0)
     else:
         kwargs["start_new_session"] = True
-    env = os.environ.copy()
+    from subway_env import headless_env
+    env = headless_env()
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = repo + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     kwargs["env"] = env
@@ -372,10 +414,30 @@ def _log_tail(path, start=0, limit=REPLY_MAX_CHARS, stop=None):
     try:
         with open(path, "rb") as fh:
             fh.seek(start)
-            raw = fh.read(-1 if stop is None else max(0, stop - start)).decode("utf-8", "replace")
+            raw = fh.read(-1 if stop is None else max(0, stop - start))
     except OSError:
         return ""
-    return _ANSI.sub("", raw).strip()[-limit:]
+    raw = _align_utf8(raw)
+    return _ANSI.sub("", raw.decode("utf-8", "replace")).strip()[-limit:]
+
+
+def _align_utf8(raw: bytes) -> bytes:
+    """A7: a byte offset can land mid-multibyte-character when a log is flushed
+    concurrently. Skip leading continuation bytes so decode starts on a boundary,
+    and drop a trailing partial character instead of emitting U+FFFD."""
+    i = 0
+    while i < len(raw) and (raw[i] & 0xC0) == 0x80:
+        i += 1
+    raw = raw[i:]
+    # Trim an incomplete trailing sequence (up to 3 continuation bytes can follow a start byte).
+    for back in range(1, min(4, len(raw)) + 1):
+        tail = raw[-back]
+        if (tail & 0x80) == 0:  # ASCII: sequence complete
+            break
+        if (tail & 0xC0) == 0xC0:  # start byte too close to the end: incomplete
+            raw = raw[:-back]
+            break
+    return raw
 
 
 def resume(adapter, ref, text, *, binary, cwd, model="", effort="", launcher=None):
@@ -386,13 +448,23 @@ def resume(adapter, ref, text, *, binary, cwd, model="", effort="", launcher=Non
         return False, "still replying to the previous message", {"pid": prev.pid}
     argv = adapter.resume_argv(binary, ref, text, model=model, effort=effort)
     streaming_ids = set(_PROVIDER_DATA.get("streaming_ids") or [])
+    sid_str = os.path.basename(str(ref))
     if adapter.id in streaming_ids:
+        os.environ["SUBWAY_LIVE_KEY"] = "%s-%s" % (adapter.id, sid_str)
+        os.environ["SUBWAY_LAUNCH_SID"] = sid_str
         argv = [sys.executable, "-m", "transplant.stream_tee", adapter.id, "--"] + argv
-    log_path = _log_path(adapter.id, os.path.basename(str(ref)))
+    log_path = _log_path(adapter.id, sid_str)
     ok, detail, info = (launcher or _launch)(argv, cwd, log_path)
     proc = info.pop("proc", None)
     if proc is not None:
         _runs[key] = proc
+        try:
+            import provider_lines as _fl
+            with _fl._headless_lock:
+                _fl._headless_runs[key] = proc
+                _fl._record_headless_meta(key, proc, log_path, info.get("offset") or 0, text)
+        except Exception:
+            pass
     return ok, detail, info
 
 
@@ -448,11 +520,14 @@ def _reply_from_log(path, offset=0, stop=None, provider=""):
     else:
         raw = _log_tail(path, offset, 1 << 24, stop)  # whole run: the reply may sit before long usage events
         text = adapter.reply_text(raw)[-REPLY_MAX_CHARS:]
-    with _lock:
-        # One entry per run log: a streaming reply changes the signature on every chunk, so drop older entries.
-        for k in [k for k in _reply_cache if k[0] == path and k[2] == offset]:
-            del _reply_cache[k]
-        _reply_cache[key] = text
+    # A7: only cache when the log was stable across the read — a signature change
+    # means the run was mid-flush and the reply we just built is incomplete.
+    if _file_sig(path) == key[1]:
+        with _lock:
+            # One entry per run log: a streaming reply changes the signature on every chunk, so drop older entries.
+            for k in [k for k in _reply_cache if k[0] == path and k[2] == offset]:
+                del _reply_cache[k]
+            _reply_cache[key] = text
     return text
 
 
@@ -574,10 +649,7 @@ def transplant(chat, to_provider, text, *, model="", effort="", project_dir="", 
     if moved:
         return _primer(adapter.id, "store format changed (%s); re-learning it needs your approval" % where)
 
-    sample = ir.trim(trimmed, k=MIN_K, budget_chars=min(chars, 30000))
-    ok, detail = _probe_ok(adapter, sample, binary=binary, cwd=cwd, model=model, runner=probe_runner)
-    if not ok:
-        return _primer(adapter.id, "resume probe failed (%s)" % detail)
+    # Skip synchronous CLI probing on the hot send path; fall back to primer only if write_session/resume fails.
 
     try:
         result = writer.write_session(adapter, trimmed, cwd=cwd, model=model)
@@ -608,13 +680,90 @@ def transplant(chat, to_provider, text, *, model="", effort="", project_dir="", 
             note_sent(root, result["session_id"], text, info.get("log", ""), info.get("offset", 0))
     return out
 
+def _rec_for_write(data, chat_id, provider=""):
+    root = _lookup_root(data, chat_id, provider=provider)
+    return root, (data["conversations"].get(root) if root else None)
+
+
+def set_cut(chat_id, tid, provider=""):
+    """Hide everything after turn `tid` in this chat (the transcript file is never touched)."""
+    with _lock:
+        root, rec = conversation_for(chat_id, provider=provider)
+        if rec is None:
+            start_conversation(chat_id, provider or "")
+        data = _load()
+        root, rec = _rec_for_write(data, chat_id, provider=provider)
+        prior = (rec.get("cut") or {}).get("hidden") or []
+        rec["cut"] = {"tid": str(tid), "at": time.time(), "sent": False, "hidden": prior}
+        _save(data)
+        return rec["cut"]
+
+
+def clear_cut(chat_id):
+    with _lock:
+        data = _load()
+        root, rec = _rec_for_write(data, chat_id)
+        cut = (rec or {}).get("cut")
+        if not cut:
+            return False
+        if cut.get("sent"):
+            raise ValueError("already continued")
+        rec.pop("cut", None)
+        _save(data)
+        return True
+
+
+def cut_for(chat_id):
+    root, rec = conversation_for(chat_id)
+    return (rec or {}).get("cut") or None
+
+
+def mark_cut_sent(chat_id, hidden=()):
+    """The next message went out: from now on only the reverted rows (`hidden` tids) stay hidden."""
+    with _lock:
+        data = _load()
+        root, rec = _rec_for_write(data, chat_id)
+        if rec and rec.get("cut"):
+            rec["cut"]["sent"] = True
+            rec["cut"]["hidden"] = list(dict.fromkeys((rec["cut"].get("hidden") or []) + [str(t) for t in hidden]))
+            _save(data)
+
+
+def fork_conversation(chat_id, tid, provider):
+    """New conversation record that starts from turn `tid` of this chat."""
+    import secrets
+    with _lock:
+        data = _load()
+        root = data["sessions"].get(_norm_id(chat_id)) or _norm_id(chat_id)
+        fid = "fork-" + secrets.token_hex(4)
+        data["conversations"][fid] = {"root": fid, "from_root": root, "from_tid": str(tid),
+                                      "provider": str(provider or ""), "current": 0, "segments": [], "at": time.time()}
+        _save(data)
+        return fid
+
+
+def discard_fork(fid):
+    """Drop a fork record whose launch failed, so no orphan is left behind."""
+    if not str(fid).startswith("fork-"):
+        return
+    with _lock:
+        data = _load()
+        if data["conversations"].pop(fid, None) is not None:
+            _save(data)
+
+
 def moved_copies():
     """Session ids that are a conversation's later segments (not its root): hidden from chat lists."""
     data = _load()
-    return {sid for sid, root in (data.get("sessions") or {}).items() if sid != root}
+    out = set()
+    for rec in (data.get("conversations") or {}).values():
+        for s in (rec.get("segments") or [])[1:]:
+            if s.get("session_id"):
+                out.add(s["session_id"])
+    return out
 
 
-def merge_conversation_turns(chat_id, turns):
+def merge_conversation_turns(chat_id, turns, turns_limit=None):
     """One conversation across providers, in order: the native chat's own turns for its window,
     then each engine-made segment's sent messages and replies. (turns, None) when not a conversation."""
     from transplant.ir import norm_ts
@@ -623,6 +772,7 @@ def merge_conversation_turns(chat_id, turns):
     if len(segs) < 2:
         return turns, None
     cid = _norm_id(chat_id)
+    fetch_turns = turns_limit if turns_limit is not None else max(100, len(turns or []))
     last_ts = norm_ts((turns or [{}])[-1].get("ts")) if turns else None
     merge_key = (chat_id, len(turns or []), last_ts, _conv_cache.get("sig"))
 
@@ -649,7 +799,7 @@ def merge_conversation_turns(chat_id, turns):
                             part_src = cached.get("turns") or []
                             sig = cur_sig
                         else:
-                            p = _chats.chat_turns(sid, source=seg.get("provider") or "all", turns=20) or {}
+                            p = _chats.chat_turns(sid, source=seg.get("provider") or "all", turns=fetch_turns) or {}
                             fetched = p.get("turns")
                             sig = _native_sig(p.get("path"), seg.get("provider"))
                             if isinstance(fetched, list):
@@ -657,7 +807,7 @@ def merge_conversation_turns(chat_id, turns):
                                 if sig is not None:
                                     _native_turns_cache[sid] = {"sig": sig, "turns": fetched, "path": p.get("path")}
                     else:
-                        p = _chats.chat_turns(sid, source=seg.get("provider") or "all", turns=20) or {}
+                        p = _chats.chat_turns(sid, source=seg.get("provider") or "all", turns=fetch_turns) or {}
                         fetched = p.get("turns")
                         sig = _native_sig(p.get("path"), seg.get("provider"))
                         if isinstance(fetched, list):
@@ -685,7 +835,18 @@ def merge_conversation_turns(chat_id, turns):
         if cached_merge and cached_merge.get("key") == full_key:
             return copy.deepcopy(cached_merge["result"])
 
-    merged.sort(key=lambda t: (norm_ts(t.get("ts")) or 0.0, 0))  # stable: same-time turns keep their order
+    last_ts = None
+    keyed = []
+    for idx, t in enumerate(merged):
+        ts = norm_ts(t.get("ts"))
+        if ts:
+            last_ts = ts
+            eff = ts
+        else:
+            eff = last_ts if last_ts is not None else 0.0
+        keyed.append((eff, idx, t))
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    merged = [item[2] for item in keyed]
     cur = current_segment(rec) or {}
     meta = {"root": root, "current_provider": cur.get("provider") or "",
             "segments": [{k: s.get(k) for k in ("provider", "method", "start", "end")} for s in segs]}

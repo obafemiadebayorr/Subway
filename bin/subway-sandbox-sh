@@ -1,0 +1,9 @@
+#!/bin/sh
+if [ -n "$SUBWAY_SANDBOX_HTTP_PROXY" ]; then
+    export HTTP_PROXY="$SUBWAY_SANDBOX_HTTP_PROXY"
+    export HTTPS_PROXY="$SUBWAY_SANDBOX_HTTP_PROXY"
+fi
+if [ -n "$SUBWAY_SANDBOX_PROFILE" ] && [ -f "$SUBWAY_SANDBOX_PROFILE" ] && command -v sandbox-exec >/dev/null 2>&1; then
+    exec sandbox-exec -f "$SUBWAY_SANDBOX_PROFILE" /bin/zsh "$@"
+fi
+exec /bin/zsh "$@"

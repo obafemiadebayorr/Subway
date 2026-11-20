@@ -47,13 +47,14 @@ def _action_path(args):
     return None
 
 
-def action_summary(actions):
+def action_summary(actions, files=None):
     """Compact marker for prior provider actions, or '' when nothing."""
     read_paths, mod_paths = [], []
     seen_read, seen_mod = set(), set()
     run_count = 0
     other_counts = {}
     other_order = []
+    saw_mod_tool = False
     for action in actions or []:
         name = (action.get("tool") or "")
         lower = name.lower()
@@ -63,6 +64,7 @@ def action_summary(actions):
                 seen_read.add(path)
                 read_paths.append(path)
         elif any(k in lower for k in ("edit", "write", "patch", "replace", "create")):
+            saw_mod_tool = True
             if path and path not in seen_mod:
                 seen_mod.add(path)
                 mod_paths.append(path)
@@ -74,6 +76,16 @@ def action_summary(actions):
                 other_counts[key] = 0
                 other_order.append(key)
             other_counts[key] += 1
+
+    for fp in files or []:
+        if not fp:
+            continue
+        if saw_mod_tool and fp not in seen_mod and fp not in seen_read:
+            seen_mod.add(fp)
+            mod_paths.append(fp)
+        elif fp not in seen_read and fp not in seen_mod:
+            seen_read.add(fp)
+            read_paths.append(fp)
 
     def fmt_paths(paths):
         shown = paths[:6]
@@ -100,7 +112,7 @@ def action_summary(actions):
 def render_assistant_text(turn):
     """Turn text, then a compact marker line for actions when present."""
     parts = [turn.get("text", "")]
-    summary = action_summary(turn.get("actions") or [])
+    summary = action_summary(turn.get("actions") or [], files=turn.get("files") or [])
     if summary:
         parts.append(summary)
     text = "\n\n".join(parts)

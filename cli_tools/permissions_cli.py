@@ -18,6 +18,34 @@ def t_estimate_complexity(prompt: str, role: str = "") -> str:
 
 def t_answer_permission(request_id: str, decision: str) -> str:
     """Pass on the user's answer. Only the window that launched the worker can do this."""
+    raw_id = str(request_id or "").strip()
+    if "@" in raw_id:
+        if raw_id.startswith("@"):
+            rest = raw_id[1:]
+            if "/" not in rest:
+                return f"Error: invalid remote permission id `{raw_id}`. Expected `@station/perm_id` or `perm_id@station`."
+            station_name, rid = rest.split("/", 1)
+        else:
+            rid, station_name = raw_id.rsplit("@", 1)
+        station_name = station_name.strip().lstrip("@")
+        rid = rid.strip()
+        if not rid or not station_name:
+            return f"Error: invalid remote permission id `{raw_id}`."
+        dec = str(decision or "").strip()
+        if dec not in ("allow", "allow_always", "deny"):
+            return "Error: decision must be allow, allow_always, or deny."
+        import peers as _peers
+        peer = _peers.by_slug(station_name)
+        if not peer:
+            return f"Error: no linked station called {station_name}."
+        res = _peers.call(peer["peer_id"], "POST", "/api/answer_permission", {"id": rid, "decision": dec})
+        status = res.get("status")
+        if status == 200:
+            return f"Answered remote permission `{rid}` on `@{_peers.slug(peer)}` with `{dec}`."
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        err = data.get("error") or res.get("error") or f"HTTP {status}"
+        return f"Error ({status}): {err}" if status else f"Error: {err}"
+
     me = _s._self_id()
     try:
         with open(_s._perm_file(request_id), "r", encoding="utf-8") as f:

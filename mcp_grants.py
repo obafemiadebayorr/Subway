@@ -106,12 +106,19 @@ def issue_grant(
     project: str = "",
     ttl: float = 3600.0,
     now: Callable[[], float] | float = time.time,
+    url: str = "",
 ) -> str:
     _validate_issue_inputs(worker_id, server, ttl)
     if project is None:
         project = ""
     if not isinstance(project, str):
         project = str(project)
+    # Pin the spec URL at issue time: the proxy re-reads the project's .mcp.json on every
+    # request, so a live worker rewriting that file could otherwise redirect the station's
+    # real bearer to a different host (F5).
+    if not isinstance(url, str):
+        url = str(url or "")
+    url = url[:500]
     cap_token = "cap_" + secrets.token_urlsafe(32)
     key = _hash_token(cap_token)
     ts = _now(now)
@@ -119,6 +126,7 @@ def issue_grant(
         "worker_id": worker_id,
         "server": server,
         "project": project,
+        "url": url,
         "issued_at": ts,
         "expires_at": ts + float(ttl),
     }

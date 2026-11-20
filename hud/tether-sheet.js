@@ -212,7 +212,7 @@ export async function openTetherSheet(opts) {
   sheetEl.appendChild(body);
 
   // Actions
-  const currentThreadEl = document.querySelector(".tt-composer-field [data-thread]");
+  const currentThreadEl = (window.__subwayComposerRoot || document).querySelector(".tt-composer-field [data-thread]");
   const currentThread = currentThreadEl ? currentThreadEl.dataset.thread : null;
 
   const principalBtn = h("button", {
@@ -254,7 +254,7 @@ export async function openTetherSheet(opts) {
             role: `New ${name || providerId} chat`,
             provider: providerId,
             effort: "low",
-            prompt: (document.querySelector(".tt-composer-field .cmp-input")?.value || "").trim() || "New chat: wait for the user's first message, then work on it."
+            prompt: ((window.__subwayComposerRoot || document).querySelector(".tt-composer-field .cmp-input")?.value || "").trim() || "New chat: wait for the user's first message, then work on it."
           });
           toast("Queued for approval");
         } catch (err) {
@@ -404,7 +404,7 @@ export async function openTetherSheet(opts) {
               steerFromComposer({ kind: "chat", id, label: itemTitle || id, sub: providerId }, "threads");
               closeTetherSheet();
               requestAnimationFrame(() => {
-                const i = document.querySelector('.tt-composer-field .cmp-input');
+                const i = (window.__subwayComposerRoot || document).querySelector('.tt-composer-field .cmp-input');
                 if (i) i.focus();
               });
             }

@@ -201,8 +201,28 @@ def record(state_dir: str, entry: dict) -> str:
     return cid
 
 
+_TERMINAL_RESOLVER_STATUSES = {"failed", "stopped", "budget_stopped", "rejected", "timed_out", "error"}
+
+
 def list_conflicts(state_dir: str, repo: str = "") -> list:
     data = _load(state_dir)
+    dirty = False
+    for e in data:
+        if e.get("status") == "resolving" and e.get("resolver"):
+            wpath = os.path.join(state_dir, "workers", f"{e['resolver']}.json")
+            wstatus = None
+            if os.path.exists(wpath):
+                try:
+                    with open(wpath, encoding="utf-8") as fh:
+                        wstatus = json.load(fh).get("status")
+                except (OSError, ValueError):
+                    wstatus = None
+            if not os.path.exists(wpath) or wstatus in _TERMINAL_RESOLVER_STATUSES:
+                e["status"] = "needs_resolution"
+                e["last_failed_resolver"] = e.pop("resolver", "")
+                dirty = True
+    if dirty:
+        _save(state_dir, data)
     if repo:
         return [e for e in data if e.get("repo") == repo]
     return list(data)

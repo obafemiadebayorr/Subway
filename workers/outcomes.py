@@ -385,7 +385,18 @@ def _update_worker_status(meta: Dict[str, Any]) -> Dict[str, Any]:
             if ((status in ("failed", "stopped", "timed_out", "budget_stopped") or current.get("priority") == "urgent")
                     and not result.get("rerouted_to") and not result.get("stall_alerted")):
                 _s.notify_desktop_event(f"worker_ended|{wid}|{status}", "Subway", message[:500], route="workers")
-            target_chat = current.get("launched_by") or current.get("thread") or current.get("thread_root")
+            if current.get("launched_by") == "hud" or "requester" in current:
+                target_chat = current.get("requester") or None
+            else:
+                target_chat = current.get("launched_by")
+                if target_chat:
+                    thread_id = current.get("thread") or current.get("thread_root")
+                    if thread_id:
+                        with contextlib.suppress(Exception):
+                            import thread_state
+                            ts = thread_state.get(_s.SUBWAY_DIR, str(thread_id))
+                            if ts.get("principal_id"):
+                                target_chat = ts["principal_id"]
             if target_chat:
                 try:
                     from wake_driver import WakeEvent, wake_chat

@@ -28,13 +28,21 @@ try:  # getpass can fail on odd platforms; identity is best-effort.
 except Exception:  # pragma: no cover - stdlib import guard
     getpass = None  # type: ignore
 
+try:
+    from hud_server import sealed_box
+except Exception:  # pragma: no cover - package import fallback
+    try:
+        import sealed_box  # type: ignore
+    except Exception:
+        sealed_box = None  # type: ignore
+
 PREFIX = "/api/collab/"
 DEFAULT_FILE = "~/.subway-context/collab.json"
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LEN = 6
 SCOPE_KEYS = ("threads", "workers", "terminals")
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 Result = Tuple[int, Dict[str, Any]]
 
@@ -215,6 +223,35 @@ def _me(role: str = "member", station_card: Any = None, peer_id: Any = None) -> 
 # --------------------------------------------------------------------- helpers
 
 
+# ------------------------------------------------------------ sealed secrets
+
+
+def _session_key(session: Dict[str, Any]) -> bytes:
+    if sealed_box is None:
+        raise RuntimeError("sealed_box unavailable")
+    return sealed_box.derive_key(str(session.get("code") or ""), str(session.get("id") or ""),
+                                 rotation_salt=str(session.get("rotation_salt") or ""))
+
+
+def seal_session_payload(session: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """Seal a secrets payload into the session doc; plaintext is never persisted."""
+    blob = sealed_box.seal(_session_key(session), json.dumps(payload).encode("utf-8"))
+    session["secrets_blob"] = blob
+
+
+def open_session_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+    blob = session.get("secrets_blob")
+    if not isinstance(blob, dict):
+        return {}
+    raw = sealed_box.open_box(_session_key(session), blob)
+    data = json.loads(raw.decode("utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def drop_session_blob(session: Dict[str, Any]) -> None:
+    session.pop("secrets_blob", None)
+
+
 def _norm_code(raw: Any) -> str:
     if not isinstance(raw, str):
         return ""
@@ -314,6 +351,8 @@ def _public(session: Dict[str, Any]) -> Dict[str, Any]:
     mine = next((m for m in members if m.get("self")), None)
     scopes = _norm_scopes(session.get("scopes"))
     out = dict(session)
+    out.pop("secrets_blob", None)  # ciphertext only on disk; never emitted
+    out.pop("secrets", None)       # plaintext secrets never leave this station
     out["members"] = members
     out["scopes"] = scopes
     out["scope"] = dict(scopes)
@@ -364,9 +403,86 @@ def _normalize_path(path: Any) -> str:
 
 
 def _end_session(session: Dict[str, Any]) -> bool:
+    _wipe_master_and_local(session, reason="ended")
+    _rotate_key(session, drop=True)
     _fanout_end(session)
     _save(None)
     return True
+
+
+def _threads_base_dir() -> str:
+    env_dir = os.environ.get("SUBWAY_THREADS_DIR", "").strip() or os.environ.get("SUBWAY_DIR", "").strip()
+    if env_dir:
+        return os.path.expanduser(env_dir)
+    return os.path.dirname(state_path())
+
+
+def _wipe_master_and_local(session: Dict[str, Any], reason: str = "revoked") -> Dict[str, Any]:
+    """Best-effort remote wipe on master's station + local thread copy cleanup.
+
+    Caveat: remote wipe relies on the master station running matching Subway code
+    (/api/peer/collab/wipe); an unmodified or adversarial remote station cannot be
+    forced to erase data it has already received.
+    """
+    sid = str(session.get("id") or "")
+    master_id = str(session.get("master_device") or "")
+    gen = int(session.get("key_generation") or 1)
+    local_wiped: List[str] = []
+    try:
+        import threads  # type: ignore
+        local_wiped = threads.wipe_session_threads(_threads_base_dir(), sid)
+    except Exception:
+        local_wiped = []
+    remote_sent = False
+    if master_id and master_id != _device_id():
+        member = _find_member(session, master_id)
+        pid = str((member or {}).get("peer_id") or "")
+        try:
+            import peers  # type: ignore
+            if not pid:
+                p = peers.by_device(master_id)
+                pid = str((p or {}).get("peer_id") or "")
+            if pid:
+                peers.call(pid, "POST", "/api/peer/collab/wipe",
+                           {"session_id": sid, "reason": reason, "key_generation": gen}, timeout=5)
+                remote_sent = True
+        except Exception:
+            pass
+    try:
+        from hud_server import outbound_guard
+        outbound_guard.log_audit("session_wipe", session_id=sid, channel="peer", match_label=reason,
+                               extra={"master_device": master_id, "remote_sent": remote_sent,
+                                      "local_wiped": len(local_wiped)})
+    except Exception:
+        pass
+    return {"remote_sent": remote_sent, "local_wiped": local_wiped}
+
+
+def revoke_and_end(session: Dict[str, Any], reason: str = "revoked") -> bool:
+    """k3/k4: Bump key generation, drop key material, send best-effort wipe to master, end session."""
+    _rotate_key(session, drop=True)
+    session.pop("code", None)
+    session.pop("rotation_salt", None)
+    _wipe_master_and_local(session, reason=reason)
+    _fanout_end(session)
+    _save(None)
+    return True
+
+
+def _rotate_key(session: Dict[str, Any], drop: bool = False) -> int:
+    """Bump key_generation, re-salt, re-seal (or drop) the secrets blob. Returns new generation."""
+    payload: Dict[str, Any] = {}
+    try:
+        payload = open_session_payload(session)
+    except Exception:
+        payload = {}
+    session["key_generation"] = int(session.get("key_generation") or 1) + 1
+    session["rotation_salt"] = secrets.token_hex(16)
+    if drop or not payload:
+        session.pop("secrets_blob", None)
+    else:
+        seal_session_payload(session, payload)
+    return int(session["key_generation"])
 
 
 def _linked_peer_ids(session: Dict[str, Any]) -> List[str]:
@@ -416,8 +532,22 @@ def _coach_links(session: Optional[Dict[str, Any]], via: str) -> List[str]:
     return out
 
 
+def _assert_sealed(session: Optional[Dict[str, Any]]) -> None:
+    """g4 guard: outbound session payloads must carry ciphertext only."""
+    if not isinstance(session, dict):
+        return
+    if "secrets" in session:
+        raise ValueError("refusing to fan out plaintext session secrets")
+    blob = session.get("secrets_blob")
+    if blob is not None and not (isinstance(blob, dict) and blob.get("nonce") and blob.get("ct") and blob.get("tag")):
+        raise ValueError("refusing to fan out malformed sealed blob")
+
+
 def _fanout(session: Dict[str, Any], removed_device_id: Optional[str] = None) -> None:
     """Best-effort: sync session state to paired ENGINES; each engine re-fans to its own coaches."""
+    _assert_sealed(session)
+    from hud_server import outbound_guard
+    outbound_guard.check_outbound(session, {"session": session, "removed_device_id": removed_device_id}, channel="fanout")
     try:
         import peers  # type: ignore
     except Exception:
@@ -428,6 +558,7 @@ def _fanout(session: Dict[str, Any], removed_device_id: Optional[str] = None) ->
     def _send() -> None:
         for pid in ids:
             payload = {"session": session, "removed_device_id": removed_device_id, "via": pid, "sender_is_host": True}
+            outbound_guard.check_outbound(session, payload, channel="fanout")
             try:
                 peers.call(pid, "POST", "/api/peer/collab/sync", payload, timeout=8)
             except Exception:
@@ -438,6 +569,9 @@ def _fanout(session: Dict[str, Any], removed_device_id: Optional[str] = None) ->
 
 def _fanout_end(session: Dict[str, Any]) -> None:
     """Tell the engines the session ended; they pass the end down to their coaches."""
+    _assert_sealed(session)
+    from hud_server import outbound_guard
+    outbound_guard.check_outbound(session, {"session": None, "ended": True, "session_id": session.get("id")}, channel="fanout_end", on_match_end=False)
     try:
         import peers  # type: ignore
     except Exception:
@@ -462,6 +596,10 @@ _LAST_GATEWAY_SNAPSHOT: Optional[Dict[str, Any]] = None
 
 def _relay(session: Optional[Dict[str, Any]], via: str, ended_id: Optional[str] = None) -> None:
     """Engine side: pass the host's snapshot (or its end) down to the coaches we vouched for."""
+    _assert_sealed(session)
+    from hud_server import outbound_guard
+    if session is not None:
+        outbound_guard.check_outbound(session, {"session": session, "via": via}, channel="relay")
     global _LAST_GATEWAY_SNAPSHOT
     ended = session is None
     if session is not None:
@@ -484,6 +622,8 @@ def _relay(session: Optional[Dict[str, Any]], via: str, ended_id: Optional[str] 
             payload = ({"session": None, "ended": True, "session_id": ended_id}
                        if ended else {"session": snap, "removed_device_id": None,
                                       "you": str((peers.get(pid) or {}).get("device_id") or "")})
+            if not ended and snap is not None:
+                outbound_guard.check_outbound(snap, payload, channel="relay")
             try:
                 peers.call(pid, "POST", "/api/peer/collab/sync", payload, timeout=8)
             except Exception:
@@ -592,7 +732,8 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
     # Train terms (item 38): stations couple into one session and uncouple to leave it.
     action = {"couple": "join", "uncouple": "leave"}.get(action, action)
     if action not in ("start", "join", "leave", "end", "remove", "scope", "handover",
-                      "billing", "master", "local_initiator", "brief", "plans"):
+                      "billing", "master", "local_initiator", "brief", "plans", "cap",
+                      "secret_set", "secret_list", "tripwire_add", "revoke"):
         return _err(404, "Unknown collaboration endpoint")
     data: Dict[str, Any] = body if isinstance(body, dict) else {}
     if action == "join" and route.endswith("/couple") and str(data.get("station") or "").strip():
@@ -625,7 +766,9 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
                 "scopes": _norm_scopes(data.get("scopes")),
                 "started_at": time.time(),
                 "revision": 1,
+                "key_generation": 1,
             }
+            _session_key(new)  # derive the session key from the join code
             _save(new)
             _fanout(new)
             return 200, {"session": _public(new), "host": _device_name()}
@@ -669,6 +812,7 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
                                    "grants": coach.get("grants") or {}})
                 if shared:
                     session["shared_coaches"] = shared
+            _session_key(session)  # re-derive on join/couple
             session["revision"] = int(session.get("revision") or 1) + 1
             _save(session)
             _fanout(session)
@@ -691,6 +835,7 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
                 ended = _end_session(session)
                 return 200, {"session": None, "ended": ended}
             session["members"] = [m for m in session.get("members", []) if m.get("device_id") != me]
+            _rotate_key(session)
             session["revision"] = int(session.get("revision") or 1) + 1
             _save(session)
             _fanout(session)
@@ -720,8 +865,8 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
                 ended = _end_session(session)
                 return 200, {"session": None, "ended": ended}
             session["members"] = [m for m in session.get("members", []) if m.get("device_id") != target]
+            _rotate_key(session)
             session["key_rotated_at"] = time.time()
-            session["key_generation"] = int(session.get("key_generation") or 1) + 1
             session["revision"] = int(session.get("revision") or 1) + 1
             _save(session)
             _fanout(session, removed_device_id=target)
@@ -818,6 +963,104 @@ def handle_post(path: str, body: Optional[Dict[str, Any]] = None) -> Optional[Re
             _save(session)
             _fanout(session)
             return 200, {"session": _public(session), "deliveries": results}
+
+        if action == "secret_set":
+            if session is None:
+                return _err(404, "No collaboration session is active")
+            name = (data.get("name") or "").strip()
+            if not name:
+                return _err(400, "name required")
+            from hud_server import session_secrets
+            try:
+                session_secrets.set_secret(
+                    session["id"], name, str(data.get("value") or ""),
+                    actor_device_id=_device_id(), share=bool(data.get("share")),
+                )
+            except session_secrets.SecretAccessError as e:
+                msg = str(e)
+                code = 403 if ("Mode A" in msg or "owner" in msg) else 400
+                return _err(code, msg)
+            return 200, {"ok": True, "handle": name}
+
+        if action == "secret_list":
+            if session is None:
+                return _err(404, "No collaboration session is active")
+            from hud_server import session_secrets
+            try:
+                handles = session_secrets.list_handles(session["id"])
+            except session_secrets.SecretAccessError as e:
+                return _err(400, str(e))
+            return 200, {"ok": True, "handles": handles}
+
+        if action == "tripwire_add":
+            if session is None:
+                return _err(404, "No collaboration session is active")
+            val = str(data.get("value") or "")
+            if not val:
+                return _err(400, "value required")
+            from hud_server import outbound_guard
+            res = outbound_guard.register_tripwire(session["id"], val, label=str(data.get("label") or ""))
+            return 200, res
+
+        if action == "revoke":
+            if session is None:
+                return _err(404, "No collaboration session is active")
+            me_id = _device_id()
+            if me_id not in (session.get("host_device"), session.get("master_device")):
+                return _err(403, "Only host or master may revoke the session")
+            reason = str(data.get("reason") or "revoked")
+            revoke_and_end(session, reason=reason)
+            return 200, {"ok": True, "revoked": True, "key_generation": session.get("key_generation")}
+
+        # action == "cap": per-sender lending caps (j1). Receiver (master) or host sets; anyone in session reads.
+        if action == "cap":
+            me_id = _device_id()
+            master = str(session.get("master_device") or session.get("host_device") or "")
+            is_priv = me_id == master or me_id == session.get("host_device")
+            sub = str(data.get("op") or "get").strip().lower()
+            caps = session.setdefault("caps", {})
+            if sub == "set":
+                if not is_priv:
+                    return _err(403, "Only the receiving master may set lending caps")
+                sender = str(data.get("sender") or data.get("device_id") or "").strip()
+                if not sender or _find_member(session, sender) is None:
+                    return _err(404, "That sender is not in the session")
+                cap: Dict[str, Any] = {}
+                for k in ("tokens", "allowance_pct", "seconds"):
+                    v = data.get(k)
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        return _err(400, f"{k} must be a number")
+                    if fv < 0:
+                        return _err(400, f"{k} must be >= 0")
+                    cap[k] = fv
+                if not cap:
+                    return _err(400, "Provide at least one of tokens, allowance_pct, seconds")
+                cap["set_by"] = me_id
+                cap["set_at"] = time.time()
+                caps[sender] = cap
+                session["revision"] = int(session.get("revision") or 1) + 1
+                _save(session)
+                _fanout(session)
+            elif sub != "get":
+                return _err(400, "op must be 'set' or 'get'")
+            usage = session.get("cap_usage") or {}
+            out: Dict[str, Any] = {}
+            for did, cap in caps.items():
+                used = usage.get(did) if isinstance(usage.get(did), dict) else {}
+                remaining: Dict[str, Any] = {}
+                if "tokens" in cap:
+                    remaining["tokens"] = max(0.0, float(cap["tokens"]) - float(used.get("tokens") or 0))
+                if "seconds" in cap:
+                    remaining["seconds"] = max(0.0, float(cap["seconds"]) - float(used.get("seconds") or 0))
+                if "allowance_pct" in cap:
+                    remaining["allowance_pct"] = max(0.0, float(cap["allowance_pct"]) - float(used.get("allowance_pct") or 0))
+                out[did] = {"cap": cap, "used": used, "remaining": remaining,
+                            "stop": any(v == 0.0 for v in remaining.values())}
+            return 200, {"caps": out, "key_generation": session.get("key_generation", 1)}
 
         # action == "plans"
         if action == "plans":
@@ -970,6 +1213,33 @@ def apply_peer_sync(body: Optional[Dict[str, Any]] = None, from_peer: str = "") 
         if via:
             _relay(incoming, via)  # engines pass the snapshot down; coaches have no coaches
         return 200, {"ok": True, "session": _public(incoming)}
+
+
+def handle_peer_wipe(body: Optional[Dict[str, Any]] = None, from_peer: str = "") -> Result:
+    """k4 master-side handler for POST /api/peer/collab/wipe: best-effort delete local thread copy."""
+    data: Dict[str, Any] = body if isinstance(body, dict) else {}
+    sid = str(data.get("session_id") or "").strip()
+    if not sid:
+        return _err(400, "session_id required")
+    wiped: List[str] = []
+    try:
+        import threads  # type: ignore
+        wiped = threads.wipe_session_threads(_threads_base_dir(), sid)
+    except Exception:
+        wiped = []
+    with _LOCK:
+        cur = _load()
+        if cur and cur.get("id") == sid:
+            _rotate_key(cur, drop=True)
+            _save(None)
+    try:
+        from hud_server import outbound_guard
+        outbound_guard.log_audit("peer_wipe_received", session_id=sid, channel="peer",
+                               match_label=str(data.get("reason") or "revoked"),
+                               extra={"from_peer": from_peer, "wiped": len(wiped)})
+    except Exception:
+        pass
+    return 200, {"ok": True, "session_id": sid, "wiped": wiped}
 
 
 def couple_from_peer(peer_id: str, body: Optional[Dict[str, Any]] = None) -> Result:

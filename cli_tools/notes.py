@@ -355,10 +355,14 @@ def t_reply_note(msg_id: str, text: str, from_chat: str = "") -> str:
     if not to:
         return f"Error: original `{msg_id}` has no sender to reply to."
     result = t_send_note(to=to, text=text, from_chat=from_chat, mode="fast", reply_to=msg_id)
-    try:
-        _fastmail.set_state(msg_id, "replied")
-    except Exception:
-        pass
+    if not str(result or "").startswith("Error"):
+        # A5: only mark the original as replied when the send actually succeeded.
+        # (t_send_note already derives sender = from_chat or self_id, so an omitted
+        # from_chat still records a usable sender — no fallback needed here.)
+        try:
+            _fastmail.set_state(msg_id, "replied")
+        except Exception:
+            pass
     return result
 
 def t_fastmail_status(msg_id: str = "", broadcast_id: str = "", limit: int = 20) -> str:

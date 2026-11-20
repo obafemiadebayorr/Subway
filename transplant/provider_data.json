@@ -2,12 +2,22 @@
   "stream_flags": {
     "pi": ["--mode", "json"],
     "claude": ["--output-format", "stream-json", "--include-partial-messages", "--verbose"],
-    "opencode": ["--format", "json"]
+    "opencode": ["--format", "json"],
+    "local": ["--format", "json"],
+    "antigravity": [],
+    "copilot": [],
+    "codex": [],
+    "cursor": ["--output-format", "stream-json", "--stream-partial-output"]
   },
   "stream_kind": {
     "pi": "event_delta",
     "claude": "partial_messages",
-    "opencode": "whole_parts"
+    "opencode": "whole_parts",
+    "local": "whole_parts",
+    "antigravity": "step_delta",
+    "copilot": "message_delta",
+    "codex": "item_text",
+    "cursor": "partial_messages"
   },
   "db_sig": {
     "opencode": {
@@ -15,6 +25,6 @@
       "names": ["opencode.db", "opencode.sqlite", "opencode.sqlite3", "db.sqlite", "opencode"]
     }
   },
-  "streaming_ids": ["pi", "claude", "opencode"],
+  "streaming_ids": ["pi", "claude", "opencode", "local"],
   "cli_noise_re": "^(pi-deep: using subway config\\b.*|Warning: No project session found with id .*)$"
 }

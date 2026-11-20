@@ -41,6 +41,8 @@ def find_claude_binary() -> Optional[str]:
         os.path.join(HOME, ".local", "bin", "claude"),
         "/usr/local/bin/claude",
         "/opt/homebrew/bin/claude",
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/bin/claude",
         *glob.glob(os.path.join(HOME, ".nvm", "versions", "node", "*", "bin", "claude")),
         *glob.glob(os.path.join(HOME, ".npm-global", "bin", "claude")),
         *sorted(glob.glob(os.path.join(HOME, ".vscode", "extensions", "anthropic.claude-code-*", "resources", "native-binary", "claude")), key=os.path.getmtime, reverse=True),
@@ -81,6 +83,10 @@ def find_opencode_binary() -> Optional[str]:
         "/usr/local/bin/opencode2",
         "/opt/homebrew/bin/opencode",
         "/opt/homebrew/bin/opencode2",
+        os.path.expanduser("~/.local/bin/opencode"),
+        os.path.expanduser("~/.local/bin/opencode2"),
+        "/usr/bin/opencode",
+        "/usr/bin/opencode2",
     ]
     if _is_windows():
         appdata = os.environ.get("APPDATA", "")
@@ -140,6 +146,8 @@ def find_copilot_binary() -> Optional[str]:
         os.path.join(HOME, ".local", "bin", "copilot"),
         "/usr/local/bin/copilot",
         "/opt/homebrew/bin/copilot",
+        os.path.expanduser("~/.local/bin/copilot"),
+        "/usr/bin/copilot",
     ]
     for c in candidates:
         if os.path.exists(c) or os.path.lexists(c):

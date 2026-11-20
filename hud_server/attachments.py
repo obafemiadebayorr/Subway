@@ -8,10 +8,27 @@ from typing import List, Optional, Tuple
 
 import server as _s
 
-MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_BYTES = 10 * 1024 * 1024
+MAX_BYTES = DEFAULT_MAX_BYTES             # legacy constant; see max_bytes()
 UPLOAD_MAX_BODY = 14 * 1024 * 1024        # base64 of 10 MB + JSON envelope
 KEEP_DAYS = 7
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def max_bytes() -> int:
+    """Upload size cap in bytes: the upload_max_mb setting (chats group). MAX_BYTES is honoured
+    when a caller has overridden it (tests, embedders) and is the fallback when the setting
+    cannot be read."""
+    if MAX_BYTES != DEFAULT_MAX_BYTES:
+        return MAX_BYTES
+    try:
+        from hud_server import settings_api
+        mb = int(settings_api.value("upload_max_mb") or 0)
+        if mb > 0:
+            return mb * 1024 * 1024
+    except Exception:
+        pass
+    return MAX_BYTES
 
 
 def attachments_dir() -> str:
@@ -69,7 +86,7 @@ def save_upload(name: str, mime: str, data_b64: str) -> Tuple[Optional[dict], Op
 
     if len(raw) == 0:
         return (None, "Empty file")
-    if len(raw) > MAX_BYTES:
+    if len(raw) > max_bytes():
         return (None, "File is over 10 MB")
 
     day_str = time.strftime("%Y%m%d")

@@ -56,9 +56,9 @@ export async function hudSheet() {
     .replace(/:root\[data-theme="light"\]|:root:not\(\[data-theme="dark"\]\)/g, ":host")
     .replace(/:root/g, ":host");
   hudCss = [host(a), host(b)];
-  hudOver = `:host{display:block;color-scheme:light;--bg:transparent;--surface:#fff;--raised:#F7F9F3;--hover:#EEF3EE;--line:#E1E5DB;--line-soft:#ECEFE7;
-      --text:#29444C;--strong:#0F2F3A;--muted:#5E7275;--accent:#2C86B0;--accent-strong:#296A7F;--accent-ink:#fff;
-      --accent-soft:rgba(44,134,176,.12);--accent-line:rgba(44,134,176,.4);--radius:12px;
+  hudOver = `:host{display:block;color-scheme:light;--bg:transparent;--surface:var(--surface);--raised:var(--cloud);--hover:var(--cloud);--line:var(--hair);--line-soft:var(--hair);
+      --text:var(--ink);--strong:var(--ink);--muted:var(--muted);--accent:var(--accent);--accent-strong:var(--sky-ink);--accent-ink:#fff;
+      --accent-soft:color-mix(in srgb,var(--accent) 12%,transparent);--accent-line:color-mix(in srgb,var(--accent) 40%,transparent);--radius:12px;
       --font-sans:"Instrument Sans",system-ui,sans-serif;--font-mono:"JetBrains Mono",ui-monospace,monospace;--font-display:var(--font-sans);
       font-family:var(--font-sans);color:var(--text);font-size:14px;line-height:1.45}
       .card{box-shadow:none;border-color:var(--line)}
@@ -182,13 +182,133 @@ async function modelsSection(slot) {
   }
 }
 
+/* Combined budget across own linked devices (GET /api/peers/allowance). */
+const CB_CSS = `.cb-card{background:var(--surface);border:1px solid var(--hair);border-radius:var(--radius);padding:14px 16px;margin-bottom:14px;display:grid;gap:12px;min-width:0}
+.cb-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px}
+.cb-head h3{margin:0;font-size:14px;font-weight:600;color:var(--ink)}
+.cb-sub{margin:0;font-size:12px;color:var(--muted)}
+.cb-totals{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:baseline}
+.cb-stat{display:flex;flex-direction:column;gap:2px;min-width:0}
+.cb-stat b{font:600 18px/1.2 "JetBrains Mono",monospace;color:var(--ink);font-variant-numeric:tabular-nums}
+.cb-stat span{font-size:12px;color:var(--muted)}
+.cb-bar{height:8px;border-radius:999px;background:var(--cloud);overflow:hidden}
+.cb-fill{height:100%;background:var(--accent);border-radius:999px;transition:width .25s ease}
+.cb-list{display:grid;gap:8px}
+.cb-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;padding-top:8px;border-top:1px solid var(--hair);font-size:13px;min-width:0}
+.cb-dev{display:flex;align-items:center;gap:8px;min-width:0;font-weight:500;color:var(--ink)}
+.cb-vals{font:12px "JetBrains Mono",monospace;color:var(--muted);font-variant-numeric:tabular-nums;text-align:right}
+.cb-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.cb-stale{color:#8A6100;background:#FBF0D6}`;
+
+function cbEl(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = String(text);
+  return n;
+}
+
+function fmtUsd(v) {
+  const n = Number(v || 0);
+  return "$" + (n >= 10 ? n.toFixed(2) : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, ".00"));
+}
+
+async function combinedBudgetSection(root, hostSlot) {
+  root.append(cbEl("style", "", CB_CSS));
+  const card = cbEl("section", "cb-card");
+  card.setAttribute("aria-label", "Combined budget");
+  const head = cbEl("div", "cb-head");
+  head.append(cbEl("h3", "", "Combined budget"), cbEl("p", "cb-sub", "Across own linked devices"));
+  const body = cbEl("div", "", "");
+  body.append(cbEl("div", "empty", "Loading combined budget…"));
+  card.append(head, body);
+  hostSlot.replaceChildren(card);
+  try {
+    const r = await fetch("/api/peers/allowance", { cache: "no-store" });
+    const d = await r.json();
+    if (!r.ok) throw new Error((d && d.error) || `HTTP ${r.status}`);
+    const peers = Array.isArray(d && d.peers) ? d.peers : [];
+    if (!peers.length) {
+      body.replaceChildren(cbEl("p", "cb-sub", "No own devices linked yet."));
+      return;
+    }
+    const tok = (d && d.tokens) || {};
+    const usd = (d && d.usd) || {};
+    const hasTok = (tok.limit || 0) > 0 || (tok.used || 0) > 0 || (tok.remaining || 0) > 0;
+    const hasUsd = (usd.limit || 0) > 0 || (usd.used || 0) > 0 || (usd.remaining || 0) > 0;
+
+    const totals = cbEl("div", "cb-totals");
+    if (hasTok || !hasUsd) {
+      const s = cbEl("div", "cb-stat");
+      s.append(
+        cbEl("b", "", tok.limit > 0 ? `${tnum(tok.remaining)} left` : `${tnum(tok.used)} used`),
+        cbEl("span", "", tok.limit > 0 ? `${tnum(tok.used)} / ${tnum(tok.limit)} tokens` : "no daily token cap"),
+      );
+      totals.append(s);
+    }
+    if (hasUsd) {
+      const s = cbEl("div", "cb-stat");
+      s.append(
+        cbEl("b", "", usd.limit > 0 ? `${fmtUsd(usd.remaining)} left` : `${fmtUsd(usd.used)} used`),
+        cbEl("span", "", usd.limit > 0 ? `${fmtUsd(usd.used)} / ${fmtUsd(usd.limit)} USD` : "USD budget"),
+      );
+      totals.append(s);
+    }
+    if (d.stale_count > 0) {
+      totals.append(cbEl("span", "cb-badge cb-stale", `${d.stale_count} stale`));
+    }
+
+    const frac = tok.limit > 0
+      ? Math.min(100, Math.max(0, Math.round((tok.used / tok.limit) * 100)))
+      : (usd.limit > 0 ? Math.min(100, Math.max(0, Math.round((usd.used / usd.limit) * 100))) : 0);
+    const bar = cbEl("div", "cb-bar");
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-valuenow", String(frac));
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    const fill = cbEl("div", "cb-fill");
+    fill.style.width = `${frac}%`;
+    bar.append(fill);
+
+    const list = cbEl("div", "cb-list");
+    for (const peer of peers) {
+      const row = cbEl("div", "cb-row");
+      const dev = cbEl("div", "cb-dev");
+      dev.append(cbEl("span", "", peer.station || peer.name || peer.peer_id || "device"));
+      if (peer.stale) dev.append(cbEl("span", "cb-badge cb-stale", "stale"));
+
+      const pt = peer.tokens || {};
+      const pu = peer.usd || {};
+      const parts = [];
+      if (peer.error) parts.push(peer.error);
+      if ((pt.limit || 0) > 0) parts.push(`${tnum(pt.used)} / ${tnum(pt.limit)} tok (${tnum(pt.remaining)} left)`);
+      else if ((pt.used || 0) > 0) parts.push(`${tnum(pt.used)} tok used`);
+      if ((pu.limit || 0) > 0) parts.push(`${fmtUsd(pu.used)} / ${fmtUsd(pu.limit)} (${fmtUsd(pu.remaining)} left)`);
+      else if ((pu.used || 0) > 0) parts.push(`${fmtUsd(pu.used)} used`);
+      if (!parts.length) parts.push("no cap");
+
+      row.append(dev, cbEl("div", "cb-vals", parts.join(" · ")));
+      list.append(row);
+    }
+
+    const frag = document.createDocumentFragment();
+    frag.append(totals);
+    if ((tok.limit || 0) > 0 || (usd.limit || 0) > 0) frag.append(bar);
+    frag.append(list);
+    body.replaceChildren(frag);
+  } catch (e) {
+    body.replaceChildren(cbEl("div", "empty", `Couldn't load combined budget: ${(e && e.message) || e}`));
+  }
+}
+
 /* Budgets: the HUD's own card, view only here; budgets are changed in the HUD. */
 async function budgetsSection(slot) {
   const { host, root } = shadowHost("us-hud");
   slot.replaceChildren(host);
   root.append(h("style", {}, ".bud-ro input,.bud-ro button,.bud-ro form{display:none!important}.bud-note{margin:0 0 10px;color:var(--muted);font-size:13px}"));
+  const cbSlot = document.createElement("div");
   const box = h("div", { class: "bud-ro" }, h("div", { class: "empty" }, "Loading budgets…"));
-  root.append(box);
+  root.append(cbSlot, box);
+  combinedBudgetSection(root, cbSlot);
   try {
     const [{ budgetsCard }, d] = await Promise.all([import("/hud/views.js"), fetch("/api/status?view=next", { cache: "no-store" }).then((r) => r.json())]);
     const card = budgetsCard(d);
@@ -475,7 +595,7 @@ const CSS = `
 .dg-tile{background:var(--surface);border:1px solid var(--hair);border-radius:var(--radius);padding:12px 12px 8px;display:flex;flex-direction:column;gap:2px;min-width:0}
 .dg-tile-h{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;font-weight:500}
 .dg-ico{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:8px;background:var(--sky-chip);color:var(--sky-ink);flex:none}
-.dg-tile .dg-ico{color:var(--c);background:color-mix(in srgb,var(--c) 12%,#fff)}
+.dg-tile .dg-ico{color:var(--c);background:color-mix(in srgb,var(--c) 12%,var(--surface))}
 .dg-big{font:500 22px/1.15 "JetBrains Mono",monospace;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dg-sub{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dg-spark-wrap{position:relative;width:100%;height:36px;margin-top:6px}
@@ -488,39 +608,39 @@ const CSS = `
 .dg-row2{display:grid;gap:12px}
 .dg-lab{font-size:12px;color:var(--muted);margin-bottom:6px}
 .dg-split{display:flex;height:12px;border-radius:999px;overflow:hidden;background:var(--cloud);gap:2px}
-.dg-split span{min-width:0}.dg-split .rest{background:#E7EBE3}
+.dg-split span{min-width:0}.dg-split .rest{background:var(--hair)}
 .dg-legend{display:grid;gap:8px;margin-top:14px}
 .dg-lg{display:flex;align-items:center;gap:8px;font-size:13px;min-width:0}
 .dg-lg i{width:10px;height:10px;border-radius:3px;flex:none}.dg-lg b{font-weight:500}
 .dg-lg span{margin-left:auto;font:12px "JetBrains Mono",monospace;color:var(--muted);white-space:nowrap}
 .dg-seg{display:inline-flex;padding:3px;gap:2px;border:1px solid var(--hair);border-radius:10px;background:var(--cloud)}
 .dg-seg button{display:inline-flex;align-items:center;gap:5px;border:0;background:none;padding:5px 10px;border-radius:8px;font:500 12px "Instrument Sans",sans-serif;color:var(--muted);cursor:pointer;min-height:28px}
-.dg-seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(15,47,58,.08)}
+.dg-seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px color-mix(in srgb,var(--ink) 8%,transparent)}
 .dg-bars{min-height:180px}
 .dg-empty{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;padding:18px 4px;justify-content:center;text-align:left;width:100%}
 .dg-err{display:flex;gap:10px;align-items:center;color:#9A3B2E;border-color:#EBC9C0;background:#FBF3F0}
 .dg-table{display:flex;flex-direction:column;font-size:13px;overflow-x:auto}
-.dg-tr{display:grid;grid-template-columns:minmax(0,1fr) 72px 64px;gap:10px;align-items:center;padding:8px 4px;border-top:1px solid #EEF1EA;min-width:0}
+.dg-tr{display:grid;grid-template-columns:minmax(0,1fr) 72px 64px;gap:10px;align-items:center;padding:8px 4px;border-top:1px solid var(--cloud);min-width:0}
 .dg-tr>span:nth-child(2),.dg-tr>span:nth-child(5){display:none}
 .dg-th{border-top:0;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding-top:0}
 .dg-proc{display:flex;flex-direction:column;min-width:0;padding-left:calc(var(--d) * 16px);position:relative}
 .dg-proc b{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dg-proc small{color:var(--muted);font:11px "JetBrains Mono",monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dg-elbow{position:absolute;left:calc(var(--d) * 16px - 12px);top:2px;width:8px;height:10px;border-left:1.5px solid #C9D2C8;border-bottom:1.5px solid #C9D2C8;border-bottom-left-radius:4px}
-.dg-chip{font-style:normal;font-size:11px;padding:2px 8px;border-radius:999px;color:var(--c);background:color-mix(in srgb,var(--c) 12%,#fff);white-space:nowrap}
+.dg-elbow{position:absolute;left:calc(var(--d) * 16px - 12px);top:2px;width:8px;height:10px;border-left:1.5px solid var(--hair);border-bottom:1.5px solid var(--hair);border-bottom-left-radius:4px}
+.dg-chip{font-style:normal;font-size:11px;padding:2px 8px;border-radius:999px;color:var(--c);background:color-mix(in srgb,var(--c) 12%,var(--surface));white-space:nowrap}
 .dg-num{font:12px "JetBrains Mono",monospace;text-align:right;white-space:nowrap;display:flex;align-items:center;gap:6px;justify-content:flex-end}
 .dg-num.dim{color:var(--muted)}
-.dg-meter{display:none;width:44px;height:4px;border-radius:2px;background:#EEF1EA;overflow:hidden}.dg-meter b{display:block;height:100%;background:var(--accent)}
+.dg-meter{display:none;width:44px;height:4px;border-radius:2px;background:var(--cloud);overflow:hidden}.dg-meter b{display:block;height:100%;background:var(--accent)}
 .dg-pair{display:grid;gap:14px}
 .dg-list{display:flex;flex-direction:column}
-.dg-li{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #EEF1EA;min-width:0}.dg-li:first-child{border-top:0}
+.dg-li{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--cloud);min-width:0}.dg-li:first-child{border-top:0}
 .dg-li-l{display:flex;flex-direction:column;min-width:0;flex:1;font-size:13px}
 .dg-li-l small{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dg-li-v{font:12px "JetBrains Mono",monospace;color:var(--ink);text-align:right;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dg-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;font:600 10.5px "Instrument Sans",sans-serif;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap;flex:none}
 .dg-pill.big{font-size:12px;padding:6px 12px;letter-spacing:.03em}
 .dg-pill[data-s="ok"]{color:#1E7A52;background:#E3F3EA}.dg-pill[data-s="warn"]{color:#8A6100;background:#FBF0D6}
-.dg-pill[data-s="fail"]{color:#A23A2C;background:#F9E3DE}.dg-pill[data-s="unsupported"]{color:#5E7275;background:#EEF1EA}
+.dg-pill[data-s="fail"]{color:#A23A2C;background:#F9E3DE}.dg-pill[data-s="unsupported"]{color:#5E7275;background:var(--cloud)}
 .dg-fail .dg-ico[data-s="fail"]{color:#A23A2C;background:#F9E3DE}.dg-fail .dg-ico[data-s="warn"]{color:#8A6100;background:#FBF0D6}
 .dg-li-l b{font-weight:600}
 .dg-count{font:500 13px "JetBrains Mono",monospace;color:var(--ink)}
@@ -567,12 +687,12 @@ const TK_CSS = `.tk{display:grid;gap:16px}
 .tk-head p{margin:2px 0 0;font-size:12px;color:var(--muted)}
 .tk-range{display:flex;gap:4px;padding:3px;border:1px solid var(--hair);border-radius:10px}
 .tk-range button{all:unset;cursor:pointer;padding:5px 11px;border-radius:7px;font-size:12px;color:var(--muted)}
-.tk-range button[aria-pressed="true"]{background:rgba(212,166,74,.16);color:#D4A64A}
-.tk-range button:focus-visible{outline:2px solid #D4A64A;outline-offset:1px}
+.tk-range button[aria-pressed="true"]{background:color-mix(in srgb,var(--ochre) 16%,transparent);color:var(--ochre)}
+.tk-range button:focus-visible{outline:2px solid var(--ochre);outline-offset:1px}
 .tk-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .tk-tile{border:1px solid var(--hair);border-radius:12px;padding:12px 14px;background:var(--surface);min-width:0}
 .tk-tile b{display:block;font-size:22px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
-.tk-tile.gold b{color:#D4A64A}
+.tk-tile.gold b{color:var(--ochre)}
 .tk-tile span{font-size:12px;color:var(--muted)}
 .tk-card{border:1px solid var(--hair);border-radius:12px;padding:14px;background:var(--surface);min-width:0}
 .tk-card h3{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--ink)}
@@ -642,7 +762,7 @@ async function ledgerSection(slot) {
 }
 const LG_CSS = `.lg-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .lg-table{width:100%;min-width:520px;border-collapse:collapse;font-size:14px}
-.lg-table th,.lg-table td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--hair,#e3e3dd);white-space:nowrap}
+.lg-table th,.lg-table td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--hair);white-space:nowrap}
 .lg-table thead th{font-size:12px;font-weight:600;color:var(--muted)}
 .lg-table .num{text-align:right;font-variant-numeric:tabular-nums}
 .lg-table tfoot th,.lg-table tfoot td{font-weight:600;border-bottom:0}`;

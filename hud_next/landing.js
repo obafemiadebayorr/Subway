@@ -66,6 +66,10 @@ async function loadLanding() {
       const h = await histRes.json();
       const entries = h.entries || [];
       LD.branches = entries.filter((w) => w.branch_name && !w.merged && !w.branch_discarded && !w.branch_gone);
+      if (Array.isArray(LD.data?.live_branches)) {
+        const live = new Set(LD.data.live_branches);
+        LD.branches = LD.branches.filter((w) => live.has(w.branch_name));
+      }
       LD.merged = entries.filter((w) => w.merged).slice(0, 10);
     }
     LD.err = "";
@@ -230,9 +234,38 @@ function paint() {
     <div class="ld-rows">${queue.length ? queue.map(queueRow).join("") : `<div class="ld-empty">Nothing queued.</div>`}</div>
   </section>`;
 
+  const renderBranchesBody = () => {
+    const L = window.SubwayLanes;
+    const lanes = L && L.lanesState.available ? L.lanesState.lanes : [];
+    if (lanes.length > 1) {
+      const mainLane = lanes.find((l) => l.role === "main")?.name || "main";
+      const groups = new Map();
+      for (const l of lanes) groups.set(l.name, []);
+      for (const w of LD.branches) {
+        const k = w.lane || mainLane;
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(w);
+      }
+      return Array.from(groups.entries())
+        .filter(([, list]) => list.length > 0)
+        .map(([laneName, list]) => {
+          const laneObj = lanes.find((l) => l.name === laneName);
+          const role = laneObj ? laneObj.role : "dev";
+          return `<div class="ln-branch-group">
+            <div class="ln-branch-group-head"><span class="ln-name">${esc(laneName)}</span><span class="ln-role ln-role-${esc(role)}">${esc(role)}</span><span class="ld-tag">${list.length}</span></div>
+            <div class="ld-rows">${list.slice(0, 15).map(branchRow).join("")}</div>
+          </div>`;
+        })
+        .join("");
+    }
+    return LD.branches.slice(0, 15).map(branchRow).join("");
+  };
+
+  const lanesSlotHtml = `<div id="ld-lanes-slot"></div>`;
+
   const branchesCard = LD.branches.length ? `<section class="ld-card">
     <div class="ld-head"><div><h2>Unmerged worker branches</h2><div class="ld-sub">Recent worker branches preserved for review.</div></div></div>
-    <div class="ld-rows">${LD.branches.slice(0, 15).map(branchRow).join("")}</div>
+    <div class="ld-rows">${renderBranchesBody()}</div>
   </section>` : "";
 
   const mergedCard = LD.merged.length ? `<section class="ld-card">
@@ -250,7 +283,8 @@ function paint() {
     <div class="ld-head"><div><h2>Working tree (physical changes)</h2><div class="ld-sub">${dirtyCount ? `${dirtyCount} uncommitted or untracked change${dirtyCount === 1 ? "" : "s"} on disk.` : "Working tree is clean."}</div></div>${dirtyCount ? `<button type="button" class="ld-btn" data-ld="diff-working">View diff</button>` : ""}</div>
   </section>`;
 
-  wrap.innerHTML = stats + diffPanel + workingCard + overlapsCard + queueCard + branchesCard + mergedCard + closedCard;
+  wrap.innerHTML = stats + diffPanel + workingCard + overlapsCard + queueCard + lanesSlotHtml + branchesCard + mergedCard + closedCard;
+  window.SubwayLanes?.mountLandingLanesStrip?.(wrap.querySelector("#ld-lanes-slot"), LD.branches);
 }
 
 function onClick(e) {
@@ -292,6 +326,7 @@ function onClick(e) {
 
 function unmount() {
   clearTimeout(LD.timer);
+  if (LD.unsubLanes) { try { LD.unsubLanes(); } catch (_) {} LD.unsubLanes = null; }
   closeDiffStream();
   wrap?.remove();
   wrap = null;
@@ -315,6 +350,11 @@ function mount() {
   }
   paint();
   clearTimeout(LD.timer);
+  import("./lanes.js").then((m) => {
+    LD.unsubLanes = m.subscribeLanes(() => paint());
+    m.loadLanes({ force: true });
+    paint();
+  }).catch(() => {});
   loadLanding().then(paint);
   if (!LD.onPush) {
     LD.onPush = () => { if (wrap && wrap.isConnected) loadLanding().then(paint); };

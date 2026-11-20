@@ -125,7 +125,7 @@ const CSS = `
 [data-mcp-slot] .st-row{min-width:0}
 [data-mcp-slot] .st-txt{min-width:0;flex:1}
 [data-mcp-slot] .st-detail{overflow-wrap:anywhere}
-.mcp-dot{width:8px;height:8px;border-radius:50%;background:#C9CFCB;flex-shrink:0}
+.mcp-dot{width:8px;height:8px;border-radius:50%;background:var(--hair);flex-shrink:0}
 .mcp-dot.on{background:#3E9C6B;box-shadow:0 0 0 3px rgba(62,156,107,.15)}
 .mcp-dot.lent{background:var(--sky)}
 .mcp-dot.wait{background:var(--ochre)}

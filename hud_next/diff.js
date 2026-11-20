@@ -10,7 +10,7 @@ export const DIFF_CSS = `
 .df-meta{font-size:12.5px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .df-seg{display:inline-flex;gap:3px;padding:3px;border-radius:10px;background:var(--ground);box-shadow:inset 0 0 0 1px var(--hair)}
 .df-seg button{border:0;background:none;padding:5px 10px;border-radius:7px;font:inherit;font-size:12px;font-weight:500;color:var(--muted);cursor:pointer}
-.df-seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(17,17,17,.08)}
+.df-seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px color-mix(in srgb,var(--ink) 8%,transparent)}
 .df-file{background:var(--surface);border-radius:var(--radius);box-shadow:0 0 0 1px var(--hair);overflow:hidden;min-width:0}
 .df-fhead{display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--ground);border-bottom:1px solid var(--hair);font-size:12.5px;padding:0}
 .df-ftoggle{flex:1;display:flex;align-items:center;gap:7px;min-width:0;border:0;background:none;font:inherit;font-size:12.5px;color:inherit;padding:8px 12px;cursor:pointer;text-align:left}
@@ -18,7 +18,7 @@ export const DIFF_CSS = `
 .df-ftoggle[data-expanded="true"] .df-chev{transform:rotate(90deg)}
 .df-fname{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .df-fdir{color:var(--muted);font-weight:500}
-.df-new{flex-shrink:0;font-size:10.5px;font-weight:600;color:#1A7F37;background:rgba(34,160,107,.12);padding:1px 6px;border-radius:99px}
+.df-new{flex-shrink:0;font-size:10.5px;font-weight:600;color:#1A7F37;background:color-mix(in srgb,#22A06B 14%,var(--surface));padding:1px 6px;border-radius:99px}
 .df-counts{display:flex;align-items:center;gap:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;flex-shrink:0;padding-right:12px}
 .df-addc{color:#1A7F37;font-weight:600}.df-delc{color:#CF222E;font-weight:600}
 .df-cbar{display:inline-flex;gap:2px;align-items:center}
@@ -31,10 +31,10 @@ export const DIFF_CSS = `
 .df-tbl td{padding:1px 8px;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}
 .df-ln{width:42px;text-align:right;color:var(--muted);user-select:none;font-variant-numeric:tabular-nums;border-right:1px solid var(--hair);padding:1px 6px}
 .df-sig{width:16px;text-align:center;user-select:none;opacity:.6;padding:1px 2px}
-.df-hunk td{background:rgba(44,134,176,.08);color:var(--muted);font-size:11.5px;padding:4px 8px;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair)}
-.df-r-add td{background:rgba(34,160,107,.11)}.df-r-add .df-sig{color:#1A7F37}
-.df-r-del td{background:rgba(226,56,43,.10)}.df-r-del .df-sig{color:#CF222E}
-.df-c-add{background:rgba(34,160,107,.11)}.df-c-del{background:rgba(226,56,43,.10)}.df-c-empty{background:var(--ground);opacity:.55}
+.df-hunk td{background:color-mix(in srgb,var(--accent) 8%,transparent);color:var(--muted);font-size:11.5px;padding:4px 8px;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair)}
+.df-r-add td{background:color-mix(in srgb,#22A06B 14%,var(--surface))}.df-r-add .df-sig{color:#1A7F37}
+.df-r-del td{background:color-mix(in srgb,#E2382B 14%,var(--surface))}.df-r-del .df-sig{color:#CF222E}
+.df-c-add{background:color-mix(in srgb,#22A06B 14%,var(--surface))}.df-c-del{background:color-mix(in srgb,#E2382B 14%,var(--surface))}.df-c-empty{background:var(--ground);opacity:.55}
 .df-split-mid{border-left:1px solid var(--hair)}
 .df-empty{padding:20px;text-align:center;color:var(--muted);font-size:13px}
 `;

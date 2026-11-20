@@ -263,6 +263,7 @@ def _pump_opencode(
     monitor_threads: List[threading.Thread] = []
     cancel_sent = False
     last_msg_time = time.time()
+    waiting = {"perm": False}
     had_tool_call = False
     had_tool_call_this_turn = False
     continued_replies: List[str] = []
@@ -278,7 +279,7 @@ def _pump_opencode(
     def watchdog() -> None:
         while not stop_monitor.is_set() and not stopped["flag"]:
             timeout = OPENCODE_WATCHDOG_TIMEOUT
-            if had_tool_call and session_id and (time.time() - last_msg_time) >= timeout:
+            if had_tool_call and session_id and not waiting["perm"] and (time.time() - last_msg_time) >= timeout:
                 write("[stalled] no reply from OpenCode for 120s")
                 send_cancel()
                 run["finished"] = True
@@ -612,8 +613,13 @@ def _pump_opencode(
                         write(f"[read guard, not enforced] {denial}")
                     decision = "allow"
                 else:
-                    rid = _s.request_permission(meta, str(title), detail, raw_input=raw)
-                    decision = _s.await_permission(rid, stop=lambda: stopped["flag"])
+                    waiting["perm"] = True
+                    try:
+                        rid = _s.request_permission(meta, str(title), detail, raw_input=raw)
+                        decision = _s.await_permission(rid, stop=lambda: stopped["flag"])
+                    finally:
+                        waiting["perm"] = False
+                    last_msg_time = time.time()
 
                 if decision not in ("allow", "allow_always"):
                     if not run.get("guard_denied"):

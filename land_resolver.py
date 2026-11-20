@@ -26,10 +26,20 @@ def find(conflict_id: str) -> Dict[str, Any]:
     return next((e for e in land_conflicts.list_conflicts(_state_dir()) if e.get("id") == cid), {})
 
 
+def _safe_ref(name: str) -> bool:
+    """A git refname safe to embed verbatim in an agent prompt (F8: no shell metachars)."""
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+-]*", str(name or "")))
+
+
 def resolver_brief(entry: Dict[str, Any]) -> str:
     files = [str(f) for f in entry.get("conflicts") or []]
     deleted = [str(f) for f in entry.get("deletes_landed") or []]
     branch = str(entry.get("branch") or "")
+    if not _safe_ref(branch):
+        branch = "(unsafe branch name refused)"
+    files = [f if _safe_ref(f) else "(unsafe path refused)" for f in files]
+    deleted = [f if _safe_ref(f) else "(unsafe path refused)" for f in deleted]
     lines = [
         f"Resolve a landing overlap ({entry.get('id')}). Worker {entry.get('worker_id')} ({entry.get('role') or 'worker'}) "
         f"changed the same lines as HEAD, so its branch `{branch}` was kept instead of landing.",

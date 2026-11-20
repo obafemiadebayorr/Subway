@@ -50,6 +50,8 @@ def to_exchanges(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cur: Optional[Dict[str, Any]] = None
     for t in turns:
         role = t["role"]
+        if role == "assistant" and t.get("boundary") and cur is None:
+            continue
         if role in ("user", "summary"):
             cur = {
                 "user": t["text"],
@@ -74,6 +76,10 @@ def to_exchanges(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "kind": "user",
                 }
                 ex.append(cur)
+            if t.get("boundary"):
+                if cur["assistant"]:
+                    cur.setdefault("breaks", []).append(len(cur["assistant"]))
+                continue
             if t.get("thought"):
                 th = t["thought"].strip()
                 if th and (not cur["thoughts"] or cur["thoughts"][-1] != th):
